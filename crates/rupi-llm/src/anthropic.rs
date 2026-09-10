@@ -480,6 +480,10 @@ impl super::LlmProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn model_id(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = self.body(&req, false);
@@ -490,19 +494,23 @@ impl super::LlmProvider for AnthropicProvider {
         if status.is_success() {
             return parse_anthropic_response(v);
         }
-        let msg = error_text(&v).unwrap_or("anthropic request failed").to_string();
+        let msg = error_text(&v)
+            .unwrap_or("anthropic request failed")
+            .to_string();
         if is_signature_mismatch(status, &msg) {
             tracing::warn!("anthropic thinking 签名失配，去思考块重试一次: {msg}");
             let retry_req = strip_thinking_for_retry(&req);
             let retry_body = self.body(&retry_req, false);
-            let retry_resp =
-                super::post_json_with_retry(|| self.headers(self.client.post(&url)), &retry_body, 3)
-                    .await?;
+            let retry_resp = super::post_json_with_retry(
+                || self.headers(self.client.post(&url)),
+                &retry_body,
+                3,
+            )
+            .await?;
             let retry_status = retry_resp.status();
             let retry_v: serde_json::Value = retry_resp.json().await?;
             if !retry_status.is_success() {
-                let retry_msg =
-                    error_text(&retry_v).unwrap_or("anthropic request failed");
+                let retry_msg = error_text(&retry_v).unwrap_or("anthropic request failed");
                 anyhow::bail!("anthropic {retry_status}: {retry_msg}");
             }
             return parse_anthropic_response(retry_v);
@@ -524,7 +532,9 @@ impl super::LlmProvider for AnthropicProvider {
         let resp = if !resp.status().is_success() {
             let status = resp.status();
             let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
-            let msg = error_text(&v).unwrap_or("anthropic request failed").to_string();
+            let msg = error_text(&v)
+                .unwrap_or("anthropic request failed")
+                .to_string();
             if is_signature_mismatch(status, &msg) {
                 tracing::warn!("anthropic thinking 签名失配（流式），去思考块重试一次: {msg}");
                 let retry_req = strip_thinking_for_retry(&req);
@@ -539,8 +549,7 @@ impl super::LlmProvider for AnthropicProvider {
                     let retry_status = retry_resp.status();
                     let retry_v: serde_json::Value =
                         retry_resp.json().await.unwrap_or(serde_json::json!({}));
-                    let retry_msg =
-                        error_text(&retry_v).unwrap_or("anthropic request failed");
+                    let retry_msg = error_text(&retry_v).unwrap_or("anthropic request failed");
                     anyhow::bail!("anthropic {retry_status}: {retry_msg}");
                 }
                 retry_resp
@@ -997,10 +1006,19 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "thinking blocks with signatures must be contiguous"
         ));
-        assert!(is_signature_mismatch(StatusCode::BAD_REQUEST, "Invalid Signature block"));
+        assert!(is_signature_mismatch(
+            StatusCode::BAD_REQUEST,
+            "Invalid Signature block"
+        ));
         // 非 400 不误判（限流/鉴权走各自重试与报错通道）
-        assert!(!is_signature_mismatch(StatusCode::UNAUTHORIZED, "invalid signature"));
-        assert!(!is_signature_mismatch(StatusCode::BAD_REQUEST, "max_tokens exceeded"));
+        assert!(!is_signature_mismatch(
+            StatusCode::UNAUTHORIZED,
+            "invalid signature"
+        ));
+        assert!(!is_signature_mismatch(
+            StatusCode::BAD_REQUEST,
+            "max_tokens exceeded"
+        ));
     }
 
     #[test]
@@ -1009,9 +1027,14 @@ mod tests {
             id: "a".into(),
             role: Role::Assistant,
             blocks: vec![
-                ContentBlock::Thinking { text: "hmm".into(), signature: Some("s".into()) },
+                ContentBlock::Thinking {
+                    text: "hmm".into(),
+                    signature: Some("s".into()),
+                },
                 ContentBlock::RedactedThinking { data: "enc".into() },
-                ContentBlock::Text { text: "answer".into() },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
             ],
             provider: None,
             created_at: chrono::Utc::now(),

@@ -358,6 +358,10 @@ impl super::LlmProvider for GeminiProvider {
         "gemini"
     }
 
+    fn model_id(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
         let body = self.body(&req);
         let url = self.url(false);

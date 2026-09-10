@@ -8,7 +8,7 @@ use rupi_llm::{ChatRequest, LlmProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
 use rupi_tools::{Tool, ToolRegistry};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub mod review;
@@ -83,6 +83,53 @@ struct PendingCall {
     denied: Option<rupi_tools::ToolOutput>,
 }
 
+/// 单模型压实覆盖（对标上游 `compaction.modelOverrides["provider/modelId"]`）：
+/// 键为 `provider.name()/model_id`（如 `anthropic/claude-sonnet-4-5`），只覆盖
+/// 给定的字段、其余走全局；无 model_id 的 provider 或键缺失时全用全局默认。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionOverride {
+    #[serde(default)]
+    pub threshold_chars: Option<usize>,
+    #[serde(default)]
+    pub keep_last: Option<usize>,
+}
+
+/// 解析压实覆盖 JSON（`RUPI_COMPRESSION_OVERRIDES`）：
+/// `{"anthropic/claude-x": {"threshold_chars": 30000, "keep_last": 10}}`。
+/// 非对象条目/未知字段/非法值只 warning 跳过该条——主循环永不因配置崩；
+/// 空串回空表，无需调用方特判。
+pub fn parse_compression_overrides(json: &str) -> HashMap<String, CompressionOverride> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return HashMap::new();
+    }
+    let raw: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("RUPI_COMPRESSION_OVERRIDES 解析失败，忽略全部覆盖: {e}");
+            return HashMap::new();
+        }
+    };
+    let obj = match raw.as_object() {
+        Some(o) => o,
+        None => {
+            tracing::warn!("RUPI_COMPRESSION_OVERRIDES 须为对象，忽略全部覆盖");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for (k, v) in obj {
+        match serde_json::from_value::<CompressionOverride>(v.clone()) {
+            Ok(o) => {
+                out.insert(k.clone(), o);
+            }
+            Err(e) => tracing::warn!("压实覆盖 [{k}] 非法已跳过: {e}"),
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct AgentLoop {
     pub max_turns: u32,
@@ -93,6 +140,8 @@ pub struct AgentLoop {
     /// 会话压缩：历史超 `compress_threshold_chars` 时摘要最旧部分，只把摘要 + 近期送模型。
     pub compress_threshold_chars: usize,
     pub compress_keep_last: usize,
+    /// 按模型压实覆盖：`provider.name()/model_id` → 阈值/保留条数（见 [`CompressionOverride`]）。
+    pub compress_overrides: HashMap<String, CompressionOverride>,
     /// 权限门：默认全放行；计划模式/规则/审批按需装配。
     pub policy: Arc<dyn Policy>,
     pub approver: Option<Arc<dyn Approver>>,
@@ -123,6 +172,7 @@ impl AgentLoop {
             on_suggestion: None,
             compress_threshold_chars: 60_000,
             compress_keep_last: 20,
+            compress_overrides: HashMap::new(),
             policy: Arc::new(policy::AllowAll),
             approver: None,
             plan_mode: false,
@@ -148,6 +198,31 @@ impl AgentLoop {
         self.compress_threshold_chars = threshold_chars;
         self.compress_keep_last = keep_last;
         self
+    }
+
+    /// 按模型压实覆盖（`RUPI_COMPRESSION_OVERRIDES` 解析结果直传）。
+    pub fn with_compression_overrides(
+        mut self,
+        overrides: HashMap<String, CompressionOverride>,
+    ) -> Self {
+        self.compress_overrides = overrides;
+        self
+    }
+
+    /// 本轮压实参数：命中 `name/model_id` 覆盖的字段优先，其余回全局。
+    /// 无 model_id 的 provider（如 Mock）永远走全局——覆盖键写了也命中不了，
+    /// 宁可保守用全局，也不猜模型。
+    pub fn compression_for(&self, provider: &dyn LlmProvider) -> (usize, usize) {
+        let key = provider
+            .model_id()
+            .map(|m| format!("{}/{}", provider.name(), m));
+        let o = key.as_deref().and_then(|k| self.compress_overrides.get(k));
+        (
+            o.and_then(|x| x.threshold_chars)
+                .unwrap_or(self.compress_threshold_chars),
+            o.and_then(|x| x.keep_last)
+                .unwrap_or(self.compress_keep_last),
+        )
     }
 
     pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
@@ -315,7 +390,7 @@ impl AgentLoop {
             if self.plan_mode {
                 system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
             }
-            let history: Vec<Message> = session.prompt_history(self.compress_keep_last);
+            let history: Vec<Message> = session.prompt_history(self.compression_for(provider).1);
             let req = ChatRequest {
                 system,
                 messages: history,
@@ -574,7 +649,9 @@ impl AgentLoop {
         session: &mut SessionTree,
         mem: &MemoryManager,
     ) {
-        if session.history_chars() <= self.compress_threshold_chars {
+        // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的阈值。
+        let (threshold_chars, keep_last) = self.compression_for(provider);
+        if session.history_chars() <= threshold_chars {
             return;
         }
         // 已压缩过且新增不足一窗：跳过，避免每轮重复烧模型
@@ -588,16 +665,16 @@ impl AgentLoop {
                     .position(|id| id == through)
                     .map(|i| i + 1)
                     .unwrap_or(0);
-                if session.current_path.len().saturating_sub(pos) <= self.compress_keep_last * 2 {
+                if session.current_path.len().saturating_sub(pos) <= keep_last * 2 {
                     return;
                 }
             }
         }
         let total = session.current_path.len();
-        if total <= self.compress_keep_last {
+        if total <= keep_last {
             return;
         }
-        let cut = total - self.compress_keep_last;
+        let cut = total - keep_last;
         let chunk: Vec<String> = session.history()[..cut]
             .iter()
             .map(|m| m.full_text())
@@ -640,10 +717,7 @@ impl AgentLoop {
             }
         };
         session.set_summary(summary, through);
-        tracing::info!(
-            "session compressed: {total} msgs, kept last {}",
-            self.compress_keep_last
-        );
+        tracing::info!("session compressed: {total} msgs, kept last {keep_last}");
     }
 
     /// 后台 review：主流程结束后安静复盘，非空建议推给 `on_suggestion`。永不抛错。
@@ -817,6 +891,130 @@ mod tests {
         // 兜底摘要照样落盘，窗口照样缩小
         assert!(session.summary.is_some());
         assert_eq!(session.prompt_history(1).len(), 2);
+    }
+
+    /// 按模型覆盖的测试替身：name/model_id 可配，complete 按剧本弹（对标上游
+    /// `compaction.modelOverrides` 按 `"provider/modelId"` 命中）。
+    struct NamedProvider {
+        name: &'static str,
+        model: Option<String>,
+        script: std::sync::Mutex<Vec<ChatResponse>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for NamedProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn model_id(&self) -> Option<&str> {
+            self.model.as_deref()
+        }
+        async fn complete(&self, _req: rupi_llm::ChatRequest) -> anyhow::Result<ChatResponse> {
+            let mut g = self.script.lock().unwrap();
+            if g.is_empty() {
+                Ok(MockProvider::text_response("named-summary"))
+            } else {
+                Ok(g.remove(0))
+            }
+        }
+    }
+
+    fn named(name: &'static str, model: &str, script: Vec<ChatResponse>) -> NamedProvider {
+        NamedProvider {
+            name,
+            model: Some(model.to_string()),
+            script: std::sync::Mutex::new(script),
+        }
+    }
+
+    #[test]
+    fn compression_override_resolves_per_model() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "anthropic/claude-x".to_string(),
+            CompressionOverride {
+                threshold_chars: Some(100),
+                keep_last: Some(3),
+            },
+        );
+        m.insert(
+            "gemini/gemini-y".to_string(),
+            CompressionOverride {
+                threshold_chars: None,
+                keep_last: Some(7),
+            },
+        );
+        let agent = AgentLoop::new(3)
+            .with_compression(9999, 20)
+            .with_compression_overrides(m);
+        // 全命中
+        let p = named("anthropic", "claude-x", vec![]);
+        assert_eq!(agent.compression_for(&p), (100, 3));
+        // 部分覆盖：阈值回全局
+        let g = named("gemini", "gemini-y", vec![]);
+        assert_eq!(agent.compression_for(&g), (9999, 7));
+        // 未登录模型走全局
+        let other = named("anthropic", "claude-z", vec![]);
+        assert_eq!(agent.compression_for(&other), (9999, 20));
+        // 无 model_id（Mock/动态网关）永远走全局，不猜模型
+        let mock = MockProvider::new(vec![]);
+        assert_eq!(agent.compression_for(&mock), (9999, 20));
+    }
+
+    #[tokio::test]
+    async fn compress_uses_model_override_threshold_and_keep() {
+        let home = std::env::temp_dir().join("rupi-agent-compress-override");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let mut session = SessionTree::new();
+        for i in 0..6 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "anthropic/claude-x".to_string(),
+            CompressionOverride {
+                threshold_chars: Some(10),
+                keep_last: Some(2),
+            },
+        );
+        // 全局阈值天花板：无覆盖时不压；覆盖把阈值拉到 10 才压
+        let agent = AgentLoop::new(3)
+            .with_compression(1_000_000, 5)
+            .with_compression_overrides(m);
+        let provider = named(
+            "anthropic",
+            "claude-x",
+            vec![MockProvider::text_response("SUMMARY-O")],
+        );
+        agent.maybe_compress(&provider, &mut session, &mem).await;
+        assert!(session.summary.as_ref().unwrap().contains("SUMMARY-O"));
+        // keep_last=2：切点落在 total-keep-1 处（6-2-1=3），不是全局 keep=5 的切点 0
+        assert_eq!(
+            session.summary_through.as_deref(),
+            Some(session.current_path[3].as_str())
+        );
+    }
+
+    #[test]
+    fn parse_compression_overrides_validates_entries() {
+        assert!(parse_compression_overrides("").is_empty());
+        assert!(parse_compression_overrides("  ").is_empty());
+        let m = parse_compression_overrides(
+            r#"{"anthropic/claude-x": {"threshold_chars": 30000, "keep_last": 10}}"#,
+        );
+        assert_eq!(m["anthropic/claude-x"].threshold_chars, Some(30000));
+        assert_eq!(m["anthropic/claude-x"].keep_last, Some(10));
+        // 非法条目（未知字段/非对象/负数）逐条跳过，合法条保留，主循环不崩
+        let m = parse_compression_overrides(
+            r#"{"a/b": {"threshold_chars": 5}, "c/d": {"threshold": 1}, "e/f": "nope", "g/h": {"keep_last": -3}}"#,
+        );
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key("a/b"));
+        // 顶层非对象/坏 JSON → 空表
+        assert!(parse_compression_overrides("[1,2]").is_empty());
+        assert!(parse_compression_overrides("{oops").is_empty());
     }
 
     #[tokio::test]

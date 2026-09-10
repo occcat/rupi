@@ -66,10 +66,10 @@ struct Cli {
     /// 用模型做后台复盘（默认启发式离线 review；LLM 版烧 token 但提炼质量更高）
     #[arg(long, default_value_t = false)]
     review_llm: bool,
-    /// 会话压缩阈值（历史字符数，超限摘要最旧部分）
+    /// 会话压缩阈值（历史字符数，超限摘要最旧部分；RUPI_COMPRESSION_OVERRIDES 可按模型覆盖）
     #[arg(long, default_value_t = 60_000)]
     compress_threshold: usize,
-    /// 压缩后保留的近期消息条数
+    /// 压缩后保留的近期消息条数（同上可按模型覆盖）
     #[arg(long, default_value_t = 20)]
     compress_keep: usize,
     /// 外部扩展目录（*.json manifests），默认 ~/.rupi/extensions
@@ -530,6 +530,17 @@ fn default_policy() -> rupi_agent::RulePolicy {
     }
 }
 
+/// 按模型压实覆盖：`RUPI_COMPRESSION_OVERRIDES` JSON
+///（如 `{"anthropic/claude-sonnet-4-5": {"threshold_chars": 30000, "keep_last": 10}}`，
+/// 对标上游 `compaction.modelOverrides`）；未设置/非法时回空表走全局阈值。
+fn load_compression_overrides() -> std::collections::HashMap<String, rupi_agent::CompressionOverride>
+{
+    match std::env::var("RUPI_COMPRESSION_OVERRIDES") {
+        Ok(s) => rupi_agent::parse_compression_overrides(&s),
+        Err(_) => Default::default(),
+    }
+}
+
 /// 可选的外部记忆 provider（当前支持 jsonl）。
 async fn maybe_external_memory(
     cli: &Cli,
@@ -656,8 +667,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
     let sess_db = SessionStore::open(home)?;
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
-    let mut agent =
-        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    let mut agent = AgentLoop::new(cli.max_turns)
+        .with_compression(cli.compress_threshold, cli.compress_keep)
+        .with_compression_overrides(load_compression_overrides());
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);
@@ -754,8 +766,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut provider: Arc<dyn LlmProvider> = build_provider(&model).await?.into();
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
-    let mut agent =
-        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    let mut agent = AgentLoop::new(cli.max_turns)
+        .with_compression(cli.compress_threshold, cli.compress_keep)
+        .with_compression_overrides(load_compression_overrides());
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);
@@ -1037,8 +1050,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         let db = sess_db.lock().unwrap();
         restore_or_new(cli, &db)?
     };
-    let mut agent =
-        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    let mut agent = AgentLoop::new(cli.max_turns)
+        .with_compression(cli.compress_threshold, cli.compress_keep)
+        .with_compression_overrides(load_compression_overrides());
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     agent = agent
         .with_policy(Arc::new(default_policy()))

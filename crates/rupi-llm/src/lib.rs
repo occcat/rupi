@@ -98,6 +98,12 @@ pub enum StreamEvent {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
+    /// 当前模型 id（压实按模型覆盖的 key 材料：`name/model_id`，对标上游
+    /// `compaction.modelOverrides` 的 `"provider/modelId"` 键）。无固定模型
+    ///（如聚合网关动态路由）返回 None，覆盖查找回退全局默认。
+    fn model_id(&self) -> Option<&str> {
+        None
+    }
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse>;
 
     /// 流式补全：边收边推 `TextDelta`，最终仍返回完整 `ChatResponse`。
@@ -252,6 +258,10 @@ impl OpenAiCompatProvider {
 impl LlmProvider for OpenAiCompatProvider {
     fn name(&self) -> &str {
         "openai-compat"
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(&self.model)
     }
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
