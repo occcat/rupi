@@ -1,7 +1,7 @@
 //! rupi-tools: Tool trait + Pi 默认七件套 Read / Write / Edit / Bash / Glob / Grep / Think + 注册表。
 
 use async_trait::async_trait;
-use rupi_core::ToolDefinition;
+use rupi_core::{CancelFlag, ToolDefinition};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,6 +30,17 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput>;
+    /// 带取消的执行入口：主循环把本轮 `CancelFlag` 透进来。默认直接调 `execute`
+    /// （瞬间完成的工具无需重写）；长耗时工具（bash 子进程、子 agent 内层循环、
+    /// 外部进程、MCP 远端）重写本方法做真抢占。注意返回 `Err` 会 abort 整轮，
+    /// 取消一律走 `Ok(ToolOutput::err("cancelled by user"))` 回模型。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        _cancel: &CancelFlag,
+    ) -> anyhow::Result<ToolOutput> {
+        self.execute(arguments).await
+    }
 }
 
 #[derive(Default, Clone)]
@@ -62,6 +73,19 @@ impl ToolRegistry {
     ) -> anyhow::Result<ToolOutput> {
         match self.tools.get(name) {
             Some(t) => t.execute(arguments).await,
+            None => Ok(ToolOutput::err(format!("unknown tool: {name}"))),
+        }
+    }
+
+    /// 带取消的执行入口（主循环用这个，把本轮 flag 一路透给工具）。
+    pub async fn execute_with_cancel(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<ToolOutput> {
+        match self.tools.get(name) {
+            Some(t) => t.execute_with_cancel(arguments, cancel).await,
             None => Ok(ToolOutput::err(format!("unknown tool: {name}"))),
         }
     }
@@ -423,15 +447,7 @@ impl Tool for BashTool {
         }
     }
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
-        let command = arguments
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let timeout_secs = arguments
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(30)
-            .clamp(1, 300);
+        let (command, timeout_secs) = Self::parse_args(&arguments);
         let run = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -457,6 +473,129 @@ impl Tool for BashTool {
                 "command timed out after {timeout_secs}s"
             ))),
         }
+    }
+    /// 真抢占：取消置位即 kill 子进程并回收，已产出内容随取消错误一并返回。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<ToolOutput> {
+        let (command, timeout_secs) = Self::parse_args(&arguments);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        // 自成进程组（setsid）：取消/超时杀整组，sh -c fork 出的孙进程不留孤儿。
+        // BashTool 本就调 sh，Unix 假设与既有用例一致。
+        use std::os::unix::process::CommandExt as _;
+        cmd.as_std_mut().process_group(0);
+        let mut child = match cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolOutput::err(format!("spawn failed: {e}"))),
+        };
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(timeout);
+        // wait 只等退出（&mut，不移动 child，select 三分支借用互不冲突），
+        // stdout/stderr 随后手动排空（进程退出/kill 后读必到 EOF）。
+        enum End {
+            Done(std::process::ExitStatus),
+            Cancelled,
+            TimedOut,
+        }
+        let end = tokio::select! {
+            _ = cancel.cancelled() => End::Cancelled,
+            _ = &mut timeout => End::TimedOut,
+            res = child.wait() => match res {
+                Ok(status) => End::Done(status),
+                Err(e) => return Ok(ToolOutput::err(format!("wait failed: {e}"))),
+            },
+        };
+        match end {
+            End::Done(status) => {
+                let (out_text, err_text) = Self::drain(&mut child).await;
+                let mut s = out_text;
+                if !err_text.is_empty() {
+                    s.push_str(&format!("\n[stderr]\n{err_text}"));
+                }
+                s = truncate_middle(&s, MAX_TOOL_OUTPUT);
+                if status.success() {
+                    Ok(ToolOutput::ok(s))
+                } else {
+                    Ok(ToolOutput::err(format!("exit {status}: {s}")))
+                }
+            }
+            End::Cancelled => {
+                Self::kill_tree(&mut child).await;
+                // 残余输出只等 500ms：孙进程可能继承管道写端（如 sh -c fork 出子进程），
+                // 无限等会拖到命令自然结束，违背取消语义；超时则舍弃残余直接返回。
+                let (out_text, _) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    Self::drain(&mut child),
+                )
+                .await
+                .unwrap_or_default();
+                let partial = truncate_middle(&out_text, MAX_TOOL_OUTPUT);
+                let mut msg = String::from("cancelled by user");
+                if !partial.is_empty() {
+                    msg.push_str(&format!("\n[partial output]\n{partial}"));
+                }
+                Ok(ToolOutput::err(msg))
+            }
+            End::TimedOut => {
+                Self::kill_tree(&mut child).await;
+                Ok(ToolOutput::err(format!(
+                    "command timed out after {timeout_secs}s"
+                )))
+            }
+        }
+    }
+}
+
+impl BashTool {
+    fn parse_args(arguments: &serde_json::Value) -> (&str, u64) {        let command = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let timeout_secs = arguments
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 300);
+        (command, timeout_secs)
+    }
+
+    /// 杀整组进程树：先 killpg 发 SIGKILL（组长即直接子进程 pid，setsid 保证），
+    /// 再补一次定向 kill 兜底，最后 wait 回收僵尸。killpg 失败一律忽略
+    /// （组已空/进程已死的 ESRCH 等），wait 保证无僵尸。
+    async fn kill_tree(child: &mut tokio::process::Child) {
+        if let Some(pid) = child.id() {
+            // SAFETY: killpg 仅向进程组发信号，不涉及内存，参数为刚取到的存活 pid。
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    /// 排空子进程 stdout/stderr 管道。进程退出（或 kill+wait 回收）后读必到 EOF，
+    /// 故本函数必返回，不会挂起。
+    async fn drain(child: &mut tokio::process::Child) -> (String, String) {
+        use tokio::io::AsyncReadExt as _;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_end(&mut out).await;
+        }
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_end(&mut err).await;
+        }
+        (
+            String::from_utf8_lossy(&out).to_string(),
+            String::from_utf8_lossy(&err).to_string(),
+        )
     }
 }
 
@@ -788,6 +927,92 @@ mod tests {
             .unwrap();
         assert!(slow.is_error);
         assert!(slow.content.contains("timed out after 1s"));
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_kills_child_and_returns_fast() {
+        // 真抢占：sleep 30 跑 300ms 后置位，调用须秒级返回取消错误，而非等 30s。
+        use rupi_core::CancelFlag;
+        let tool = BashTool;
+        let cancel = CancelFlag::new();
+        let killer = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            killer.cancel();
+        });
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute_with_cancel(
+                serde_json::json!({"command": "sleep 30", "timeout_secs": 60}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(out.is_error);
+        assert!(out.content.contains("cancelled by user"), "{}", out.content);
+        // 不置位时走正常路径（无取消回归）。
+        let ok = tool
+            .execute_with_cancel(
+                serde_json::json!({"command": "echo hi"}),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!ok.is_error);
+        assert!(ok.content.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_kills_process_group_no_orphans() {
+        // 进程组语义：sh -c fork 出的孙进程随取消一起死，不留孤儿。
+        // 用独特时长做 pgrep 探针；无 pgrep 的环境跳过断言（不断门）。
+        use rupi_core::CancelFlag;
+        if tokio::process::Command::new("which")
+            .arg("pgrep")
+            .output()
+            .await
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let tool = BashTool;
+        let probe = "sleep 47";
+        // 先确认探针干净（防其他测试残留干扰）。
+        let pre = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '[s]leep 47' || true")
+            .output()
+            .await
+            .unwrap();
+        assert!(pre.stdout.is_empty(), "probe polluted: {pre:?}");
+        let cancel = CancelFlag::new();
+        let killer = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            killer.cancel();
+        });
+        let out = tool
+            .execute_with_cancel(
+                serde_json::json!({"command": probe, "timeout_secs": 60}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("cancelled by user"), "{}", out.content);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let post = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '[s]leep 47' || true")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            post.stdout.is_empty(),
+            "orphan sleep survived cancel: {}",
+            String::from_utf8_lossy(&post.stdout)
+        );
     }
 
     #[tokio::test]

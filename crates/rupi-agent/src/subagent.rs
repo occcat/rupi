@@ -174,6 +174,26 @@ impl rupi_tools::Tool for SubagentTool {
         &self,
         arguments: serde_json::Value,
     ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        self.run_subagent(arguments, &CancelFlag::new()).await
+    }
+
+    /// 父取消直透内层循环：Esc/trl-C 置位后子 agent 在下一个检查点（turn 边界/
+    /// 流中/工具间隙）停下，本工具调用回取消错误，不再等子循环跑完。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        self.run_subagent(arguments, cancel).await
+    }
+}
+
+impl SubagentTool {
+    async fn run_subagent(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
         let goal = arguments
             .get("goal")
             .and_then(|v| v.as_str())
@@ -217,7 +237,7 @@ impl rupi_tools::Tool for SubagentTool {
                 self.skills.as_ref(),
                 &[],
                 &noop,
-                &CancelFlag::new(),
+                cancel,
             )
             .await?;
         let summary = session
@@ -272,10 +292,27 @@ mod tests {
         assert!(out.content.contains("sub done"));
     }
 
+    /// 父取消直透子循环：预置位的 flag 进来，内层 run 起手即停，
+    /// provider 零调用（此前传 fresh flag，子循环会完整跑完）。
+    #[tokio::test]
+    async fn subagent_inherits_parent_cancellation() {
+        let (p, t, m, f, s) = ctx();
+        let tool = SubagentTool::new(p.clone(), t, m, f, s, 3);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute_with_cancel(serde_json::json!({"goal": "do thing"}), &cancel)
+            .await
+            .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(p.seen_tools.lock().unwrap().is_empty());
+        let _ = out;
+    }
+
     /// 子任务思考强度透传：父档位进子循环请求，默认 None 不干预。
     #[tokio::test]
-    async fn thinking_level_reaches_child_loop() {
-        struct Capture {
+    async fn thinking_level_reaches_child_loop() {        struct Capture {
             seen: std::sync::Mutex<Vec<Option<rupi_llm::ThinkingLevel>>>,
         }
         #[async_trait::async_trait]

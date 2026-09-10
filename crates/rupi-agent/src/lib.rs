@@ -269,6 +269,7 @@ impl AgentLoop {
 
     /// 第二阶段：真实执行一个放行的工具调用（memory 路由 + skill 内建 + 注册表 + 发现路由）。
     /// 串行/并行共用；denied 短路由调用方处理，这里只管执行，错误一律转 tool error。
+    #[allow(clippy::too_many_arguments)]
     async fn execute_allowed(
         &self,
         tools: &ToolRegistry,
@@ -277,6 +278,7 @@ impl AgentLoop {
         search_space: &[ToolDefinition],
         name: &str,
         args: serde_json::Value,
+        cancel: &CancelFlag,
     ) -> rupi_tools::ToolOutput {
         if name == "search_tools" {
             let Some(cfg) = &self.discovery else {
@@ -330,7 +332,7 @@ impl AgentLoop {
             match mem.handle_tool_call(&name, args.clone()).await {
                 Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
                 Ok(None) => tools
-                    .execute(&name, args.clone())
+                    .execute_with_cancel(&name, args.clone(), cancel)
                     .await
                     .unwrap_or_else(|e| {
                         rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
@@ -347,8 +349,9 @@ impl AgentLoop {
     /// 运行一轮用户请求直到 `done` / 无工具调用 / max_turns。每步推 `AgentEvent`。
     /// 协作取消（`cancel`，对标上游 effect-gate 取消源）：turn 边界、流式补全中、
     /// 串行工具间隙检查；中止发 `TurnEnd{Aborted}`（轮中）+ `RunEnd{Aborted}` 并回
-    /// `Ok(Aborted)`。in-flight 工具跑完当前项、并行批跑完当前批；子 agent 运行不继承
-    /// （`Tool::execute` 无取消通道，子循环传的是 fresh flag）。
+    /// `Ok(Aborted)`。in-flight 工具跑完当前项、并行批跑完当前批；`cancel` 经
+    /// `execute_with_cancel` 一路透给工具：子 agent 继承父取消（内层循环就地停）、
+    /// bash/外部进程被 kill、MCP 远端调用不再等。
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -650,6 +653,7 @@ impl AgentLoop {
                                     &all_tools,
                                     &p.name,
                                     p.args.clone(),
+                                    cancel,
                                 )
                                 .await
                             }
@@ -680,6 +684,7 @@ impl AgentLoop {
                                         &all_tools,
                                         &p.name,
                                         p.args.clone(),
+                                        cancel,
                                     )
                                     .await
                                 }

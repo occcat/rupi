@@ -379,7 +379,9 @@ pub enum StopReason {
 /// 主循环在 turn 边界、流式补全 `select!`、串行工具间隙检查，中止后发
 /// `TurnEnd{Aborted}`（轮中）+ `RunEnd{Aborted}` 收尾。
 /// `clone` 共享同一状态（一次置位处处可见）；语义是协作式的——in-flight 的工具调用
-/// 跑完当前项，并行批跑完当前批，审批问询（同步阻塞）与子 agent 运行不受影响。
+/// 跑完当前项，并行批跑完当前批，审批问询（同步阻塞）不受影响；`cancel` 经
+/// `execute_with_cancel` 透给工具后，子 agent 内层循环就地停、bash/外部进程整组被杀、
+/// MCP 远端调用不再等。
 #[derive(Debug, Clone, Default)]
 pub struct CancelFlag {
     inner: std::sync::Arc<CancelInner>,

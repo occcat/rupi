@@ -106,8 +106,56 @@ impl rupi_tools::Tool for ExternalTool {
         &self,
         arguments: serde_json::Value,
     ) -> anyhow::Result<rupi_tools::ToolOutput> {
-        use tokio::io::AsyncWriteExt as _;
         let m = &self.manifest;
+        let child = match Self::spawn_with_input(m, &arguments).await {
+            Ok(c) => c,
+            Err(out) => return Ok(out),
+        };
+        let timeout_secs = effective_timeout_secs(m.timeout_secs);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await;
+        // 超时：timeout 会丢弃 wait future，连带 kill_on_drop(true) 干掉子进程，无僵尸
+        Ok(Self::finish(out, timeout_secs))
+    }
+
+    /// 取消即返回：wait future 被丢弃，连带 kill_on_drop(true) 干掉子进程，
+    /// 调用方不再等外部进程收尾（与超时同语义）。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &rupi_core::CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        let m = &self.manifest;
+        let child = match Self::spawn_with_input(m, &arguments).await {
+            Ok(c) => c,
+            Err(out) => return Ok(out),
+        };
+        let timeout_secs = effective_timeout_secs(m.timeout_secs);
+        let out = tokio::select! {
+            _ = cancel.cancelled() => None,
+            r = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                child.wait_with_output(),
+            ) => Some(r),
+        };
+        match out {
+            None => Ok(rupi_tools::ToolOutput::err("cancelled by user")),
+            Some(r) => Ok(Self::finish(r, timeout_secs)),
+        }
+    }
+}
+
+impl ExternalTool {
+    /// 起外部进程并把 arguments 灌进 stdin。失败直接给 tool error；
+    /// stdin 写失败时先 drop child（kill_on_drop 杀进程），不留孤儿。
+    async fn spawn_with_input(
+        m: &ExtensionManifest,
+        arguments: &serde_json::Value,
+    ) -> Result<tokio::process::Child, rupi_tools::ToolOutput> {
+        use tokio::io::AsyncWriteExt as _;
         let child = tokio::process::Command::new(&m.command)
             .args(&m.args)
             .envs(&m.env)
@@ -119,7 +167,7 @@ impl rupi_tools::Tool for ExternalTool {
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
-                return Ok(rupi_tools::ToolOutput::err(format!(
+                return Err(rupi_tools::ToolOutput::err(format!(
                     "spawn {} failed: {e}",
                     m.command
                 )));
@@ -128,16 +176,21 @@ impl rupi_tools::Tool for ExternalTool {
         if let Some(mut stdin) = child.stdin.take() {
             let body = arguments.to_string();
             if stdin.write_all(body.as_bytes()).await.is_err() {
-                return Ok(rupi_tools::ToolOutput::err("write stdin failed"));
+                drop(child);
+                return Err(rupi_tools::ToolOutput::err("write stdin failed"));
             }
         }
-        let timeout_secs = effective_timeout_secs(m.timeout_secs);
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
-        // 超时：timeout 会丢弃 wait future，连带 kill_on_drop(true) 干掉子进程，无僵尸
+        Ok(child)
+    }
+
+    /// wait/timeout 收尾（纯函数，取消/非取消路径共用）。
+    fn finish(
+        out: Result<
+            Result<std::process::Output, std::io::Error>,
+            tokio::time::error::Elapsed,
+        >,
+        timeout_secs: u64,
+    ) -> rupi_tools::ToolOutput {
         match out {
             Ok(Ok(out)) => {
                 // 外部进程输出同样有界：与内置 bash 同口径折叠，保上下文窗口
@@ -148,19 +201,19 @@ impl rupi_tools::Tool for ExternalTool {
                 .trim()
                 .to_string();
                 if out.status.success() {
-                    Ok(rupi_tools::ToolOutput::ok(text))
+                    rupi_tools::ToolOutput::ok(text)
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    Ok(rupi_tools::ToolOutput::err(format!(
+                    rupi_tools::ToolOutput::err(format!(
                         "exit {}: {err}",
                         out.status
-                    )))
+                    ))
                 }
             }
-            Ok(Err(e)) => Ok(rupi_tools::ToolOutput::err(format!("wait failed: {e}"))),
-            Err(_) => Ok(rupi_tools::ToolOutput::err(format!(
+            Ok(Err(e)) => rupi_tools::ToolOutput::err(format!("wait failed: {e}")),
+            Err(_) => rupi_tools::ToolOutput::err(format!(
                 "extension timed out after {timeout_secs}s"
-            ))),
+            )),
         }
     }
 }

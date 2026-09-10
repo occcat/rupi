@@ -1117,6 +1117,29 @@ impl rupi_tools::Tool for McpResourceReader {
             ))),
         }
     }
+
+    /// 取消即返回，不再等远端（桥内部请求继续跑完但无人消费，与超时同语义）。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &rupi_core::CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        let uri = arguments.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+        if uri.is_empty() {
+            return Ok(rupi_tools::ToolOutput::err(
+                "missing required argument: uri",
+            ));
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => Ok(rupi_tools::ToolOutput::err("cancelled by user")),
+            r = self.bridge.read_resource(uri) => match r {
+                Ok(text) => Ok(rupi_tools::ToolOutput::ok(text)),
+                Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                    "MCP resource read failed: {e:#}"
+                ))),
+            },
+        }
+    }
 }
 
 /// MCP 提示模板渲染器：每 server 注册一个 `{server}_get_prompt` 原生工具。
@@ -1193,6 +1216,33 @@ impl rupi_tools::Tool for McpPromptGetter {
             ))),
         }
     }
+
+    /// 取消即返回，不再等远端（与资源侧同策略）。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &rupi_core::CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        let name = arguments.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return Ok(rupi_tools::ToolOutput::err(
+                "missing required argument: name",
+            ));
+        }
+        let args = arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        tokio::select! {
+            _ = cancel.cancelled() => Ok(rupi_tools::ToolOutput::err("cancelled by user")),
+            r = self.bridge.get_prompt(name, args) => match r {
+                Ok(text) => Ok(rupi_tools::ToolOutput::ok(text)),
+                Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                    "MCP prompt render failed: {e:#}"
+                ))),
+            },
+        }
+    }
 }
 
 // ---- registerToolsFromMCP：把远端 MCP 工具注册为本地原生工具 ----
@@ -1240,6 +1290,27 @@ impl rupi_tools::Tool for McpToolExecutor {
             Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
                 "MCP call failed: {e:#}"
             ))),
+        }
+    }
+
+    /// 取消即返回，不再等远端（与资源/提示侧同策略）。
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &rupi_core::CancelFlag,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        tokio::select! {
+            _ = cancel.cancelled() => Ok(rupi_tools::ToolOutput::err("cancelled by user")),
+            r = self.bridge.call_tool(&self.tool_name, arguments, &self.input_schema) => match r {
+                Ok(r) => Ok(if r.is_error {
+                    rupi_tools::ToolOutput::err(r.text)
+                } else {
+                    rupi_tools::ToolOutput::ok(r.text)
+                }),
+                Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                    "MCP call failed: {e:#}"
+                ))),
+            },
         }
     }
 }
