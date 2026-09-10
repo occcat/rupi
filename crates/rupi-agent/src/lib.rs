@@ -18,6 +18,10 @@ pub use policy::{
 };
 pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
+pub mod hooks;
+pub use hooks::{
+    DenyToolsHook, HookDecision, RecordedCall, RecordingHook, RedirectCommandHook, ToolHook,
+};
 
 #[derive(Clone)]
 pub struct PromptBuilder {
@@ -73,6 +77,9 @@ pub struct AgentLoop {
     pub approver: Option<Arc<dyn Approver>>,
     /// 计划模式：禁 write/edit/bash（只侦察、不动手），并在系统提示中声明。
     pub plan_mode: bool,
+    /// 工具调用钩子（对标上游 beforeToolCall / afterToolCall）：
+    /// before 在权限门之前（可改写参数/提前拒绝），after 包住一切结果（含拒绝路径）。
+    pub hooks: Vec<Arc<dyn ToolHook>>,
 }
 
 impl AgentLoop {
@@ -89,6 +96,7 @@ impl AgentLoop {
             policy: Arc::new(policy::AllowAll),
             approver: None,
             plan_mode: false,
+            hooks: vec![],
         }
     }
 
@@ -120,6 +128,11 @@ impl AgentLoop {
 
     pub fn with_plan_mode(mut self, plan_mode: bool) -> Self {
         self.plan_mode = plan_mode;
+        self
+    }
+
+    pub fn with_hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
+        self.hooks.push(hook);
         self
     }
 
@@ -236,32 +249,47 @@ impl AgentLoop {
             let mut results = vec![];
             for (id, name, args) in calls {
                 tool_names.push(name.clone());
+                // before 钩子：可改写 args（后续钩子/策略门/执行看到新值）或提前拒绝
+                let mut args = args;
+                let mut hook_denied: Option<rupi_tools::ToolOutput> = None;
+                for h in &self.hooks {
+                    match h.before(&name, &args).await {
+                        HookDecision::Proceed { args: Some(a) } => args = a,
+                        HookDecision::Proceed { args: None } => {}
+                        HookDecision::Deny { reason } => {
+                            hook_denied = Some(rupi_tools::ToolOutput::err(format!(
+                                "denied by hook: {reason}"
+                            )));
+                            break;
+                        }
+                    }
+                }
                 on_event(AgentEvent::ToolStart {
                     tool_call_id: id.clone(),
                     name: name.clone(),
                     arguments: args.clone(),
                 });
                 // 权限门：拒绝 / 无审批的 Ask 一律转 tool error 回模型，主循环不中断
-                let denied: Option<rupi_tools::ToolOutput> = match self.policy.decide(&name, &args)
-                {
-                    Decision::Allow => None,
-                    Decision::Deny(reason) => Some(rupi_tools::ToolOutput::err(format!(
-                        "denied by policy: {reason}"
-                    ))),
-                    Decision::Ask(reason) => {
-                        let ok = match &self.approver {
-                            Some(a) => a.approve(&name, &args, &reason),
-                            None => false,
-                        };
-                        if ok {
-                            None
-                        } else {
-                            Some(rupi_tools::ToolOutput::err(format!(
-                                "denied (approval required): {reason}"
-                            )))
+                let denied: Option<rupi_tools::ToolOutput> =
+                    hook_denied.or(match self.policy.decide(&name, &args) {
+                        Decision::Allow => None,
+                        Decision::Deny(reason) => Some(rupi_tools::ToolOutput::err(format!(
+                            "denied by policy: {reason}"
+                        ))),
+                        Decision::Ask(reason) => {
+                            let ok = match &self.approver {
+                                Some(a) => a.approve(&name, &args, &reason),
+                                None => false,
+                            };
+                            if ok {
+                                None
+                            } else {
+                                Some(rupi_tools::ToolOutput::err(format!(
+                                    "denied (approval required): {reason}"
+                                )))
+                            }
                         }
-                    }
-                };
+                    });
                 // 计划模式兜底：即使策略放行，变更类工具也不执行
                 let denied = denied.or_else(|| {
                     if self.plan_mode && Self::is_mutating(&name) {
@@ -272,58 +300,57 @@ impl AgentLoop {
                         None
                     }
                 });
-                if let Some(out) = denied {
-                    on_event(AgentEvent::ToolEnd {
-                        tool_call_id: id.clone(),
-                        name: name.clone(),
-                        content: out.content.clone(),
-                        is_error: out.is_error,
-                    });
-                    results.push(ContentBlock::ToolResult {
-                        tool_call_id: id,
-                        content: out.content,
-                        is_error: out.is_error,
-                    });
-                    continue;
-                }
-                let out = if name == "load_skill" {
-                    let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    match skills.load_skill(sk) {
-                        Some(body) => rupi_tools::ToolOutput::ok(body),
-                        None => rupi_tools::ToolOutput::err(format!("unknown skill {sk}")),
-                    }
-                } else if name == "read_resource" {
-                    let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    match skills.read_resource(sk, rel) {
-                        Ok(body) => {
-                            // 资源文件可能很大：截断保窗口
-                            let mut capped = body.chars().take(20_000).collect::<String>();
-                            if body.chars().count() > 20_000 {
-                                capped.push_str("\n...[truncated: file larger than 20k chars]");
+                let mut out = match denied {
+                    Some(out) => out,
+                    None => {
+                        if name == "load_skill" {
+                            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            match skills.load_skill(sk) {
+                                Some(body) => rupi_tools::ToolOutput::ok(body),
+                                None => rupi_tools::ToolOutput::err(format!("unknown skill {sk}")),
                             }
-                            rupi_tools::ToolOutput::ok(capped)
-                        }
-                        Err(e) => {
-                            rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}"))
-                        }
-                    }
-                } else {
-                    // 工具执行错误一律转 tool error 回模型，主循环不中断
-                    // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
-                    match mem.handle_tool_call(&name, args.clone()).await {
-                        Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
-                        Ok(None) => tools
-                            .execute(&name, args.clone())
-                            .await
-                            .unwrap_or_else(|e| {
-                                rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
-                            }),
-                        Err(e) => {
-                            rupi_tools::ToolOutput::err(format!("memory tool {name} failed: {e:#}"))
+                        } else if name == "read_resource" {
+                            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            match skills.read_resource(sk, rel) {
+                                Ok(body) => {
+                                    // 资源文件可能很大：截断保窗口
+                                    let mut capped = body.chars().take(20_000).collect::<String>();
+                                    if body.chars().count() > 20_000 {
+                                        capped.push_str(
+                                            "\n...[truncated: file larger than 20k chars]",
+                                        );
+                                    }
+                                    rupi_tools::ToolOutput::ok(capped)
+                                }
+                                Err(e) => rupi_tools::ToolOutput::err(format!(
+                                    "read_resource failed: {e:#}"
+                                )),
+                            }
+                        } else {
+                            // 工具执行错误一律转 tool error 回模型，主循环不中断
+                            // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
+                            match mem.handle_tool_call(&name, args.clone()).await {
+                                Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
+                                Ok(None) => tools
+                                    .execute(&name, args.clone())
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        rupi_tools::ToolOutput::err(format!(
+                                            "tool {name} failed: {e:#}"
+                                        ))
+                                    }),
+                                Err(e) => rupi_tools::ToolOutput::err(format!(
+                                    "memory tool {name} failed: {e:#}"
+                                )),
+                            }
                         }
                     }
                 };
+                // after 钩子：观察/改写结果（含拒绝路径），再回模型
+                for h in &self.hooks {
+                    out = h.after(&name, &args, out).await;
+                }
                 on_event(AgentEvent::ToolEnd {
                     tool_call_id: id.clone(),
                     name: name.clone(),
@@ -809,5 +836,128 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(all.contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn hook_deny_short_circuits_before_execution() {
+        let mk_call = || ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo should-not-run"}),
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let rec = Arc::new(RecordingHook::default());
+        let agent = AgentLoop::new(5)
+            .with_hook(Arc::new(DenyToolsHook::new(["bash"])))
+            .with_hook(rec.clone());
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-hook-deny");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &MockProvider::new(vec![mk_call(), MockProvider::text_response("d")]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("denied by hook"));
+        // 精确证明未执行：Tool 角色消息里只有拒绝结果，没有真实回包
+        let tool_results: Vec<_> = session
+            .history()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| m.blocks.iter())
+            .collect();
+        assert!(!tool_results.is_empty());
+        for b in tool_results {
+            match b {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    assert!(*is_error);
+                    assert!(content.contains("denied by hook"));
+                }
+                _ => {}
+            }
+        }
+        // ToolCall 参数原文仍在历史里（模型发出的请求），不作否定断言。
+        // after 钩子同样包住拒绝路径
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].is_error);
+    }
+
+    #[tokio::test]
+    async fn hook_rewrite_applies_before_execution() {
+        let mk_call = || ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "original-cmd"}),
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let agent = AgentLoop::new(5).with_hook(Arc::new(RedirectCommandHook::new(vec![(
+            "original-cmd",
+            "echo rewritten-ok",
+        )])));
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-hook-rewrite");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &MockProvider::new(vec![mk_call(), MockProvider::text_response("d")]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 未改写会是 exit 127；改写后真实执行 echo
+        assert!(all.contains("rewritten-ok"));
+        assert!(!all.contains("exit 127"));
     }
 }
