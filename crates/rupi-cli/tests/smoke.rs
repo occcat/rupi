@@ -415,7 +415,8 @@ fn repl_toggles_all_respond() {
     let o = chat_with(
         &home,
         &[],
-        "/plan\n/thinking\n/model\n/skills\n/commands\n/reload\n/tree\n/rewind\n/quit\n".as_bytes(),
+        "/plan\n/thinking\n/model\n/skills\n/commands\n/reload\n/tree\n/rewind\n/goto zzz\n/quit\n"
+            .as_bytes(),
     );
     let (out, _) = out_text(&o);
     assert!(o.status.success(), "开关遍历非零退出: {o:?}");
@@ -425,6 +426,8 @@ fn repl_toggles_all_respond() {
         "[model ",
         "[ext] no changes",
         "[rewind] nothing to undo",
+        "(empty session",
+        "unknown or ambiguous",
     ] {
         assert!(out.contains(want), "缺 `{want}`:\n{out}");
     }
