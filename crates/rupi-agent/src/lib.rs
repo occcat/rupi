@@ -62,6 +62,24 @@ impl PromptBuilder {
     }
 }
 
+/// 工具执行策略：对标上游 `toolExecution: "parallel" | "sequential"`。
+/// 默认串行（历史行为；审批问询顺序确定）。并行时“门”（before 钩子/策略/审批/计划模式）
+/// 仍在第一阶段顺序执行，只并发第二阶段的真实执行；事件流与结果顺序保持原序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolExecution {
+    #[default]
+    Sequential,
+    Parallel,
+}
+
+/// 第一阶段产物：门已过完（或已拒绝），等第二阶段真实执行。
+struct PendingCall {
+    id: String,
+    name: String,
+    args: serde_json::Value,
+    denied: Option<rupi_tools::ToolOutput>,
+}
+
 #[derive(Clone)]
 pub struct AgentLoop {
     pub max_turns: u32,
@@ -80,6 +98,8 @@ pub struct AgentLoop {
     /// 工具调用钩子（对标上游 beforeToolCall / afterToolCall）：
     /// before 在权限门之前（可改写参数/提前拒绝），after 包住一切结果（含拒绝路径）。
     pub hooks: Vec<Arc<dyn ToolHook>>,
+    /// 工具执行策略，默认串行。
+    pub tool_execution: ToolExecution,
 }
 
 impl AgentLoop {
@@ -97,6 +117,7 @@ impl AgentLoop {
             approver: None,
             plan_mode: false,
             hooks: vec![],
+            tool_execution: ToolExecution::Sequential,
         }
     }
 
@@ -134,6 +155,56 @@ impl AgentLoop {
     pub fn with_hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
         self.hooks.push(hook);
         self
+    }
+
+    pub fn with_tool_execution(mut self, tool_execution: ToolExecution) -> Self {
+        self.tool_execution = tool_execution;
+        self
+    }
+
+    /// 第二阶段：真实执行一个放行的工具调用（memory 路由 + skill 内建 + 注册表）。
+    /// 串行/并行共用；denied 短路由调用方处理，这里只管执行，错误一律转 tool error。
+    async fn execute_allowed(
+        tools: &ToolRegistry,
+        mem: &MemoryManager,
+        skills: &SkillRegistry,
+        name: &str,
+        args: serde_json::Value,
+    ) -> rupi_tools::ToolOutput {
+        if name == "load_skill" {
+            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            match skills.load_skill(sk) {
+                Some(body) => rupi_tools::ToolOutput::ok(body),
+                None => rupi_tools::ToolOutput::err(format!("unknown skill {sk}")),
+            }
+        } else if name == "read_resource" {
+            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            match skills.read_resource(sk, rel) {
+                Ok(body) => {
+                    // 资源文件可能很大：截断保窗口
+                    let mut capped = body.chars().take(20_000).collect::<String>();
+                    if body.chars().count() > 20_000 {
+                        capped.push_str("\n...[truncated: file larger than 20k chars]");
+                    }
+                    rupi_tools::ToolOutput::ok(capped)
+                }
+                Err(e) => rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}")),
+            }
+        } else {
+            // 工具执行错误一律转 tool error 回模型，主循环不中断
+            // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
+            match mem.handle_tool_call(&name, args.clone()).await {
+                Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
+                Ok(None) => tools
+                    .execute(&name, args.clone())
+                    .await
+                    .unwrap_or_else(|e| {
+                        rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
+                    }),
+                Err(e) => rupi_tools::ToolOutput::err(format!("memory tool {name} failed: {e:#}")),
+            }
+        }
     }
 
     fn is_mutating(tool: &str) -> bool {
@@ -247,6 +318,9 @@ impl AgentLoop {
                 })
                 .collect();
             let mut results = vec![];
+            // 第一阶段（顺序）：before 钩子改写/拒绝 → ToolStart → 权限门/审批/计划模式。
+            // 问询类动作保持原序；真实执行留到第二阶段（串行或并发），事件与结果保原序。
+            let mut pending: Vec<PendingCall> = vec![];
             for (id, name, args) in calls {
                 tool_names.push(name.clone());
                 // before 钩子：可改写 args（后续钩子/策略门/执行看到新值）或提前拒绝
@@ -300,65 +374,55 @@ impl AgentLoop {
                         None
                     }
                 });
-                let mut out = match denied {
-                    Some(out) => out,
-                    None => {
-                        if name == "load_skill" {
-                            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            match skills.load_skill(sk) {
-                                Some(body) => rupi_tools::ToolOutput::ok(body),
-                                None => rupi_tools::ToolOutput::err(format!("unknown skill {sk}")),
-                            }
-                        } else if name == "read_resource" {
-                            let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                            match skills.read_resource(sk, rel) {
-                                Ok(body) => {
-                                    // 资源文件可能很大：截断保窗口
-                                    let mut capped = body.chars().take(20_000).collect::<String>();
-                                    if body.chars().count() > 20_000 {
-                                        capped.push_str(
-                                            "\n...[truncated: file larger than 20k chars]",
-                                        );
-                                    }
-                                    rupi_tools::ToolOutput::ok(capped)
-                                }
-                                Err(e) => rupi_tools::ToolOutput::err(format!(
-                                    "read_resource failed: {e:#}"
-                                )),
-                            }
-                        } else {
-                            // 工具执行错误一律转 tool error 回模型，主循环不中断
-                            // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
-                            match mem.handle_tool_call(&name, args.clone()).await {
-                                Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
-                                Ok(None) => tools
-                                    .execute(&name, args.clone())
+                pending.push(PendingCall {
+                    id,
+                    name,
+                    args,
+                    denied,
+                });
+            }
+            // 第二阶段：真实执行（串行逐个 await；并行 join_all 并发，结果保原序）
+            let executed: Vec<rupi_tools::ToolOutput> = match self.tool_execution {
+                ToolExecution::Sequential => {
+                    let mut outs = Vec::with_capacity(pending.len());
+                    for p in &pending {
+                        outs.push(match &p.denied {
+                            Some(o) => o.clone(),
+                            None => {
+                                Self::execute_allowed(tools, mem, skills, &p.name, p.args.clone())
                                     .await
-                                    .unwrap_or_else(|e| {
-                                        rupi_tools::ToolOutput::err(format!(
-                                            "tool {name} failed: {e:#}"
-                                        ))
-                                    }),
-                                Err(e) => rupi_tools::ToolOutput::err(format!(
-                                    "memory tool {name} failed: {e:#}"
-                                )),
+                            }
+                        });
+                    }
+                    outs
+                }
+                ToolExecution::Parallel => {
+                    futures::future::join_all(pending.iter().map(|p| async {
+                        match &p.denied {
+                            Some(o) => o.clone(),
+                            None => {
+                                Self::execute_allowed(tools, mem, skills, &p.name, p.args.clone())
+                                    .await
                             }
                         }
-                    }
-                };
+                    }))
+                    .await
+                }
+            };
+            // 第三阶段（顺序）：after 钩子 → ToolEnd → 结果入历史，保持原序
+            for (p, mut out) in pending.into_iter().zip(executed) {
                 // after 钩子：观察/改写结果（含拒绝路径），再回模型
                 for h in &self.hooks {
-                    out = h.after(&name, &args, out).await;
+                    out = h.after(&p.name, &p.args, out).await;
                 }
                 on_event(AgentEvent::ToolEnd {
-                    tool_call_id: id.clone(),
-                    name: name.clone(),
+                    tool_call_id: p.id.clone(),
+                    name: p.name.clone(),
                     content: out.content.clone(),
                     is_error: out.is_error,
                 });
                 results.push(ContentBlock::ToolResult {
-                    tool_call_id: id,
+                    tool_call_id: p.id,
                     content: out.content,
                     is_error: out.is_error,
                 });
@@ -894,9 +958,7 @@ mod tests {
         for b in tool_results {
             match b {
                 ContentBlock::ToolResult {
-                    content,
-                    is_error,
-                    ..
+                    content, is_error, ..
                 } => {
                     assert!(*is_error);
                     assert!(content.contains("denied by hook"));
@@ -959,5 +1021,109 @@ mod tests {
         // 未改写会是 exit 127；改写后真实执行 echo
         assert!(all.contains("rewritten-ok"));
         assert!(!all.contains("exit 127"));
+    }
+
+    #[test]
+    fn default_tool_execution_is_sequential() {
+        assert_eq!(AgentLoop::new(3).tool_execution, ToolExecution::Sequential);
+    }
+
+    fn two_bash_calls(cmd1: &str, cmd2: &str) -> ChatResponse {
+        ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![
+                    ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": cmd1}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "c2".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": cmd2}),
+                    },
+                ],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        }
+    }
+
+    fn tool_result_texts(session: &SessionTree) -> Vec<String> {
+        session
+            .history()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.trim().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn parallel_preserves_result_order() {
+        use rupi_core::ContentBlock;
+        let agent = AgentLoop::new(5).with_tool_execution(ToolExecution::Parallel);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-par-order");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &MockProvider::new(vec![
+                    two_bash_calls("echo par-a", "echo par-b"),
+                    MockProvider::text_response("d"),
+                ]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(tool_result_texts(&session), vec!["par-a", "par-b"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_runs_concurrently() {
+        let agent = AgentLoop::new(5).with_tool_execution(ToolExecution::Parallel);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-par-time");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let t = std::time::Instant::now();
+        agent
+            .run(
+                &MockProvider::new(vec![
+                    two_bash_calls("sleep 2", "sleep 2"),
+                    MockProvider::text_response("d"),
+                ]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        // 串行至少 4s；并行约 2s，3.5s 上限留足余量
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(3500),
+            "parallel took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(tool_result_texts(&session).len(), 2);
     }
 }

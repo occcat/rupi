@@ -87,6 +87,9 @@ struct Cli {
     /// 恢复历史会话继续聊（sessions 命令看 id）
     #[arg(long)]
     resume: Option<String>,
+    /// 工具并发执行（对标上游 toolExecution: parallel；默认串行，审批问询保序）
+    #[arg(long, default_value_t = false)]
+    parallel_tools: bool,
 }
 
 #[derive(Subcommand)]
@@ -465,6 +468,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         .with_policy(Arc::new(default_policy()))
         .with_approver(Arc::new(TerminalApprover::default()))
         .with_plan_mode(cli.plan);
+    if cli.parallel_tools {
+        agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
+        println!("[parallel tools] tool calls in one turn run concurrently");
+    }
     if cli.plan {
         println!("[plan mode] read-only: write/edit/bash disabled");
     }
@@ -707,6 +714,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         .with_policy(Arc::new(default_policy()))
         .with_approver(Arc::new(rupi_tui::TuiApprover::default()))
         .with_plan_mode(cli.plan);
+    if cli.parallel_tools {
+        agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
+        eprintln!("[parallel tools] tool calls in one turn run concurrently");
+    }
     if cli.subagents {
         let sub = SubagentTool::new(
             provider.clone(),
