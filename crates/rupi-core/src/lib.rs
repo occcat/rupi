@@ -301,6 +301,10 @@ impl SessionTree {
         for r in &roots {
             dfs(self, &children, &on_path, r, 0, &mut out);
         }
+        // 空树不回空串：调用方（REPL/TUI）直接打印，空串等于零输出
+        if out.is_empty() {
+            out.push_str("(empty session — send a message first)");
+        }
         out
     }
 }

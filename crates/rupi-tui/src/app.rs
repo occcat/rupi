@@ -147,7 +147,13 @@ fn dispatch_builtin(
         return Builtin::Quit;
     }
     if t == "/skills" {
-        return Builtin::Done(skills.index_block());
+        // 空注册表给提示（与 CLI skills-list 同文案），不推空行进视图
+        let block = skills.index_block();
+        return Builtin::Done(if block.is_empty() {
+            "no skills found. distill one with `skill-distill <name> <desc> <steps...>`".into()
+        } else {
+            block
+        });
     }
     if t == "/commands" {
         return Builtin::Done(commands::index_block(command_dirs));
@@ -803,5 +809,51 @@ mod tests {
             &[],
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
+    }
+
+    #[test]
+    fn read_only_views_never_fall_through_to_model() {
+        use rupi_core::Message;
+        let (mut agent, mut session, mut provider, skills) = harness();
+        // 空技能注册表给提示而非空行（与 CLI 同文案）
+        let msg = done_text(dispatch_builtin(
+            "/skills",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(msg.contains("no skills found"), "{msg}");
+        // 空命令目录给指引
+        let msg = done_text(dispatch_builtin(
+            "/commands",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(msg.contains("no custom commands"), "{msg}");
+        // 空树也有视图（不空返回、不漏进模型）
+        let msg = done_text(dispatch_builtin(
+            "/tree",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(!msg.is_empty(), "空树视图不应为空");
+        session.push(Message::text(rupi_core::Role::User, "hi"));
+        let msg2 = done_text(dispatch_builtin(
+            "/tree",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert_ne!(msg, msg2, "有节点后视图应变化");
     }
 }
