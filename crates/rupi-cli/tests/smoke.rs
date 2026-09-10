@@ -386,6 +386,29 @@ fn memory_write_refuses_secrets() {
 }
 
 #[test]
+fn ext_list_discovers_valid_and_skips_invalid() {
+    // 扩展发现端到端：有效 manifest 列出，非法（坏名/坏 schema）静默跳过不炸整单
+    let home = fresh_home();
+    let dir = home.join("extensions");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("shout.json"),
+        r#"{"name":"shout","description":"shout text","input_schema":{"type":"object"},"command":"true"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bad.json"),
+        r#"{"name":"Bad Name!","description":"bad","input_schema":[],"command":""}"#,
+    )
+    .unwrap();
+    let o = rupi(&home, &["ext-list"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "ext-list 非零退出: {o:?}");
+    assert!(out.contains("shout"), "有效扩展未列出:\n{out}");
+    assert!(!out.contains("Bad Name"), "非法扩展应跳过:\n{out}");
+}
+
+#[test]
 fn trust_gate_skip_remember_and_silence() {
     // 项目信任门三态：n 跳过进聊天、y 记住、下次同目录免扰（cwd 即 home，项目资源自带）。
     let home = fresh_home();
