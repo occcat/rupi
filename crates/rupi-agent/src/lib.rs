@@ -751,7 +751,9 @@ impl AgentLoop {
 
         let mut input = String::new();
         if let Some(old) = &session.summary {
-            input.push_str(&format!("Previous summary:\n{old}\n\nNew messages:\n"));
+            // 旧文件块剥掉再喂（合并后重贴权威表，不让模型复述旧列表）
+            let clean = strip_file_op_tags(old);
+            input.push_str(&format!("Previous summary:\n{clean}\n\nNew messages:\n"));
         }
         input.push_str(&chunk.join("\n---\n"));
         let req = ChatRequest {
@@ -782,6 +784,11 @@ impl AgentLoop {
                     .join("\n")
             }
         };
+        // 文件足迹追加：旧摘要块 ∪ 本轮被压区间（kept 尾部不算），LLM 成败都贴
+        let (read_files, modified_files) =
+            merged_file_lists(session.summary.as_deref(), &session.history()[..cut]);
+        let mut summary = summary;
+        summary.push_str(&format_file_operations(&read_files, &modified_files));
         session.set_summary(summary, through);
         tracing::info!("session compressed: {total} msgs, kept last {keep_last}");
     }
@@ -801,6 +808,127 @@ impl AgentLoop {
             cb(s);
         }
     }
+}
+
+/// 压缩文件足迹（对标上游 `extractFileOps/formatFileOperations`）：
+/// 被压掉区间里 read/write/edit 碰过的文件，摘要后追加确定性 `<read-files>/`
+/// `<modified-files>` 块——LLM 自由文本之外，文件上下文不丢；多轮压实通过解析
+/// 旧摘要的同名块合并累积（上游 details.readFiles/modifiedFiles 同约）。
+fn extract_file_ops(messages: &[&Message]) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    let mut modified: BTreeSet<String> = BTreeSet::new();
+    for m in messages {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        for b in &m.blocks {
+            if let ContentBlock::ToolCall { name, arguments, .. } = b {
+                let Some(path) = arguments.get("path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if path.is_empty() {
+                    continue;
+                }
+                match name.as_str() {
+                    "read" => {
+                        read.insert(path.to_string());
+                    }
+                    "write" | "edit" => {
+                        modified.insert(path.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // 先读后改的归已改（上游 computeFileLists 同约），两表各自有序去重
+    let read_only: Vec<String> = read.difference(&modified).cloned().collect();
+    (read_only, modified.into_iter().collect())
+}
+
+/// 解析旧摘要自带的同名块（累积用）；没有返回空表。
+fn parse_file_op_tags(summary: &str) -> (Vec<String>, Vec<String>) {
+    fn section(text: &str, tag: &str) -> Vec<String> {
+        let open = format!("<{tag}>\n");
+        let close = format!("\n</{tag}>");
+        let Some(s) = text.find(&open) else {
+            return vec![];
+        };
+        let rest = &text[s + open.len()..];
+        let Some(e) = rest.find(&close) else {
+            return vec![];
+        };
+        rest[..e]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    (section(summary, "read-files"), section(summary, "modified-files"))
+}
+
+/// 旧摘要喂模型前剥掉同名块（合并后重贴权威表，避免模型复述/篡改旧列表）。
+fn strip_file_op_tags(summary: &str) -> String {
+    let mut out = summary.to_string();
+    for tag in ["read-files", "modified-files"] {
+        loop {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let Some(s) = out.find(&open) else {
+                break;
+            };
+            let Some(e) = out[s..].find(&close) else {
+                break;
+            };
+            // 连带块前至多两个换行一起吃掉，不留空白堆积
+            let mut start = s;
+            for _ in 0..2 {
+                if out[..start].ends_with('\n') {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            out.replace_range(start..s + e + close.len(), "");
+        }
+    }
+    out
+}
+
+fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = vec![];
+    if !read_files.is_empty() {
+        sections.push(format!("<read-files>\n{}\n</read-files>", read_files.join("\n")));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        return String::new();
+    }
+    format!("\n\n{}", sections.join("\n\n"))
+}
+
+/// 合并：旧摘要块 ∪ 本轮被压区间新足迹（BTreeSet 去重排序）。
+fn merged_file_lists(previous: Option<&str>, chunk: &[&Message]) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let (old_read, old_modified) = previous.map(parse_file_op_tags).unwrap_or_default();
+    let (fresh_read, fresh_modified) = extract_file_ops(chunk);
+    let read: Vec<String> = old_read.into_iter().chain(fresh_read).collect::<BTreeSet<_>>().into_iter().collect();
+    let modified: Vec<String> = old_modified
+        .into_iter()
+        .chain(fresh_modified)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // 合并后仍守“先读后改归已改”
+    let read_only: Vec<String> = read.into_iter().filter(|f| !modified.contains(f)).collect();
+    (read_only, modified)
 }
 
 /// 把任意 `Tool` 适配成 `Extension`（Pi 的 registerTool 语义）。
@@ -952,9 +1080,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    fn tool_msg(name: &str, args: serde_json::Value) -> Message {
+        let mut m = Message::text(Role::Assistant, "");
+        m.blocks.push(ContentBlock::ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args,
+        });
+        m
+    }
+
+    #[test]
+    fn file_ops_extract_sorts_and_dedups() {
+        let owned = [
+            tool_msg("read", serde_json::json!({"path": "b.txt"})),
+            tool_msg("read", serde_json::json!({"path": "a.txt"})),
+            tool_msg("edit", serde_json::json!({"path": "a.txt"})),
+            tool_msg("write", serde_json::json!({"path": "c.txt"})),
+            tool_msg("bash", serde_json::json!({"command": "ls"})),
+            Message::text(Role::User, "read b.txt"),
+        ];
+        let refs: Vec<&Message> = owned.iter().collect();
+        let (read, modified) = extract_file_ops(&refs);
+        // 先读后改的 a 归已改；bash 无 path 忽略；用户消息不算
+        assert_eq!(read, vec!["b.txt".to_string()]);
+        assert_eq!(
+            modified,
+            vec!["a.txt".to_string(), "c.txt".to_string()]
+        );
+        // 空输入 → 空表 → 无块
+        assert_eq!(
+            extract_file_ops(&[]),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        assert_eq!(format_file_operations(&[], &[]), "");
+    }
+
     #[tokio::test]
-    async fn force_compress_compacts_without_threshold() {
-        // /compact 直调 force：阈值检查跳过，条数够切即压；短历史无操作不烧模型。
+    async fn compress_appends_file_lists_for_compressed_range_only() {
+        // keep=2/total=6 → 前 4 条被压；尾部工具调用不进摘要
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let mut session = SessionTree::new();
+        session.push(Message::text(Role::User, "start"));
+        session.push(tool_msg("edit", serde_json::json!({"path": "old.txt"})));
+        session.push(Message::text(Role::User, "more"));
+        session.push(tool_msg("read", serde_json::json!({"path": "ref.txt"})));
+        session.push(Message::text(Role::User, "tail"));
+        session.push(tool_msg("write", serde_json::json!({"path": "tail.txt"})));
+        let home = std::env::temp_dir().join(format!("rupi-agent-fileops-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .force_compress(
+                &MockProvider::new(vec![MockProvider::text_response("SUM")]),
+                &mut session,
+                &mem,
+            )
+            .await;
+        let s = session.summary.clone().expect("summary");
+        assert!(s.starts_with("SUM"), "{s}");
+        assert!(s.contains("<modified-files>\nold.txt\n</modified-files>"), "{s}");
+        assert!(s.contains("<read-files>\nref.txt\n</read-files>"), "{s}");
+        assert!(!s.contains("tail.txt"), "kept 尾部足迹不应进摘要：{s}");
+    }
+
+    #[tokio::test]
+    async fn compress_merges_file_lists_across_rounds() {
+        // 第二轮压实：旧块 ∪ 新足迹，且同名块只出现一次
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let mut session = SessionTree::new();
+        for i in 0..3 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        // 工具调用放在被压区间内（索引 3，前 4 条被压），另两条填充 kept 尾部
+        session.push(tool_msg("write", serde_json::json!({"path": "new.txt"})));
+        session.push(Message::text(Role::User, "tail one padding xxxxxxxxxx"));
+        session.push(Message::text(Role::User, "tail two padding xxxxxxxxxx"));
+        let through = session.current_path[0].clone();
+        session.set_summary(
+            "prev prose\n\n<modified-files>\nancient.txt\n</modified-files>".into(),
+            through,
+        );
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-fileops2-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .force_compress(
+                &MockProvider::new(vec![MockProvider::text_response("SUM2")]),
+                &mut session,
+                &mem,
+            )
+            .await;
+        let s = session.summary.clone().expect("summary");
+        assert!(s.contains("ancient.txt"), "{s}");
+        assert!(s.contains("new.txt"), "{s}");
+        assert_eq!(s.matches("<modified-files>").count(), 1, "块只能出现一次：{s}");
+        assert_eq!(s.matches("<read-files>").count(), 0, "无读足迹不应有空块：{s}");
+    }
+
+    #[tokio::test]
+    async fn compress_without_tool_calls_appends_no_tags() {
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let mut session = SessionTree::new();
+        for i in 0..4 {
+            session.push(Message::text(
+                Role::User,
+                format!("plain message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-fileops3-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .force_compress(
+                &MockProvider::new(vec![MockProvider::text_response("SUM3")]),
+                &mut session,
+                &mem,
+            )
+            .await;
+        assert_eq!(session.summary.as_deref(), Some("SUM3"));
+    }
+
+    #[tokio::test]
+    async fn force_compress_compacts_without_threshold() {        // /compact 直调 force：阈值检查跳过，条数够切即压；短历史无操作不烧模型。
         let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
         let mut session = SessionTree::new();
         for i in 0..6 {
