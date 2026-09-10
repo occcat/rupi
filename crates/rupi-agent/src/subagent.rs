@@ -234,8 +234,6 @@ mod tests {
     use rupi_memory::MemoryStore;
     use rupi_tools::Tool as _;
 
-    fn ignore(_: AgentEvent) {}
-
     fn ctx() -> (
         Arc<MockProvider>,
         Arc<ToolRegistry>,

@@ -1723,7 +1723,6 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_preserves_result_order() {
-        use rupi_core::ContentBlock;
         let agent = AgentLoop::new(5).with_tool_execution(ToolExecution::Parallel);
         let mut session = SessionTree::new();
         let tools = ToolRegistry::with_builtins();

@@ -54,7 +54,7 @@ export RUPI_GEMINI_KEY=... # 或 GEMINI_API_KEY / GOOGLE_API_KEY；网关 RUPI_G
 ./target/debug/rupi mcp-list python3 crates/rupi-mcp/tests/fake_mcp_server.py
 echo '[{"name":"fake","command":"python3","args":["crates/rupi-mcp/tests/fake_mcp_server.py"],"env":{}}]' > /tmp/mcp.json
 echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
-# → [mcp] 2 tools: fake_echo, fake_fail
+# → [mcp] 3 tools: mcp_echo, mcp_fail, mcp_roots_probe
 ```
 
 语义与 `pi-directx` 一致：stdio 上换行分隔 JSON-RPC 2.0，
