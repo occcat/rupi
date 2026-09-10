@@ -271,4 +271,11 @@ fn mcp_list_probes_fake_server() {
         "mcp-list 失败:\nstdout={out}\nstderr={err}"
     );
     assert!(out.contains("mcp_echo"), "未探到 fake 工具:\n{out}");
+    assert!(out.contains("== resources =="), "缺资源区段:\n{out}");
+    assert!(
+        out.contains("test://notes/hello"),
+        "未探到 fake 资源:\n{out}"
+    );
+    assert!(out.contains("== prompts =="), "缺模板区段:\n{out}");
+    assert!(out.contains("greet"), "未探到 fake 模板:\n{out}");
 }

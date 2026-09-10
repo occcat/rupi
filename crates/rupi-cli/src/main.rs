@@ -165,8 +165,14 @@ enum Cmd {
     Sessions,
     /// 查看会话明细
     SessionShow { id: String },
-    /// MCP tools/list 探活
-    McpList { command: String, args: Vec<String> },
+    /// MCP 探活：tools/resources/prompts 三区段（stdio 命令或 `--url` 二选一）
+    McpList {
+        command: String,
+        args: Vec<String>,
+        /// StreamableHTTP 端点；给出即走 HTTP 而非 spawn stdio（此时 command/args 忽略）
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 fn home_dir() -> PathBuf {
@@ -451,12 +457,37 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Some(Cmd::McpList { command, args }) => {
-            let cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
-            let bridge = rupi_mcp::McpBridge::spawn(cfg).await?;
+        Some(Cmd::McpList { command, args, url }) => {
+            let mut cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
+            cfg.url = url;
+            let bridge = if cfg.url.is_some() {
+                rupi_mcp::McpBridge::spawn_http(cfg).await?
+            } else {
+                rupi_mcp::McpBridge::spawn(cfg).await?
+            };
+            println!("== tools ==");
             for t in bridge.list_tools().await? {
                 let d = rupi_mcp::mcp_tool_to_definition("mcp", &t);
                 println!("{} — {}", d.name, d.description);
+            }
+            // 资源/模板是可选能力：server 不支持（MethodNotFound）只记 stderr，不炸整单
+            println!("== resources ==");
+            match bridge.list_resources().await {
+                Ok(rs) => {
+                    for r in rs {
+                        println!("{} — {}", r.uri, r.name);
+                    }
+                }
+                Err(e) => eprintln!("[mcp-list] resources unsupported: {e:#}"),
+            }
+            println!("== prompts ==");
+            match bridge.list_prompts().await {
+                Ok(ps) => {
+                    for p in ps {
+                        println!("{} — {}", p.name, p.description.as_deref().unwrap_or(""));
+                    }
+                }
+                Err(e) => eprintln!("[mcp-list] prompts unsupported: {e:#}"),
             }
         }
         Some(Cmd::Run { ref prompt }) => {
