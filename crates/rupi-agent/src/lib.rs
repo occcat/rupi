@@ -446,6 +446,11 @@ impl AgentLoop {
                     return Err(e);
                 }
             };
+            // provider 显式失败终结（如 Gemini TOO_MANY_TOOL_CALLS/SAFETY 家族已归一化为
+            // "error"）：必须 abort，不能把截断/空输出当 Done 呈现，更不能拿残缺工具调用去执行。
+            if resp.stop_reason == "error" {
+                anyhow::bail!("{} reported error stop reason", provider.name());
+            }
             // select 竞速可能提前 break，排空残留 delta 保顺序完整
             while let Ok(rupi_llm::StreamEvent::TextDelta(delta)) = rx.try_recv() {
                 on_event(AgentEvent::TextDelta { delta });
@@ -1199,6 +1204,37 @@ mod tests {
         assert!(format!("{err:#}").contains("prompt is too long"));
         // 两次恢复都压过（第二次是无新内容重复压，有界收敛不打转）
         assert!(*provider.calls.lock().unwrap() == 1 + MAX_OVERFLOW_RECOVERIES);
+    }
+
+    #[tokio::test]
+    async fn error_stop_reason_aborts_instead_of_done() {
+        // provider 显式失败终结：即使带文本/调用残片也不执行，直接报错
+        //（此前会把截断输出当 Done 呈现；对标上游 error stopReason）。
+        let bad = ChatResponse {
+            message: Message::text(Role::Assistant, "partial"),
+            stop_reason: "error".into(),
+        };
+        let provider = MockProvider::new(vec![bad]);
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join(format!("rupi-agent-errstop-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let err = agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("error stop reason"));
     }
 
     #[tokio::test]

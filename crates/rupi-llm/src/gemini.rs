@@ -183,6 +183,32 @@ pub fn error_text(v: &serde_json::Value) -> Option<&str> {
     v.pointer("/error/message").and_then(|s| s.as_str())
 }
 
+/// 终结原因归一化（对标上游 `mapStopReasonString` 的 error 分支，含 v0.85.1 后新增的
+/// `TOO_MANY_TOOL_CALLS`）：安全/配额/畸形调用等失败族统一为 `"error"`，主循环据此
+/// abort 而不是把截断输出当 Done 呈现。`STOP` 等非失败值保持本地原样透传——全量
+/// `StopReason` 词表统一等主循环消费更多状态（length/refusal）时再做，避免空转 churn。
+pub fn normalize_finish_reason(reason: &str) -> &str {
+    match reason {
+        "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "SAFETY"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION"
+        | "IMAGE_OTHER"
+        | "RECITATION"
+        | "FINISH_REASON_UNSPECIFIED"
+        | "OTHER"
+        | "LANGUAGE"
+        | "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "NO_IMAGE" => "error",
+        _ => reason,
+    }
+}
+
 /// 非流回包解析：首 candidate；functionCall 无 id，用序号合成（执行按名路由）。
 pub fn parse_gemini_response(v: serde_json::Value) -> anyhow::Result<super::ChatResponse> {
     if error_text(&v).is_some() {
@@ -236,11 +262,12 @@ pub fn parse_gemini_response(v: serde_json::Value) -> anyhow::Result<super::Chat
             provider: Some("gemini".into()),
             created_at: chrono::Utc::now(),
         },
-        stop_reason: cand
-            .get("finishReason")
-            .and_then(|s| s.as_str())
-            .unwrap_or("STOP")
-            .to_string(),
+        stop_reason: normalize_finish_reason(
+            cand.get("finishReason")
+                .and_then(|s| s.as_str())
+                .unwrap_or("STOP"),
+        )
+        .to_string(),
     })
 }
 
@@ -333,9 +360,10 @@ impl GeminiAccumulator {
                 provider: Some("gemini".into()),
                 created_at: chrono::Utc::now(),
             },
-            stop_reason: self
-                .finish_reason
-                .unwrap_or_else(|| default_stop.to_string()),
+            stop_reason: normalize_finish_reason(
+                self.finish_reason.as_deref().unwrap_or(default_stop),
+            )
+            .to_string(),
         }
     }
 }
@@ -537,6 +565,32 @@ mod tests {
         let v = serde_json::json!({"error": {"code": 400, "message": "bad key"}});
         assert_eq!(error_text(&v), Some("bad key"));
         assert!(parse_gemini_response(v).is_err());
+    }
+
+    #[test]
+    fn error_family_finish_reasons_normalize_to_error() {
+        // 失败族 → "error"（主循环 abort，不把截断当 Done）；非失败值原样透传。
+        for fr in [
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "OTHER",
+        ] {
+            let v = serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "partial"}], "role": "model"},
+                    "finishReason": fr,
+                }],
+            });
+            let r = parse_gemini_response(v).unwrap();
+            assert_eq!(r.stop_reason, "error", "finishReason={fr}");
+        }
+        for fr in ["STOP", "MAX_TOKENS", "STOP_SEQUENCE", ""] {
+            assert_eq!(normalize_finish_reason(fr), fr);
+        }
     }
 
     #[tokio::test]
