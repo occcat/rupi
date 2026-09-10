@@ -197,6 +197,33 @@ pub fn error_text(v: &serde_json::Value) -> Option<&str> {
     v.pointer("/error/message").and_then(|s| s.as_str())
 }
 
+/// 签名失配判定：400 且错误文本提到 signature/thinking——通常是历史思考块被
+/// 截断/改写导致回放凭证失效（上游 0.85 headline 同类）。此时本地 strip 后
+/// 重试一次比直接报错更安全：丢掉的是旧推理过程，不影响本轮工具结果。
+pub fn is_signature_mismatch(status: reqwest::StatusCode, msg: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = msg.to_lowercase();
+    lower.contains("signature") || lower.contains("thinking")
+}
+
+/// 去思考块重试请求：删历史 Thinking/RedactedThinking 块并关 thinking（新轮
+/// 不再开 extended-thinking，避免服务端拿新旧签名交叉校验）。
+pub fn strip_thinking_for_retry(req: &super::ChatRequest) -> super::ChatRequest {
+    let mut out = req.clone();
+    out.thinking = None;
+    for m in &mut out.messages {
+        m.blocks.retain(|b| {
+            !matches!(
+                b,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
+    }
+    out
+}
+
 pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::ChatResponse> {
     if error_text(&v).is_some() {
         anyhow::bail!("anthropic error: {}", v.pointer("/error/message").unwrap());
@@ -460,11 +487,27 @@ impl super::LlmProvider for AnthropicProvider {
             super::post_json_with_retry(|| self.headers(self.client.post(&url)), &body, 3).await?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            let msg = error_text(&v).unwrap_or("anthropic request failed");
-            anyhow::bail!("anthropic {status}: {msg}");
+        if status.is_success() {
+            return parse_anthropic_response(v);
         }
-        parse_anthropic_response(v)
+        let msg = error_text(&v).unwrap_or("anthropic request failed").to_string();
+        if is_signature_mismatch(status, &msg) {
+            tracing::warn!("anthropic thinking 签名失配，去思考块重试一次: {msg}");
+            let retry_req = strip_thinking_for_retry(&req);
+            let retry_body = self.body(&retry_req, false);
+            let retry_resp =
+                super::post_json_with_retry(|| self.headers(self.client.post(&url)), &retry_body, 3)
+                    .await?;
+            let retry_status = retry_resp.status();
+            let retry_v: serde_json::Value = retry_resp.json().await?;
+            if !retry_status.is_success() {
+                let retry_msg =
+                    error_text(&retry_v).unwrap_or("anthropic request failed");
+                anyhow::bail!("anthropic {retry_status}: {retry_msg}");
+            }
+            return parse_anthropic_response(retry_v);
+        }
+        anyhow::bail!("anthropic {status}: {msg}");
     }
 
     /// 真 SSE 流：`event:` + `data:` 配对，文本直推、tool_use 内部累积。
@@ -478,12 +521,35 @@ impl super::LlmProvider for AnthropicProvider {
         let body = self.body(&req, true);
         let resp =
             super::post_json_with_retry(|| self.headers(self.client.post(&url)), &body, 3).await?;
-        if !resp.status().is_success() {
+        let resp = if !resp.status().is_success() {
             let status = resp.status();
             let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
-            let msg = error_text(&v).unwrap_or("anthropic request failed");
-            anyhow::bail!("anthropic {status}: {msg}");
-        }
+            let msg = error_text(&v).unwrap_or("anthropic request failed").to_string();
+            if is_signature_mismatch(status, &msg) {
+                tracing::warn!("anthropic thinking 签名失配（流式），去思考块重试一次: {msg}");
+                let retry_req = strip_thinking_for_retry(&req);
+                let retry_body = self.body(&retry_req, true);
+                let retry_resp = super::post_json_with_retry(
+                    || self.headers(self.client.post(&url)),
+                    &retry_body,
+                    3,
+                )
+                .await?;
+                if !retry_resp.status().is_success() {
+                    let retry_status = retry_resp.status();
+                    let retry_v: serde_json::Value =
+                        retry_resp.json().await.unwrap_or(serde_json::json!({}));
+                    let retry_msg =
+                        error_text(&retry_v).unwrap_or("anthropic request failed");
+                    anyhow::bail!("anthropic {retry_status}: {retry_msg}");
+                }
+                retry_resp
+            } else {
+                anyhow::bail!("anthropic {status}: {msg}");
+            }
+        } else {
+            resp
+        };
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut event = String::new();
@@ -922,5 +988,46 @@ mod tests {
         }
         // 思考文本不污染回答与 transcript 文本口径
         assert!(r.message.full_text().contains("[thinking] reason more"));
+    }
+
+    #[test]
+    fn signature_mismatch_detects_400_thinking_errors() {
+        use reqwest::StatusCode;
+        assert!(is_signature_mismatch(
+            StatusCode::BAD_REQUEST,
+            "thinking blocks with signatures must be contiguous"
+        ));
+        assert!(is_signature_mismatch(StatusCode::BAD_REQUEST, "Invalid Signature block"));
+        // 非 400 不误判（限流/鉴权走各自重试与报错通道）
+        assert!(!is_signature_mismatch(StatusCode::UNAUTHORIZED, "invalid signature"));
+        assert!(!is_signature_mismatch(StatusCode::BAD_REQUEST, "max_tokens exceeded"));
+    }
+
+    #[test]
+    fn strip_thinking_removes_blocks_and_disables_budget() {
+        let assistant = Message {
+            id: "a".into(),
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Thinking { text: "hmm".into(), signature: Some("s".into()) },
+                ContentBlock::RedactedThinking { data: "enc".into() },
+                ContentBlock::Text { text: "answer".into() },
+            ],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        };
+        let req = super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![assistant],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: Some(super::super::ThinkingLevel::Medium),
+        };
+        let stripped = strip_thinking_for_retry(&req);
+        assert!(stripped.thinking.is_none());
+        assert_eq!(stripped.messages[0].blocks.len(), 1);
+        // 原请求不动（重试是纯构造，不污染主历史）
+        assert_eq!(req.messages[0].blocks.len(), 3);
     }
 }
