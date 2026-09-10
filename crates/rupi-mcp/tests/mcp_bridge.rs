@@ -459,3 +459,63 @@ async fn http_server_stream_answers_pushed_requests() {
     // bridge drop 即 abort 流任务：此处显式 drop，泄漏/死锁会直接挂测试
     drop(bridge);
 }
+
+#[tokio::test]
+async fn tools_list_changed_refreshes_registry() {
+    // 动态假 server（FAKE_MCP_DYNAMIC=1）：第 1 次 list 回基础 3 件套并附通知，
+    // 第 2 次多出 late，第 3 次起 late 消失。不断线热刷新两轮。
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_mcp_server.py");
+    let mut cfg = McpServerConfig::new("fake", "python3", vec![script.to_string()]);
+    cfg.env.insert("FAKE_MCP_DYNAMIC".into(), "1".into());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = McpManager::spawn_all_watched(&[cfg], tx)
+        .await
+        .expect("spawn all");
+    let mut registry = ToolRegistry::with_builtins();
+    let names = manager.register_all(&mut registry).await;
+    assert!(names.contains(&"fake_echo".to_string()));
+    assert!(
+        !names.iter().any(|n| n == "fake_late"),
+        "首轮 list 不应有 late"
+    );
+
+    // 第 1 个通知到达 → 刷新 → late 出现且端到端可调
+    let srv = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("通知超时")
+        .expect("通道关闭");
+    assert_eq!(srv, "fake");
+    let added = manager
+        .refresh_server(&mut registry, "fake")
+        .await
+        .expect("refresh");
+    assert_eq!(added, vec!["fake_late".to_string()]);
+    let out = registry
+        .execute("fake_late", serde_json::json!({}))
+        .await
+        .expect("exec late");
+    assert!(!out.is_error);
+    assert_eq!(out.content, "LATE-OK");
+
+    // 第 2 个通知到达 → 再刷新 → late 消失，echo 常驻不受影响
+    let srv = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("通知超时")
+        .expect("通道关闭");
+    assert_eq!(srv, "fake");
+    let added = manager
+        .refresh_server(&mut registry, "fake")
+        .await
+        .expect("refresh");
+    assert!(added.is_empty());
+    assert!(
+        registry.definitions().iter().all(|d| d.name != "fake_late"),
+        "消失的工具应注销"
+    );
+    assert!(
+        registry.definitions().iter().any(|d| d.name == "fake_echo"),
+        "常驻工具不应被误伤"
+    );
+    // 未知 server 刷新直接报错，不动注册表
+    assert!(manager.refresh_server(&mut registry, "nope").await.is_err());
+}

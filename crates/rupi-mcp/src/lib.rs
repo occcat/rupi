@@ -220,12 +220,45 @@ pub struct McpBridge {
     pub roots: Vec<McpRoot>,
     next_id: AtomicI64,
     transport: Transport,
+    tool_watch: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// server 推送去向：`notifications/tools/list_changed` 到达时把 server 名推进去，
+/// 宿主逐轮排空后差量刷新工具表。`None` = 无人订阅（默认），通知照旧忽略。
+#[derive(Clone, Default)]
+struct PushTarget {
+    watch: Option<mpsc::UnboundedSender<String>>,
+    server: String,
+}
+
+fn note_tools_changed(target: &PushTarget, method: &str, sid: Option<i64>) {
+    // list_changed 按 spec 是无 id 通知；带 id 的同名包不认（防误触发）。
+    if method == "notifications/tools/list_changed" && sid.is_none() {
+        if let Some(w) = &target.watch {
+            let _ = w.send(target.server.clone());
+        }
+    }
 }
 
 impl McpBridge {
     /// 启动 server 进程并握手 `initialize` + `notifications/initialized`。
     pub async fn spawn(config: McpServerConfig) -> anyhow::Result<Self> {
-        let mut cmd = Command::new(&config.command);
+        Self::spawn_inner(config, None).await
+    }
+
+    /// 带工具变更观察的启动：server 发 `notifications/tools/list_changed` 即把
+    /// server 名推进 `watch`，宿主逐轮排空后差量刷新（见 `McpManager::refresh_server`）。
+    pub async fn spawn_watched(
+        config: McpServerConfig,
+        watch: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(config, Some(watch)).await
+    }
+
+    async fn spawn_inner(
+        config: McpServerConfig,
+        tool_watch: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<Self> {        let mut cmd = Command::new(&config.command);
         cmd.args(&config.args)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
@@ -257,6 +290,10 @@ impl McpBridge {
         let roots_route = vec![McpRoot::cwd()];
         let stdin_write = stdin_route.clone();
         let roots_in_task = roots_route.clone();
+        let push_route = PushTarget {
+            watch: tool_watch.clone(),
+            server: config.name.clone(),
+        };
         tokio::spawn(async move {
             while let Some(line) = rx_lines.recv().await {
                 let v: serde_json::Value = match serde_json::from_str(&line) {
@@ -264,8 +301,12 @@ impl McpBridge {
                     Err(_) => continue,
                 };
                 let id = v.get("id").and_then(|i| i.as_i64());
-                // server→client 请求（含 roots/list、ping）：必须应答，否则 server 侧超时
+                // server→client 请求（含 roots/list、ping）：必须应答，否则 server 侧超时；
+                // 无 id 的工具变更通知推进观察队列，由宿主逐轮差量刷新（无订阅即忽略）
                 if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+                    if id.is_none() {
+                        note_tools_changed(&push_route, method, id);
+                    }
                     if let Some(resp) = server_request_response(method, id, &roots_in_task) {
                         let mut stdin = stdin_write.lock().await;
                         let _ = stdin.write_all(format!("{resp}\n").as_bytes()).await;
@@ -297,6 +338,7 @@ impl McpBridge {
             config,
             roots: roots_route.clone(),
             next_id: AtomicI64::new(1),
+            tool_watch,
             transport: Transport::Stdio {
                 pending,
                 stdin: stdin_route,
@@ -329,6 +371,21 @@ impl McpBridge {
     /// 握手成功后另开独立 GET 常驻流收 server 推送（反向请求当场 POST 应答，通知忽略），
     /// 桥 drop 时 abort。不支持 GET 的 server 只记 debug，不重连打扰。
     pub async fn spawn_http(config: McpServerConfig) -> anyhow::Result<Self> {
+        Self::spawn_http_inner(config, None).await
+    }
+
+    /// 带工具变更观察的 HTTP 启动（语义同 `spawn_watched`）。
+    pub async fn spawn_http_watched(
+        config: McpServerConfig,
+        watch: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_http_inner(config, Some(watch)).await
+    }
+
+    async fn spawn_http_inner(
+        config: McpServerConfig,
+        tool_watch: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<Self> {
         let url = config
             .url
             .clone()
@@ -340,6 +397,7 @@ impl McpBridge {
             config,
             roots: vec![McpRoot::cwd()],
             next_id: AtomicI64::new(1),
+            tool_watch,
             transport: Transport::Http {
                 client,
                 url,
@@ -358,6 +416,10 @@ impl McpBridge {
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let push = PushTarget {
+            watch: self.tool_watch.clone(),
+            server: self.config.name.clone(),
+        };
         match &self.transport {
             Transport::Stdio { pending, stdin, .. } => {
                 Self::call_stdio(pending, stdin, id, method, params).await
@@ -367,7 +429,10 @@ impl McpBridge {
                 url,
                 session_id,
                 ..
-            } => Self::call_http(client, url, session_id, &self.roots, id, method, params).await,
+            } => {
+                Self::call_http(client, url, session_id, &self.roots, &push, id, method, params)
+                    .await
+            }
         }
     }
 
@@ -407,11 +472,13 @@ impl McpBridge {
     /// 202/空体（notification 应答）按 `Null` 回，调用方视为成功。
     /// SSE 流里的 server→client 请求（roots/ping/…)增量当场 POST 应答，
     /// 不再丢弃；仅剩独立 GET 常驻流未建，纯推送通知仍收不到。
+    #[allow(clippy::too_many_arguments)]
     async fn call_http(
         client: &reqwest::Client,
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
         id: i64,
         method: &str,
         params: serde_json::Value,
@@ -442,7 +509,7 @@ impl McpBridge {
             .to_string();
         if ctype.contains("text/event-stream") && status.is_success() {
             let msg =
-                Self::read_sse_stream(client, url, session_id, roots, id, method, resp).await?;
+                Self::read_sse_stream(client, url, session_id, roots, push, id, method, resp).await?;
             return Self::unwrap_result(method, msg);
         }
         let body = resp.text().await.unwrap_or_default();
@@ -471,11 +538,13 @@ impl McpBridge {
     /// 读到流关闭（与此前整包 `text()` 同界，30s client 超时兜底）。
     /// 当场应答而非缓冲后补：server 可能等应答到了才发本轮结果（如 elicitation），
     /// 缓冲整包会与 server 互相等待直到超时。
+    #[allow(clippy::too_many_arguments)]
     async fn read_sse_stream(
         client: &reqwest::Client,
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
         id: i64,
         method: &str,
         resp: reqwest::Response,
@@ -488,7 +557,7 @@ impl McpBridge {
             let chunk = chunk.context("MCP http SSE stream failed")?;
             for raw in framer.feed(&String::from_utf8_lossy(&chunk)) {
                 if let Some(v) =
-                    Self::handle_sse_payload(client, url, session_id, roots, &raw, id).await
+                    Self::handle_sse_payload(client, url, session_id, roots, push, &raw, id).await
                 {
                     found = Some(v);
                 }
@@ -496,7 +565,7 @@ impl McpBridge {
         }
         if let Some(raw) = framer.flush() {
             if let Some(v) =
-                Self::handle_sse_payload(client, url, session_id, roots, &raw, id).await
+                Self::handle_sse_payload(client, url, session_id, roots, push, &raw, id).await
             {
                 found = Some(v);
             }
@@ -510,13 +579,15 @@ impl McpBridge {
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
         raw: &str,
         id: i64,
     ) -> Option<serde_json::Value> {
         match classify_sse_data(raw, id) {
             SseDatum::Response(v) => Some(v),
             SseDatum::ServerRequest { method, id: sid } => {
-                Self::answer_server_request(client, url, session_id, roots, &method, sid).await;
+                Self::answer_server_request(client, url, session_id, roots, push, &method, sid)
+                    .await;
                 None
             }
             SseDatum::Ignored => None,
@@ -530,9 +601,12 @@ impl McpBridge {
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
         method: &str,
         sid: Option<i64>,
     ) {
+        // 工具变更通知无 id、无需应答，只推进观察队列（无订阅即忽略）
+        note_tools_changed(push, method, sid);
         let Some(answer) = server_request_response(method, sid, roots) else {
             return;
         };
@@ -570,11 +644,16 @@ impl McpBridge {
         if stream_task.lock().unwrap().is_some() {
             return;
         }
+        let push = PushTarget {
+            watch: self.tool_watch.clone(),
+            server: self.config.name.clone(),
+        };
         let task = tokio::spawn(Self::run_server_stream(
             client.clone(),
             url.clone(),
             session_id.clone(),
             self.roots.clone(),
+            push,
         ));
         *stream_task.lock().unwrap() = Some(task);
     }
@@ -587,9 +666,10 @@ impl McpBridge {
         url: String,
         session_id: Arc<Mutex<Option<String>>>,
         roots: Vec<McpRoot>,
+        push: PushTarget,
     ) {
         loop {
-            match Self::pump_server_stream(&client, &url, &session_id, &roots).await {
+            match Self::pump_server_stream(&client, &url, &session_id, &roots, &push).await {
                 Ok(true) => {
                     tracing::debug!(target: "rupi-mcp", "mcp GET stream closed, reconnect in 1s");
                 }
@@ -612,6 +692,7 @@ impl McpBridge {
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
     ) -> anyhow::Result<bool> {
         use futures::StreamExt as _;
         let mut get = client
@@ -645,11 +726,11 @@ impl McpBridge {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("MCP http GET stream failed")?;
             for raw in framer.feed(&String::from_utf8_lossy(&chunk)) {
-                Self::handle_server_push(client, url, session_id, roots, &raw).await;
+                Self::handle_server_push(client, url, session_id, roots, push, &raw).await;
             }
         }
         if let Some(raw) = framer.flush() {
-            Self::handle_server_push(client, url, session_id, roots, &raw).await;
+            Self::handle_server_push(client, url, session_id, roots, push, &raw).await;
         }
         Ok(true)
     }
@@ -660,12 +741,14 @@ impl McpBridge {
         url: &str,
         session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
+        push: &PushTarget,
         raw: &str,
     ) {
         match classify_sse_data(raw, i64::MIN) {
             SseDatum::Response(_) => {}
             SseDatum::ServerRequest { method, id: sid } => {
-                Self::answer_server_request(client, url, session_id, roots, &method, sid).await;
+                Self::answer_server_request(client, url, session_id, roots, push, &method, sid)
+                    .await;
             }
             SseDatum::Ignored => {
                 tracing::debug!(target: "rupi-mcp", "mcp server notification ignored");
@@ -690,7 +773,12 @@ impl McpBridge {
                 ..
             } => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                Self::call_http(client, url, session_id, &self.roots, id, method, params).await?;
+                let push = PushTarget {
+                    watch: self.tool_watch.clone(),
+                    server: self.config.name.clone(),
+                };
+                Self::call_http(client, url, session_id, &self.roots, &push, id, method, params)
+                    .await?;
                 Ok(())
             }
         }
@@ -1170,13 +1258,30 @@ pub struct McpServerEntry {
 
 impl McpManager {
     pub async fn spawn_all(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
+        Self::spawn_all_inner(configs, None).await
+    }
+
+    /// 带工具变更观察的启动：各桥收到 `notifications/tools/list_changed` 即把
+    /// server 名推进 `watch`；宿主逐轮排空并调 `refresh_server` 差量刷新。
+    pub async fn spawn_all_watched(
+        configs: &[McpServerConfig],
+        watch: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_all_inner(configs, Some(watch)).await
+    }
+
+    async fn spawn_all_inner(
+        configs: &[McpServerConfig],
+        watch: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<Self> {
         let mut entries = vec![];
         for cfg in configs {
             // 有 url 走 StreamableHTTP，否则 stdio 子进程
-            let spawned = if cfg.url.is_some() {
-                McpBridge::spawn_http(cfg.clone()).await
-            } else {
-                McpBridge::spawn(cfg.clone()).await
+            let spawned = match (&watch, &cfg.url) {
+                (Some(w), Some(_)) => McpBridge::spawn_http_watched(cfg.clone(), w.clone()).await,
+                (Some(w), None) => McpBridge::spawn_watched(cfg.clone(), w.clone()).await,
+                (None, Some(_)) => McpBridge::spawn_http(cfg.clone()).await,
+                (None, None) => McpBridge::spawn(cfg.clone()).await,
             };
             match spawned {
                 Ok(b) => entries.push(McpServerEntry {
@@ -1260,6 +1365,52 @@ impl McpManager {
             }
         }
         registered
+    }
+
+    /// 差量刷新单个 server 的工具（`notifications/tools/list_changed` 的宿主侧落点）：
+    /// 重列远端，新 tool 注册、消失的注销（`{server}_read_resource` / `{server}_get_prompt`
+    /// 是资源/模板入口，不在此动）；返回新增工具名。远端名与他方已注册名冲突仍首胜跳过。
+    pub async fn refresh_server(
+        &self,
+        registry: &mut rupi_tools::ToolRegistry,
+        server: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.config.name == server)
+            .with_context(|| format!("unknown MCP server '{server}'"))?;
+        let fresh = entry.bridge.list_tools().await?;
+        let prefix = format!("{server}_");
+        let pinned = [
+            McpResourceReader::tool_name(server),
+            McpPromptGetter::tool_name(server),
+        ];
+        let current: Vec<String> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .filter(|n| n.starts_with(&prefix) && !pinned.contains(n))
+            .collect();
+        let mut added = vec![];
+        for t in &fresh {
+            let name = format!("{prefix}{}", t.name);
+            if current.contains(&name) {
+                continue;
+            }
+            if registry.definitions().iter().any(|d| d.name == name) {
+                tracing::warn!("MCP tool name conflict: {name}; first wins");
+                continue;
+            }
+            registry.register(Arc::new(McpToolExecutor::new(server, entry.bridge.clone(), t)));
+            added.push(name);
+        }
+        let desired: Vec<String> = fresh.iter().map(|t| format!("{prefix}{}", t.name)).collect();
+        for gone in current.iter().filter(|n| !desired.contains(n)) {
+            registry.unregister(gone);
+            tracing::debug!(target: "rupi-mcp", "MCP tool removed: {gone}");
+        }
+        Ok(added)
     }
 }
 

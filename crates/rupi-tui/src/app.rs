@@ -22,11 +22,13 @@ use ratatui::{
 use rupi_agent::AgentLoop;
 use rupi_core::{commands, AgentEvent, SessionTree};
 use rupi_llm::LlmProvider;
+use rupi_mcp::McpManager;
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
 use rupi_tools::ToolRegistry;
 use std::io::Stdout;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// TUI 运行上下文：与 REPL 版 `run_chat` 同构的装配。
 /// `agent` / `provider` 可变：TUI 内建命令（/plan /thinking /model）会话内切换，
@@ -35,10 +37,14 @@ pub struct TuiContext<'a> {
     pub provider: &'a mut Arc<dyn LlmProvider>,
     pub agent: &'a mut AgentLoop,
     pub session: &'a mut SessionTree,
-    pub tools: &'a ToolRegistry,
+    pub tools: &'a mut ToolRegistry,
     pub mem: &'a MemoryManager,
     pub frozen: &'a FrozenMemory,
     pub skills: &'a SkillRegistry,
+    /// MCP 热刷新：manager 活着才有意义；`mcp_rx` 排空收 server 名后差量刷新工具表。
+    /// tools 取 `&mut` 即为此：TUI 也要逐轮应用远端工具变更（与 REPL 同语义）。
+    pub mcp: Option<&'a McpManager>,
+    pub mcp_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// skill 发现目录：每轮发送前 `refresh`，会话内新蒸馏 skill 即时可见（与 REPL 同闭环）。
     pub skill_dirs: Vec<std::path::PathBuf>,
     /// 自定义斜杠命令目录：发送前展开（与 REPL 同语义）。
@@ -247,7 +253,7 @@ enum Control {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ctx: TuiContext<'_>,
+    mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
     view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
@@ -284,6 +290,19 @@ async fn run_loop(
             }
             KeyCode::Enter if !input.is_empty() => {
                 let text = input.take();
+                // MCP 工具热刷新：server 发 notifications/tools/list_changed 即重列差量更新
+                if let (Some(m), Some(rx)) = (ctx.mcp, ctx.mcp_rx.as_mut()) {
+                    while let Ok(srv) = rx.try_recv() {
+                        match m.refresh_server(&mut *ctx.tools, &srv).await {
+                            Ok(added) if !added.is_empty() => view.push_system(format!(
+                                "[mcp] {srv} tools added: {}",
+                                added.join(", ")
+                            )),
+                            Ok(_) => view.push_system(format!("[mcp] {srv} tools updated")),
+                            Err(e) => view.push_system(format!("[mcp] refresh {srv} failed: {e:#}")),
+                        }
+                    }
+                }
                 match dispatch_builtin(
                     &text,
                     ctx.agent,
@@ -330,7 +349,7 @@ async fn run_loop(
                     ctx.agent,
                     &**ctx.provider,
                     ctx.session,
-                    ctx.tools,
+                    &*ctx.tools,
                     ctx.mem,
                     ctx.frozen,
                     ctx.skills,

@@ -8,10 +8,17 @@ prompts/list + prompts/get（单个带参模板），
 """
 
 import json
+import os
 import sys
 
 # server 收到的 roots/list 应答存在这里，roots_probe 工具读出来给测试断言
 seen_roots = None
+
+# 动态工具门（list_changed 联调专用）：FAKE_MCP_DYNAMIC=1 时 tools/list 按调用计数变脸——
+# 第 1 次回基础 3 件套并附 notifications/tools/list_changed，第 2 次多出 late，第 3 次起
+# late 消失（再附一次通知）。默认关闭，既有断言（tools.len()==3）不受影响。
+DYNAMIC = os.environ.get("FAKE_MCP_DYNAMIC") == "1"
+list_count = 0
 
 
 def send(obj):
@@ -20,7 +27,7 @@ def send(obj):
 
 
 def main():
-    global seen_roots
+    global seen_roots, list_count
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -44,38 +51,48 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
         elif method == "tools/list":
-            send(
+            list_count += 1
+            tools = [
                 {
-                    "jsonrpc": "2.0",
-                    "id": rid,
-                    "result": {
-                        "tools": [
-                            {
-                                "name": "echo",
-                                "description": "echo text back",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "text": {"type": "string"},
-                                        "shout": {"type": "boolean"},
-                                    },
-                                    "required": ["text"],
-                                },
-                            },
-                            {
-                                "name": "fail",
-                                "description": "always fails as tool error",
-                                "inputSchema": {"type": "object"},
-                            },
-                            {
-                                "name": "roots_probe",
-                                "description": "returns roots/list answers seen from client",
-                                "inputSchema": {"type": "object"},
-                            },
-                        ]
+                    "name": "echo",
+                    "description": "echo text back",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "shout": {"type": "boolean"},
+                        },
+                        "required": ["text"],
                     },
-                }
-            )
+                },
+                {
+                    "name": "fail",
+                    "description": "always fails as tool error",
+                    "inputSchema": {"type": "object"},
+                },
+                {
+                    "name": "roots_probe",
+                    "description": "returns roots/list answers seen from client",
+                    "inputSchema": {"type": "object"},
+                },
+            ]
+            if DYNAMIC and list_count == 2:
+                tools.append(
+                    {
+                        "name": "late",
+                        "description": "appears after list_changed",
+                        "inputSchema": {"type": "object"},
+                    }
+                )
+            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
+            if DYNAMIC and list_count <= 2:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                        "params": {},
+                    }
+                )
         elif method == "tools/call":
             params = req.get("params", {})
             name = params.get("name")
@@ -112,6 +129,14 @@ def main():
                                 {"type": "text", "text": json.dumps(seen_roots)}
                             ]
                         },
+                    }
+                )
+            elif DYNAMIC and name == "late":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {"content": [{"type": "text", "text": "LATE-OK"}]},
                     }
                 )
             else:

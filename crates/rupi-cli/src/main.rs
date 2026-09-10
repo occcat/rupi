@@ -910,10 +910,12 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         agent = agent.with_thinking(t);
     }
     let mut tools = sandboxed_tools();
-    // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
-    let _mcp = if let Some(path) = &cli.mcp_config {
+    // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）；
+    // 带变更观察启动：server 发 notifications/tools/list_changed 即进队，逐轮差量刷新
+    let (mcp_tx, mut mcp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
-        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let manager = rupi_mcp::McpManager::spawn_all_watched(&configs, mcp_tx).await?;
         let names = manager.register_all(&mut tools).await;
         println!("[mcp] {} tools: {}", names.len(), names.join(", "));
         Some(manager)
@@ -1108,6 +1110,18 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）；
         // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
         refresh_extensions(&mut tools, &mut ext_set);
+        // MCP 工具热刷新：server 发 notifications/tools/list_changed 即重列该 server 差量更新
+        if let Some(m) = &mcp {
+            while let Ok(srv) = mcp_rx.try_recv() {
+                match m.refresh_server(&mut tools, &srv).await {
+                    Ok(added) if !added.is_empty() => {
+                        println!("[mcp] {srv} tools added: {}", added.join(", "))
+                    }
+                    Ok(_) => println!("[mcp] {srv} tools updated"),
+                    Err(e) => eprintln!("[mcp] refresh {srv} failed: {e:#}"),
+                }
+            }
+        }
         skills.refresh(&skill_dirs(home, load_project));
         // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
         let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
@@ -1174,9 +1188,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // thinking 档位先验：非法值在建会话前 bail，不污染会话库
     let thinking = thinking_for(cli)?;
     let mut tools = sandboxed_tools();
-    let _mcp = if let Some(path) = &cli.mcp_config {
+    let (mcp_tx, mcp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
-        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let manager = rupi_mcp::McpManager::spawn_all_watched(&configs, mcp_tx).await?;
         let names = manager.register_all(&mut tools).await;
         eprintln!("[mcp] {} tools: {}", names.len(), names.join(", "));
         Some(manager)
@@ -1304,10 +1319,12 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         provider: &mut provider,
         agent: &mut agent,
         session: &mut session,
-        tools: &tools,
+        tools: &mut tools,
         mem: &*mem,
         frozen: &frozen,
         skills: &*skills,
+        mcp: mcp.as_ref(),
+        mcp_rx: Some(mcp_rx),
         skill_dirs: skill_dirs(home, load_project),
         command_dirs: command_dirs_filtered(home, load_project),
         review_lines,
