@@ -253,6 +253,34 @@ fn chat_review_apply_persists_memory_and_failure() {
 }
 
 #[test]
+fn run_review_apply_persists_memory() {
+    // 非交互 run 同样走复盘落盘（与 chat 不同的接线点 run_once，值得单独覆盖）。
+    let home = fresh_home();
+    let o = rupi(
+        &home,
+        &[
+            "--review-apply",
+            "--no-approve",
+            "run",
+            "请记住我爱喝乌龙茶",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "run 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    assert!(
+        out.contains("[review] memory saved"),
+        "run 记忆建议未落盘:\n{out}"
+    );
+    let mem = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap_or_default();
+    assert!(mem.contains("乌龙茶"), "MEMORY.md 无复盘条目:\n{mem}");
+}
+
+#[test]
 fn empty_states_exit_zero() {
     let home = fresh_home();
     for sub in ["ext-list", "commands"] {
