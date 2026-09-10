@@ -251,16 +251,20 @@ fn server_request_response_covers_roots_ping_unknown() {
 }
 
 /// 最小 StreamableHTTP stub：手写 HTTP/1.1 成帧（每连接一请求，`Connection: close`）。
-/// initialize→JSON+session 头，initialized→202，tools/list→JSON，tools/call→SSE 流（含 ping 注释
-/// 与一条 server 请求，验证桥只挑本轮 id）。`seen.session_header` 记录非握手请求是否回传 session。
+/// initialize→JSON+session 头，initialized→202，tools/list→JSON，tools/call→SSE 流（含 ping 注释、
+/// 一条 ping 反向请求、一条 roots/list 反向请求在结果之前，验证桥增量应答）。
+/// 无 method 但带 id+result/error 的 POST 即桥对反向请求的应答，记入 `answers` 后回 202。
+/// `seen.session_header` 记录非握手请求是否回传 session。
 struct HttpStubSeen {
     session_header: std::sync::Mutex<bool>,
+    answers: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let seen = Arc::new(HttpStubSeen {
         session_header: std::sync::Mutex::new(false),
+        answers: std::sync::Mutex::new(vec![]),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -304,6 +308,17 @@ async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
                 if method != "initialize" && has_session {
                     *seen.session_header.lock().unwrap() = true;
                 }
+                // 桥对流内反向请求的应答：无 method + 带 id + result/error，记下后回 202
+                if method.is_empty()
+                    && req.get("id").is_some()
+                    && (req.get("result").is_some() || req.get("error").is_some())
+                {
+                    seen.answers.lock().unwrap().push(req);
+                    let head = "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n";
+                    wh.write_all(head.as_bytes()).await.unwrap();
+                    return;
+                }
                 let (status, ctype, extra, payload): (_, _, _, Vec<u8>) = match method {
                     "initialize" => (
                         "200 OK",
@@ -330,6 +345,7 @@ async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
                         "",
                         format!(
                             ": ping\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}}\n\n\
+                             data: {{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"roots/list\",\"params\":{{}}}}\n\n\
                              data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\
                              \"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"HTTP-HI\"}}]}}}}\n\n"
                         )
@@ -369,7 +385,8 @@ async fn http_transport_lists_calls_tools_and_keeps_session() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "hecho");
 
-    // tools/call 经 SSE 流回包：桥正确挑出本轮 id（跳过 ping 注释与 server 请求）
+    // tools/call 经 SSE 流回包：桥正确挑出本轮 id（跳过 ping 注释），
+    // 流内 ping 与 roots/list 反向请求当场 POST 应答（此前已知局限：server 侧超时）
     let r = bridge
         .call_tool("hecho", serde_json::json!({}), &tools[0].input_schema)
         .await
@@ -379,4 +396,16 @@ async fn http_transport_lists_calls_tools_and_keeps_session() {
 
     // initialize 后下发的 session id，后续请求经 header 回传
     assert!(*seen.session_header.lock().unwrap(), "session id 未回传");
+    // 反向 roots/list（id 77）已应答且带本机 file:// 根；ping（id 999）回空结果
+    let answers = seen.answers.lock().unwrap();
+    let roots_answer = answers.iter().find(|a| a["id"] == 77).expect("roots 应答");
+    assert!(
+        roots_answer["result"]["roots"][0]["uri"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("file://"),
+        "roots 应答带本机根：{roots_answer}"
+    );
+    let ping_answer = answers.iter().find(|a| a["id"] == 999).expect("ping 应答");
+    assert_eq!(ping_answer["result"], serde_json::json!({}));
 }
