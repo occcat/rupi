@@ -111,13 +111,7 @@ impl HeuristicReviewer {
             let entry: String = user.chars().take(self.max_entry_chars).collect();
             return Some(format!("user correction: {entry}"));
         }
-        let a = t.assistant.to_lowercase();
-        let admitted = t.assistant.contains("失败了")
-            || t.assistant.contains("出错了")
-            || t.assistant.contains("没能")
-            || a.contains("failed to")
-            || a.contains("couldn't complete")
-            || a.contains("error occurred");
+        let admitted = assistant_admits_failure(&t.assistant);
         if admitted {
             let entry: String = t.assistant.chars().take(self.max_entry_chars).collect();
             return Some(format!("assistant reported failure: {entry}"));
@@ -163,6 +157,18 @@ impl HeuristicReviewer {
             name,
         })
     }
+}
+
+fn assistant_admits_failure(assistant: &str) -> bool {
+    // 与 HeuristicReviewer::failure_entry 的助手自认分支同源：抽出共享，
+    // 供 LlmReviewer 寒暄门复用（寒暄回合若助手自认失败，仍需走模型提炼教训）。
+    let lower = assistant.to_lowercase();
+    assistant.contains("失败了")
+        || assistant.contains("出错了")
+        || assistant.contains("没能")
+        || lower.contains("failed to")
+        || lower.contains("couldn't complete")
+        || lower.contains("error occurred")
 }
 
 fn fnv1a32(s: &str) -> u32 {
@@ -301,6 +307,14 @@ impl LlmReviewer {
 #[async_trait::async_trait]
 impl Reviewer for LlmReviewer {
     async fn review_turn(&self, t: &TurnTranscript) -> anyhow::Result<ReviewSuggestion> {
+        // 寒暄门（对标 Hermes is_trivial_prompt 预检）：无信息回合跳过模型调用，
+        // 省一次计费且空建议本来也解析为空；助手自认失败除外（须提炼教训）。
+        if t.tool_names.is_empty()
+            && rupi_memory::is_trivial_prompt(&t.user)
+            && !assistant_admits_failure(&t.assistant)
+        {
+            return Ok(ReviewSuggestion::default());
+        }
         let req = rupi_llm::ChatRequest {
             system: "You are a terse JSON-only reviewer.".into(),
             messages: vec![rupi_core::Message::text(
@@ -501,5 +515,47 @@ mod tests {
             .unwrap();
         assert_eq!(s.memory_ops[0].entry, "uses fish shell");
         assert_eq!(s.skill_draft.as_ref().unwrap().name, "deploy-flow");
+    }
+
+    #[tokio::test]
+    async fn llm_reviewer_skips_model_call_for_trivial_turn() {
+        // 寒暄＋无工具＋助手无自认失败：直接回空，不调模型（seen_tools 为空可观测）。
+        use rupi_llm::MockProvider;
+        let p = Arc::new(MockProvider::new(vec![]));
+        let r = LlmReviewer::new(p.clone());
+        let s = r
+            .review_turn(&TurnTranscript {
+                user: "hi!".into(),
+                assistant: "hello!".into(),
+                tool_names: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(s.is_empty());
+        assert!(p.seen_tools.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn llm_reviewer_still_calls_model_when_assistant_admits_failure() {
+        // 同为寒暄但助手自认失败：必须走模型提炼教训，不可跳过。
+        use rupi_llm::MockProvider;
+        let body = serde_json::json!({
+            "memory_ops": [],
+            "failures": ["greeting failed"],
+            "skill_draft": null
+        })
+        .to_string();
+        let p = Arc::new(MockProvider::new(vec![MockProvider::text_response(&body)]));
+        let r = LlmReviewer::new(p.clone());
+        let s = r
+            .review_turn(&TurnTranscript {
+                user: "hi".into(),
+                assistant: "I failed to start the session".into(),
+                tool_names: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(p.seen_tools.lock().unwrap().len(), 1);
+        assert_eq!(s.failures, vec!["greeting failed".to_string()]);
     }
 }
