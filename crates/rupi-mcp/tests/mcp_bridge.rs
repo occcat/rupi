@@ -280,10 +280,14 @@ async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
                 let mut reader = tokio::io::BufReader::new(rh);
                 let mut content_len = 0usize;
                 let mut has_session = false;
+                let mut request_line = String::new();
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                         return;
+                    }
+                    if request_line.is_empty() {
+                        request_line = line.trim().to_string();
                     }
                     let t = line.trim();
                     if t.is_empty() {
@@ -296,6 +300,20 @@ async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
                     if lower.starts_with("mcp-session-id:") {
                         has_session = true;
                     }
+                }
+                // 独立 GET 常驻流：推一条 roots/list 反向请求（id 55）后关流；
+                // 桥应以后台任务应答（记入 answers），断线重连会再推一次，同 id 去重断言即可。
+                if request_line.starts_with("GET") {
+                    let payload =
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":55,\"method\":\"roots/list\",\"params\":{}}\n\n"
+                            .as_bytes();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    wh.write_all(head.as_bytes()).await.unwrap();
+                    wh.write_all(payload).await.unwrap();
+                    return;
                 }
                 let mut body = vec![0u8; content_len];
                 if content_len > 0 {
@@ -408,4 +426,36 @@ async fn http_transport_lists_calls_tools_and_keeps_session() {
     );
     let ping_answer = answers.iter().find(|a| a["id"] == 999).expect("ping 应答");
     assert_eq!(ping_answer["result"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn http_server_stream_answers_pushed_requests() {
+    let (url, seen) = start_http_stub().await;
+    let mut cfg = McpServerConfig::new("h", "", vec![]);
+    cfg.url = Some(url);
+    let bridge = rupi_mcp::McpBridge::spawn_http(cfg)
+        .await
+        .expect("spawn http");
+    // GET 常驻流是后台任务：轮询等 stub 收到对推送 roots/list（id 55）的应答
+    let mut found = None;
+    for _ in 0..60 {
+        {
+            let answers = seen.answers.lock().unwrap();
+            if let Some(a) = answers.iter().find(|a| a["id"] == 55) {
+                found = Some(a.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let roots_answer = found.expect("GET 流推送的 roots/list（id 55）未被应答");
+    assert!(
+        roots_answer["result"]["roots"][0]["uri"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("file://"),
+        "推送应答带本机根：{roots_answer}"
+    );
+    // bridge drop 即 abort 流任务：此处显式 drop，泄漏/死锁会直接挂测试
+    drop(bridge);
 }

@@ -129,8 +129,7 @@ pub fn sanitize_params(
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>;
 
 /// SSE `data:` 事件分类（纯函数，可单测）：本轮响应 / server→client 请求 / 可忽略。
-/// 反向请求不再跳过——调用方需当场 POST 应答，否则 HTTP server 侧超时
-///（此前已知局限；仅剩独立 GET 常驻流未建，纯推送通知仍收不到）。
+/// 反向请求由调用方当场 POST 应答（POST 回包流内与独立 GET 流皆然），否则 server 侧超时。
 #[derive(Debug, PartialEq)]
 enum SseDatum {
     Response(serde_json::Value),
@@ -152,33 +151,50 @@ fn classify_sse_data(raw: &str, id: i64) -> SseDatum {
     }
 }
 
-/// 把 SSE 体按空行切成逐事件 `data:` 荷载（测试用缓冲切分；
-/// 与 `read_sse_stream` 增量路径同语义：空行刷块、`:` 注释跳过、`data:` 拼块）。
-#[cfg(test)]
-fn split_sse_data(body: &str) -> Vec<String> {
-    let mut out = vec![];
-    let mut data_lines: Vec<&str> = vec![];
-    for line in body.lines().chain(std::iter::once("")) {
-        let t = line.trim();
-        if t.is_empty() {
-            if !data_lines.is_empty() {
-                out.push(data_lines.join("\n"));
-                data_lines.clear();
+/// SSE 增量切分器：POST 回包与 GET 常驻流共用同一切分语义
+///（空行刷块、`:` 注释跳过、`data:` 拼块；流尾无空行 `flush` 补一次）。
+/// 逐字节 `feed`，凑满一个事件即吐出荷载，避免两路增量循环各自手写分块而漂移。
+#[derive(Debug, Default)]
+struct SseFramer {
+    buf: String,
+    data_lines: Vec<String>,
+}
+
+impl SseFramer {
+    fn feed(&mut self, chunk: &str) -> Vec<String> {
+        let mut out = vec![];
+        self.buf.push_str(chunk);
+        while let Some(pos) = self.buf.find('\n') {
+            let line = self.buf[..pos].trim().to_string();
+            self.buf = self.buf[pos + 1..].to_string();
+            if line.is_empty() {
+                if !self.data_lines.is_empty() {
+                    out.push(std::mem::take(&mut self.data_lines).join("\n"));
+                }
+                continue;
             }
-            continue;
+            if line == ": ping" || line.starts_with(':') {
+                continue;
+            }
+            if let Some(payload) = line.strip_prefix("data:") {
+                self.data_lines.push(payload.trim().to_string());
+            }
         }
-        if t == ": ping" || t.starts_with(':') {
-            continue;
-        }
-        if let Some(payload) = t.strip_prefix("data:") {
-            data_lines.push(payload.trim());
+        out
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if self.data_lines.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.data_lines).join("\n"))
         }
     }
-    out
 }
 
 /// 传输层：stdio（子进程，server→client 请求可应答）或
-/// StreamableHTTP（POST + JSON 或增量 SSE，流内反向请求当场 POST 应答；无独立 GET 常驻流）。
+/// StreamableHTTP（POST + JSON 或增量 SSE，流内反向请求当场 POST 应答；
+/// 另有独立 GET 常驻流收 server 纯推送，桥 drop 时 abort）。
 enum Transport {
     Stdio {
         pending: PendingMap,
@@ -190,7 +206,11 @@ enum Transport {
     Http {
         client: reqwest::Client,
         url: String,
-        session_id: Mutex<Option<String>>,
+        session_id: Arc<Mutex<Option<String>>>,
+        /// GET 常驻流任务槽：握手成功后 `open_server_stream` 填入（`&self` 即可，
+        /// 构造时还无 session，不提前开流）。只做同步 take/insert，用 std 锁，
+        /// `Drop::abort` 处绝不碰异步锁（`blocking_lock` 在运行时内会 panic）。
+        stream_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     },
 }
 
@@ -305,10 +325,9 @@ impl McpBridge {
         Ok(())
     }
 
-    /// StreamableHTTP 建连：`config.url` 做 POST initialize 握手，session id 走 header 保持。
-    ///
-    /// 反向请求（roots/ping）与 stdio 同语义：SSE 流内收到的当场 POST 应答；
-    /// 仅剩独立 GET 常驻流未建，server 的纯推送通知仍收不到——工具/资源/提示正向调用不受影响。
+    /// StreamableHTTP 建连：`config.url` 做 POST initialize 握手，session id 走 header 保持；
+    /// 握手成功后另开独立 GET 常驻流收 server 推送（反向请求当场 POST 应答，通知忽略），
+    /// 桥 drop 时 abort。不支持 GET 的 server 只记 debug，不重连打扰。
     pub async fn spawn_http(config: McpServerConfig) -> anyhow::Result<Self> {
         let url = config
             .url
@@ -324,10 +343,12 @@ impl McpBridge {
             transport: Transport::Http {
                 client,
                 url,
-                session_id: Mutex::new(None),
+                session_id: Arc::new(Mutex::new(None)),
+                stream_task: std::sync::Mutex::new(None),
             },
         };
         bridge.handshake().await?;
+        bridge.open_server_stream().await;
         Ok(bridge)
     }
 
@@ -345,6 +366,7 @@ impl McpBridge {
                 client,
                 url,
                 session_id,
+                ..
             } => Self::call_http(client, url, session_id, &self.roots, id, method, params).await,
         }
     }
@@ -388,7 +410,7 @@ impl McpBridge {
     async fn call_http(
         client: &reqwest::Client,
         url: &str,
-        session_id: &Mutex<Option<String>>,
+        session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
         id: i64,
         method: &str,
@@ -452,7 +474,7 @@ impl McpBridge {
     async fn read_sse_stream(
         client: &reqwest::Client,
         url: &str,
-        session_id: &Mutex<Option<String>>,
+        session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
         id: i64,
         method: &str,
@@ -460,39 +482,19 @@ impl McpBridge {
     ) -> anyhow::Result<serde_json::Value> {
         use futures::StreamExt as _;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut data_lines: Vec<String> = vec![];
+        let mut framer = SseFramer::default();
         let mut found = None;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("MCP http SSE stream failed")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.is_empty() {
-                    if !data_lines.is_empty() {
-                        let raw = data_lines.join("\n");
-                        data_lines.clear();
-                        if let Some(v) =
-                            Self::handle_sse_payload(client, url, session_id, roots, &raw, id)
-                                .await
-                        {
-                            found = Some(v);
-                        }
-                    }
-                    continue;
-                }
-                if line == ": ping" || line.starts_with(':') {
-                    continue;
-                }
-                if let Some(payload) = line.strip_prefix("data:") {
-                    data_lines.push(payload.trim().to_string());
+            for raw in framer.feed(&String::from_utf8_lossy(&chunk)) {
+                if let Some(v) =
+                    Self::handle_sse_payload(client, url, session_id, roots, &raw, id).await
+                {
+                    found = Some(v);
                 }
             }
         }
-        // 流尾无空行时补一次（与 `split_sse_data` 同一切分语义）
-        if !data_lines.is_empty() {
-            let raw = data_lines.join("\n");
+        if let Some(raw) = framer.flush() {
             if let Some(v) =
                 Self::handle_sse_payload(client, url, session_id, roots, &raw, id).await
             {
@@ -506,7 +508,7 @@ impl McpBridge {
     async fn handle_sse_payload(
         client: &reqwest::Client,
         url: &str,
-        session_id: &Mutex<Option<String>>,
+        session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
         raw: &str,
         id: i64,
@@ -526,7 +528,7 @@ impl McpBridge {
     async fn answer_server_request(
         client: &reqwest::Client,
         url: &str,
-        session_id: &Mutex<Option<String>>,
+        session_id: &Arc<Mutex<Option<String>>>,
         roots: &[McpRoot],
         method: &str,
         sid: Option<i64>,
@@ -552,6 +554,125 @@ impl McpBridge {
         }
     }
 
+    /// 握手成功后打开独立 GET 常驻流（StreamableHTTP server→client 通道）。
+    /// 幂等：重复调用不重复开流（重连/hot 路径复用同一槽）。
+    async fn open_server_stream(&self) {
+        let Transport::Http {
+            client,
+            url,
+            session_id,
+            stream_task,
+            ..
+        } = &self.transport
+        else {
+            return;
+        };
+        if stream_task.lock().unwrap().is_some() {
+            return;
+        }
+        let task = tokio::spawn(Self::run_server_stream(
+            client.clone(),
+            url.clone(),
+            session_id.clone(),
+            self.roots.clone(),
+        ));
+        *stream_task.lock().unwrap() = Some(task);
+    }
+
+    /// GET 常驻流自维持循环：server 关流/传输抖动则 1s 后重连；
+    /// server 明确不支持（404/405/非 SSE）则退出不再打扰；桥 drop 时 abort。
+    /// GET 流上只收 server 推送（本轮响应一律走 POST 回包，无需 id 路由）。
+    async fn run_server_stream(
+        client: reqwest::Client,
+        url: String,
+        session_id: Arc<Mutex<Option<String>>>,
+        roots: Vec<McpRoot>,
+    ) {
+        loop {
+            match Self::pump_server_stream(&client, &url, &session_id, &roots).await {
+                Ok(true) => {
+                    tracing::debug!(target: "rupi-mcp", "mcp GET stream closed, reconnect in 1s");
+                }
+                Ok(false) => {
+                    tracing::debug!(target: "rupi-mcp", "mcp GET stream unsupported, giving up");
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(target: "rupi-mcp", "mcp GET stream error ({e:#}), retry in 1s");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// 单次 GET 泵送：200+SSE 则消费到关流（反向请求当场 POST 应答，通知记 debug），
+    /// 返回是否值得重连。`i64::MIN` 当本轮 id——GET 流上无本轮响应，一律走请求/忽略两路。
+    async fn pump_server_stream(
+        client: &reqwest::Client,
+        url: &str,
+        session_id: &Arc<Mutex<Option<String>>>,
+        roots: &[McpRoot],
+    ) -> anyhow::Result<bool> {
+        use futures::StreamExt as _;
+        let mut get = client
+            .get(url)
+            .header("Accept", "text/event-stream, application/json");
+        if let Some(s) = session_id.lock().await.clone() {
+            get = get.header("mcp-session-id", s);
+        }
+        let resp = get.send().await.context("MCP http GET failed")?;
+        if let Some(s) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *session_id.lock().await = Some(s.to_string());
+        }
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !status.is_success() || !ctype.contains("text/event-stream") {
+            // 不支持独立流的 server（404/405/回 JSON）：退出外层循环，不重连打扰
+            tracing::debug!(target: "rupi-mcp", "mcp GET unsupported (status {status}, ctype {ctype})");
+            return Ok(false);
+        }
+        let mut stream = resp.bytes_stream();
+        let mut framer = SseFramer::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("MCP http GET stream failed")?;
+            for raw in framer.feed(&String::from_utf8_lossy(&chunk)) {
+                Self::handle_server_push(client, url, session_id, roots, &raw).await;
+            }
+        }
+        if let Some(raw) = framer.flush() {
+            Self::handle_server_push(client, url, session_id, roots, &raw).await;
+        }
+        Ok(true)
+    }
+
+    /// GET 流单个事件：反向请求应答后吞掉，通知与其他一律记 debug 忽略。
+    async fn handle_server_push(
+        client: &reqwest::Client,
+        url: &str,
+        session_id: &Arc<Mutex<Option<String>>>,
+        roots: &[McpRoot],
+        raw: &str,
+    ) {
+        match classify_sse_data(raw, i64::MIN) {
+            SseDatum::Response(_) => {}
+            SseDatum::ServerRequest { method, id: sid } => {
+                Self::answer_server_request(client, url, session_id, roots, &method, sid).await;
+            }
+            SseDatum::Ignored => {
+                tracing::debug!(target: "rupi-mcp", "mcp server notification ignored");
+            }
+        }
+    }
+
     pub async fn notify(&self, method: &str, params: serde_json::Value) -> anyhow::Result<()> {
         match &self.transport {
             Transport::Stdio { stdin, .. } => {
@@ -566,6 +687,7 @@ impl McpBridge {
                 client,
                 url,
                 session_id,
+                ..
             } => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
                 Self::call_http(client, url, session_id, &self.roots, id, method, params).await?;
@@ -652,6 +774,18 @@ impl McpBridge {
             is_error,
             structured: result.get("structuredContent").cloned(),
         })
+    }
+}
+
+/// 桥 drop 即停 GET 常驻流（stdio 子进程随 Child drop 回收，此处只需 abort 流任务，
+/// 否则后台重连循环泄漏到进程结束——长 REPL 会话每建一次桥漏一个）。
+impl Drop for McpBridge {
+    fn drop(&mut self) {
+        if let Transport::Http { stream_task, .. } = &self.transport {
+            if let Some(handle) = stream_task.lock().unwrap().take() {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -1173,7 +1307,15 @@ mod tests {
     fn sse_datum_classifies_responses_requests_and_noise() {
         let body = ": ping\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}\n\n\
             data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
-        let events = split_sse_data(body);
+        // 事件被拦腰切断也应拼回（增量喂块与整包同语义）
+        let mut framer = SseFramer::default();
+        let mut events = vec![];
+        for chunk in [body, ""] {
+            let mid = chunk.len() / 2;
+            events.extend(framer.feed(&chunk[..mid]));
+            events.extend(framer.feed(&chunk[mid..]));
+        }
+        events.extend(framer.flush());
         assert_eq!(events.len(), 2);
         assert_eq!(
             classify_sse_data(&events[0], 7),
@@ -1187,12 +1329,11 @@ mod tests {
             SseDatum::Response(serde_json::json!({"jsonrpc":"2.0","id":7,"result":{"ok":true}}))
         );
         // 非本轮 id、非法 JSON、空体全部忽略
-        assert_eq!(
-            classify_sse_data(&events[1], 8),
-            SseDatum::Ignored
-        );
+        assert_eq!(classify_sse_data(&events[1], 8), SseDatum::Ignored);
         assert_eq!(classify_sse_data("not json", 7), SseDatum::Ignored);
-        assert!(split_sse_data("not events at all").is_empty());
+        let mut empty = SseFramer::default();
+        assert!(empty.feed("not events at all").is_empty());
+        assert!(empty.flush().is_none());
         // 无 id 的反向通知：标请求但 id 为空，组包时回 None（无法应答即跳过）
         assert_eq!(
             classify_sse_data(r#"{"jsonrpc":"2.0","method":"ping"}"#, 7),
