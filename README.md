@@ -56,9 +56,12 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 
 ## 记忆语义（Hermes 对齐）
 
-- `~/.rupi/memories/MEMORY.md` / `USER.md`，`memory_char_limit=2200` / `user_char_limit=1375`。
+- `~/.rupi/memories/MEMORY.md` / `USER.md` / `failures.md`，`memory_char_limit=5000` / `user_char_limit=5000`。
 - 启动时冻结快照注入系统提示（保 prefix cache）；会话内 `memory` 工具写盘即时生效，
   但快照不变，下个 session 才可见；`tool` 回包永远显示实时状态。
+- 密钥扫描：`memory` 写入 / `failures.md` 记录含疑似密钥（api key / token / 私钥）一律拒绝落盘。
+- 失败记忆：review 纠正检测（用户纠正 / 助手自认失败）→ `failures.md`，随快照注入 `<FailureMemory>`。
+- 成功写入即镜像到 `sessions.db`（memories 表 + FTS5），`memory-search` / `memory_search` 工具按需查，不进每轮 prompt。
 - `MemoryManager` 只允许一个外部 provider，第二个拒绝并 warning；
   `prefetch` 超时/失败只记 debug，`sync` 失败记 warning，主循环不崩。
 - `SessionStore`（SQLite + FTS5）提供 `session-search` 跨会话回忆。

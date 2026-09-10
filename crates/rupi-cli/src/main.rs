@@ -25,6 +25,12 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
                 Err(e) => eprintln!("[review] memory save failed: {e:#}"),
             }
         }
+        for f in &s.failures {
+            match store.record_failure(f) {
+                Ok(()) => println!("[review] failure saved"),
+                Err(e) => eprintln!("[review] failure save failed: {e:#}"),
+            }
+        }
         if let Some(d) = &s.skill_draft {
             match acc.propose(&d.name, &d.description, &d.steps) {
                 Ok(dir) => println!("[review] skill drafted at {}", dir.display()),
@@ -102,6 +108,8 @@ enum Cmd {
     },
     /// 会话全文检索
     SessionSearch { query: String },
+    /// 记忆检索（MEMORY.md / failures 镜像）
+    MemorySearch { query: String },
     /// 列出外部扩展工具
     ExtList,
     /// 列出最近会话
@@ -195,14 +203,19 @@ async fn main() -> anyhow::Result<()> {
             let store = MemoryStore::new(home);
             let frozen = store.frozen_snapshot();
             println!(
-                "--- MEMORY.md ---\n{}\n--- USER.md ---\n{}",
-                frozen.memory, frozen.user
+                "--- MEMORY.md ---\n{}\n--- USER.md ---\n{}\n--- failures.md ---\n{}",
+                frozen.memory, frozen.user, frozen.failures
             );
         }
         Some(Cmd::MemoryWrite { op, entry }) => {
             let store = MemoryStore::new(home);
-            let live = store.apply_write(&op, &entry)?;
-            println!("updated. live state:\n{live}");
+            if op == "failure" {
+                store.record_failure(&entry)?;
+                println!("failure recorded.");
+            } else {
+                let live = store.apply_write(&op, &entry)?;
+                println!("updated. live state:\n{live}");
+            }
         }
         Some(Cmd::SkillsList) => {
             let reg = SkillRegistry::discover(&skill_dirs(&home));
@@ -228,6 +241,12 @@ async fn main() -> anyhow::Result<()> {
             let store = SessionStore::open(&home)?;
             for (sid, snippet) in store.search(&query, 10)? {
                 println!("[{sid}] {snippet}");
+            }
+        }
+        Some(Cmd::MemorySearch { query }) => {
+            let store = SessionStore::open(&home)?;
+            for (target, snippet) in store.memory_search(&query, 10)? {
+                println!("[{target}] {snippet}");
             }
         }
         Some(Cmd::ExtList) => {
@@ -380,8 +399,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             Arc::new(HeuristicReviewer::default()),
             Arc::new(move |s: ReviewSuggestion| {
                 println!(
-                    "\n[review] memory_ops={} skill={}",
+                    "\n[review] memory_ops={} failures={} skill={}",
                     s.memory_ops.len(),
+                    s.failures.len(),
                     s.skill_draft
                         .as_ref()
                         .map(|d| d.name.as_str())
@@ -389,6 +409,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 );
                 for m in &s.memory_ops {
                     println!("[review] memory add: {}", m.entry);
+                }
+                for f in &s.failures {
+                    println!("[review] failure: {f}");
                 }
                 if let Some(d) = &s.skill_draft {
                     println!("[review] skill draft: {} — {}", d.name, d.description);
@@ -582,6 +605,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 for m in &s.memory_ops {
                     lines.push(format!("[review] memory add: {}", m.entry));
                 }
+                for f in &s.failures {
+                    lines.push(format!("[review] failure: {f}"));
+                }
                 if let Some(d) = &s.skill_draft {
                     lines.push(format!(
                         "[review] skill draft: {} — {}",
@@ -594,6 +620,12 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                         match store.apply_write("add", &m.entry) {
                             Ok(_) => lines.push("[review] memory saved".into()),
                             Err(e) => lines.push(format!("[review] memory save failed: {e:#}")),
+                        }
+                    }
+                    for f in &s.failures {
+                        match store.record_failure(f) {
+                            Ok(()) => lines.push("[review] failure saved".into()),
+                            Err(e) => lines.push(format!("[review] failure save failed: {e:#}")),
                         }
                     }
                     if let Some(d) = &s.skill_draft {

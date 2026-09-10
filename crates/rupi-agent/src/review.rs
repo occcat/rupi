@@ -30,12 +30,15 @@ pub struct SkillDraftSuggestion {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewSuggestion {
     pub memory_ops: Vec<MemoryOpSuggestion>,
+    /// 本轮学到的失败教训（用户纠正 / 助手自认失败），调用方写 failures.md。
+    #[serde(default)]
+    pub failures: Vec<String>,
     pub skill_draft: Option<SkillDraftSuggestion>,
 }
 
 impl ReviewSuggestion {
     pub fn is_empty(&self) -> bool {
-        self.memory_ops.is_empty() && self.skill_draft.is_none()
+        self.memory_ops.is_empty() && self.failures.is_empty() && self.skill_draft.is_none()
     }
 }
 
@@ -85,6 +88,43 @@ impl HeuristicReviewer {
         }
     }
 
+    /// 纠正检测（Hermes correction detection 对齐）：用户纠正立刻记一条失败，
+    /// 助手自认失败也记一条。不确定时宁可不记，避免污染 failures.md。
+    fn failure_entry(&self, t: &TurnTranscript) -> Option<String> {
+        let user = t.user.trim();
+        if user.is_empty() {
+            return None;
+        }
+        let lower = user.to_lowercase();
+        let correction = user.contains("不对")
+            || user.contains("不是这样")
+            || user.contains("你错了")
+            || user.contains("你搞错了")
+            || user.contains("错了")
+            || user.contains("重来")
+            || lower.contains("that's wrong")
+            || lower.contains("you're wrong")
+            || lower.contains("you misunderstood")
+            || lower.contains("not what i asked")
+            || lower.contains("incorrect");
+        if correction {
+            let entry: String = user.chars().take(self.max_entry_chars).collect();
+            return Some(format!("user correction: {entry}"));
+        }
+        let a = t.assistant.to_lowercase();
+        let admitted = t.assistant.contains("失败了")
+            || t.assistant.contains("出错了")
+            || t.assistant.contains("没能")
+            || a.contains("failed to")
+            || a.contains("couldn't complete")
+            || a.contains("error occurred");
+        if admitted {
+            let entry: String = t.assistant.chars().take(self.max_entry_chars).collect();
+            return Some(format!("assistant reported failure: {entry}"));
+        }
+        None
+    }
+
     fn skill_draft(&self, t: &TurnTranscript) -> Option<SkillDraftSuggestion> {
         let mut distinct = vec![];
         for n in &t.tool_names {
@@ -130,6 +170,7 @@ impl Reviewer for HeuristicReviewer {
                 .map(|entry| MemoryOpSuggestion { entry })
                 .into_iter()
                 .collect(),
+            failures: self.failure_entry(t).into_iter().collect(),
             skill_draft: self.skill_draft(t),
         })
     }
@@ -184,6 +225,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.memory_ops.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn correction_yields_failure_entry() {
+        let r = HeuristicReviewer::default();
+        let s = r
+            .review_turn(&TurnTranscript {
+                user: "不对，你搞错了目录".into(),
+                assistant: "ok".into(),
+                tool_names: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.failures.len(), 1);
+        assert!(s.failures[0].contains("correction"));
+    }
+
+    #[tokio::test]
+    async fn admitted_failure_yields_failure_entry() {
+        let r = HeuristicReviewer::default();
+        let s = r
+            .review_turn(&TurnTranscript {
+                user: "deploy it".into(),
+                assistant: "I failed to connect to the host".into(),
+                tool_names: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.failures.len(), 1);
+        assert!(s.failures[0].contains("failure"));
     }
 
     #[tokio::test]

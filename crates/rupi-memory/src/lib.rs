@@ -11,6 +11,52 @@ use std::path::{Path, PathBuf};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const USER_FILE: &str = "USER.md";
+pub const FAILURES_FILE: &str = "failures.md";
+
+/// 疑似密钥落盘即拒绝（Hermes secret scanning 对齐）：API key / token / 私钥块等。
+/// 误伤可接受——记忆本就不该存这些；调用方收到 error 可改写后再存。
+pub fn contains_secret(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    for marker in [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxs-",
+        "akia",
+        "-----begin",
+        "private key",
+    ] {
+        if lower.contains(marker) {
+            return true;
+        }
+    }
+    // key= / token: / password= 后跟较长无空格值
+    let mut last_word = String::new();
+    let mut chars = lower.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            last_word.push(c);
+        } else {
+            if (c == ':' || c == '=')
+                && matches!(
+                    last_word.as_str(),
+                    "api_key" | "apikey" | "api-key" | "token" | "password" | "passwd" | "secret"
+                )
+            {
+                let rest: String = chars.clone().take(64).collect();
+                let val = rest.trim_start_matches([' ', '"', '\'']);
+                if val.chars().take_while(|c| !c.is_whitespace()).count() >= 8 {
+                    return true;
+                }
+            }
+            last_word.clear();
+        }
+    }
+    false
+}
 
 /// 内建记忆文件：受 char limit 保护（默认 ~800 tokens / ~500 tokens），超限截断保尾部。
 #[derive(Debug, Clone)]
@@ -28,8 +74,8 @@ impl MemoryStore {
             home,
             memory_enabled: true,
             user_profile_enabled: true,
-            memory_char_limit: 2200,
-            user_char_limit: 1375,
+            memory_char_limit: 5000,
+            user_char_limit: 5000,
         }
     }
 
@@ -69,11 +115,39 @@ impl MemoryStore {
         FrozenMemory {
             memory: self.memory_text(),
             user: self.user_text(),
+            failures: self.failures_text(),
         }
     }
 
+    /// 失败记忆（Hermes failures.md 对齐）：存“什么没成 + 为什么”，带时间戳。
+    /// 同样过密钥扫描；失败记录只追加，由 review 纠正检测或 agent 显式写入。
+    pub fn record_failure(&self, entry: &str) -> anyhow::Result<()> {
+        if contains_secret(entry) {
+            anyhow::bail!("refused: failure entry looks like a secret; describe it without the credential");
+        }
+        std::fs::create_dir_all(self.memories_dir())?;
+        let path = self.memories_dir().join(FAILURES_FILE);
+        let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+        content.push_str(&format!(
+            "- [{}] {}\n",
+            chrono::Utc::now().format("%Y-%m-%d"),
+            entry.trim()
+        ));
+        std::fs::write(&path, &content)?;
+        self.mirror_memory("failure", entry);
+        Ok(())
+    }
+
+    pub fn failures_text(&self) -> String {
+        self.read_limited(&self.memories_dir().join(FAILURES_FILE), self.memory_char_limit)
+    }
+
     /// agent 经 `memory` 工具写入：即时落盘，返回实时状态（但不改变已冻结快照）。
+    /// 含疑似密钥一律拒绝（不落盘，调用方可改写脱敏后再存）。
     pub fn apply_write(&self, op: &str, entry: &str) -> anyhow::Result<String> {
+        if contains_secret(entry) {
+            anyhow::bail!("refused: entry looks like a secret (api key/token/private key); store a reference instead");
+        }
         std::fs::create_dir_all(self.memories_dir())?;
         let path = self.memories_dir().join(MEMORY_FILE);
         let mut content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -98,6 +172,7 @@ impl MemoryStore {
             _ => anyhow::bail!("unknown memory op: {op}"),
         }
         std::fs::write(&path, &content)?;
+        self.mirror_memory("memory", entry);
         Ok(content)
     }
 
@@ -119,12 +194,44 @@ impl MemoryStore {
             prompt_snippet: Some("memory(op, entry): persist durable facts across sessions".into()),
         })
     }
+
+    pub fn memory_search_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_search".into(),
+            description: "Search learned long-term memories (MEMORY.md / failures mirror): query past facts, lessons, failures".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5}
+                },
+                "required": ["query"]
+            }),
+            prompt_snippet: Some(
+                "memory_search(query): recall learned facts/lessons/failures on demand".into(),
+            ),
+        }
+    }
+
+    /// SQLite 镜像（best-effort）：成功写入的记忆同步一行到 sessions.db，
+    /// 失败只 warning，绝不影响 markdown 主写入。
+    fn mirror_memory(&self, target: &str, content: &str) {
+        match SessionStore::open(&self.home) {
+            Ok(db) => {
+                if let Err(e) = db.mirror_memory_entry(target, content) {
+                    tracing::warn!("memory mirror failed: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("memory mirror failed: {e:#}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FrozenMemory {
     pub memory: String,
     pub user: String,
+    pub failures: String,
 }
 
 impl FrozenMemory {
@@ -138,6 +245,12 @@ impl FrozenMemory {
         }
         if !self.user.is_empty() {
             s.push_str(&format!("\n<UserProfile>\n{}\n</UserProfile>\n", self.user));
+        }
+        if !self.failures.is_empty() {
+            s.push_str(&format!(
+                "\n<FailureMemory>\nPast failures — do not repeat these mistakes:\n{}\n</FailureMemory>\n",
+                self.failures
+            ));
         }
         s
     }
@@ -234,6 +347,7 @@ impl MemoryManager {
         let mut out = vec![];
         if let Some(d) = self.store.memory_tool_definition() {
             out.push(d);
+            out.push(MemoryStore::memory_search_tool_definition());
         }
         if let Some(e) = &self.external {
             out.extend(e.tool_schemas());
@@ -296,6 +410,24 @@ impl MemoryManager {
             return Ok(Some(format!(
                 "memory updated (live). Takes effect in prompt next session.\n{live}"
             )));
+        }
+        if name == "memory_search" {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .min(20) as usize;
+            let db = SessionStore::open(&self.store.home)?;
+            let hits = db.memory_search(query, limit)?;
+            if hits.is_empty() {
+                return Ok(Some("no matching memories".into()));
+            }
+            let lines: Vec<String> = hits
+                .iter()
+                .map(|(target, snippet)| format!("[{target}] {snippet}"))
+                .collect();
+            return Ok(Some(lines.join("\n---\n")));
         }
         if let Some(e) = &self.external {
             if self.tool_to_provider.contains_key(name) {
@@ -427,6 +559,12 @@ pub struct SessionStore {
     conn: rusqlite::Connection,
 }
 
+/// 用户查询转 FTS5 短语：裸 `-` / `:` / `*` 等会被当运算符导致 syntax error，
+/// 包一层双引号按字面短语查（分词仍按 tokenizer 来，不影响中英文关键词）。
+fn fts_phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
 impl SessionStore {
     pub fn open(home: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(home)?;
@@ -442,6 +580,21 @@ impl SessionStore {
              END;
              CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+             END;
+             -- 扩展记忆镜像（Hermes memories 对齐）：MEMORY.md / failures.md 写入即镜像一行，
+             -- `memory_search` 按需查，不注入每轮 prompt
+             CREATE TABLE IF NOT EXISTS memories(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               target TEXT NOT NULL,
+               content TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid');
+             CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+               INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+               INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
              END;
              -- 存量补索引（老库升级路径）
              INSERT INTO messages_fts(rowid, content)
@@ -501,7 +654,7 @@ impl SessionStore {
              WHERE messages_fts MATCH ? LIMIT ?",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![query, limit as i64], |r| {
+            .query_map(rusqlite::params![fts_phrase(query), limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
             .collect::<Result<Vec<(String, String)>, _>>()?;
@@ -527,6 +680,31 @@ impl SessionStore {
                 Ok((id, profile, created, count))
             })?
             .collect::<Result<Vec<(String, String, String, i64)>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 扩展记忆镜像写入（target: 'memory' | 'failure'），供 `memory_search` 查询。
+    pub fn mirror_memory_entry(&self, target: &str, content: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO memories(target, content, created_at) VALUES(?,?,?)",
+            rusqlite::params![target, content, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// memory_search：查 markdown 记忆镜像（MEMORY.md / failures.md 的成功写入）。
+    /// 与 session_search 分开：记忆是“学到的”，会话是“聊过的”。
+    pub fn memory_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.target, snippet(memory_fts, 0, '<b>', '</b>', '...', 20)
+             FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
+             WHERE memory_fts MATCH ? LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![fts_phrase(query), limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<Vec<(String, String)>, _>>()?;
         Ok(rows)
     }
 
@@ -636,6 +814,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(hit.contains("oolong"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn secrets_are_refused_not_persisted() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        assert!(store.apply_write("add", "my api_key = sk-abcdef1234567890").is_err());
+        assert!(store
+            .apply_write("add", "token: ghp_deadbeefcafe1234")
+            .is_err());
+        assert!(store
+            .apply_write("add", "-----BEGIN RSA PRIVATE KEY-----")
+            .is_err());
+        assert!(store.record_failure("AKIAIOSFODNN7EXAMPLE leaked").is_err());
+        // 拒绝后无残留
+        assert!(store.memory_text().is_empty());
+        assert!(store.failures_text().is_empty());
+        // 正常写入不受影响
+        store.apply_write("add", "likes tea").unwrap();
+        assert!(store.memory_text().contains("tea"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn failures_record_and_freeze_into_prompt() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        store.record_failure("rm -rf deleted worktree; use trash instead").unwrap();
+        let frozen = store.frozen_snapshot();
+        assert!(frozen.failures.contains("trash"));
+        assert!(frozen.system_block().contains("FailureMemory"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn memory_writes_mirror_into_sqlite_and_searchable() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        store.apply_write("add", "prefers oolong tea over coffee").unwrap();
+        store.record_failure("used bash pipe wrong; check exit codes").unwrap();
+        let db = SessionStore::open(&home).unwrap();
+        let hits = db.memory_search("oolong", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "memory");
+        let fhits = db.memory_search("exit codes", 5).unwrap();
+        assert_eq!(fhits.len(), 1);
+        assert_eq!(fhits[0].0, "failure");
+        assert!(db.memory_search("zzz-no-match", 5).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn manager_routes_memory_search_tool() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-ms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mgr = MemoryManager::new(MemoryStore::new(home.clone()));
+        assert!(mgr
+            .all_tool_definitions()
+            .iter()
+            .any(|d| d.name == "memory_search"));
+        mgr.handle_tool_call(
+            "memory",
+            serde_json::json!({"op": "add", "entry": "deploy via gondolin sandbox"}),
+        )
+        .await
+        .unwrap();
+        let hit = mgr
+            .handle_tool_call("memory_search", serde_json::json!({"query": "gondolin"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("gondolin"));
+        let miss = mgr
+            .handle_tool_call("memory_search", serde_json::json!({"query": "zzz-no-match"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(miss, "no matching memories");
         let _ = std::fs::remove_dir_all(&home);
     }
 
