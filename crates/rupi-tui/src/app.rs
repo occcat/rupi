@@ -639,9 +639,9 @@ fn draw<B: Backend>(
             f.render_widget(
                 Paragraph::new(if busy {
                     if queued > 0 {
-                        format!("… thinking ({queued} queued · Ctrl-C 退出)")
+                        format!("… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出)")
                     } else {
-                        "… thinking (Ctrl-C 退出)".to_string()
+                        "… thinking (Esc 中断本轮 · Ctrl-C 退出)".to_string()
                     }
                 } else {
                     "ready".to_string()
@@ -767,6 +767,36 @@ mod tests {
         // 光标：输入框行首 x+3（"> " 后）+ 字符数，"he" → x=5；输入框 y=8 → 光标 y=9
         let pos = terminal.backend_mut().get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (5, 9), "光标位置不对");
+    }
+
+    #[test]
+    fn draw_busy_status_hints_steer_and_quit() {
+        // 运行中状态栏即 steering 说明书：排队时提示 Esc 中断并转向，无排队只提示中断。
+        use ratatui::{backend::TestBackend, Terminal};
+        let view = ChatView::default();
+        let input = InputBuffer::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 2, &[]).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("2 queued"), "缺排队数:\n{screen}");
+        assert!(screen.contains("Esc"), "缺转向提示:\n{screen}");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 0, &[]).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Esc"), "缺中断提示:\n{screen}");
+        assert!(!screen.contains("queued"), "无排队不应提 queued:\n{screen}");
     }
 
     #[test]

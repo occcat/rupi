@@ -191,6 +191,16 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+/// 上下文文件搜索起点：信任项目读 cwd 链，否则只读全局 home（cwd=home，
+/// 祖先链退化为 home→根，与上游 agentDir 行为一致）。
+fn context_cwd(load_project: bool, home: &std::path::Path) -> PathBuf {
+    if load_project {
+        std::env::current_dir().unwrap_or_else(|_| home.to_path_buf())
+    } else {
+        home.to_path_buf()
+    }
+}
+
 /// 内建记忆 store：全局 `~/.rupi/memories` + 从 cwd 上溯 `.git` 的项目层（Hermes two-tier）。
 /// `load_project` 为 false（项目信任被拒）时只挂全局层，项目 `MEMORY.md` 不读不写。
 fn memory_store(home: &PathBuf, load_project: bool) -> MemoryStore {
@@ -789,6 +799,8 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
+    // 项目上下文（AGENTS.md 系）守信任门：非信任只读全局 home，不读 cwd 链（防项目指令注入）。
+    agent = agent.with_context_dirs(context_cwd(load_project, home), home.clone());
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);
@@ -939,6 +951,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut ext_set = load_extensions(&mut tools, &ext_path);
     // 项目信任门：未信任则项目记忆/skills/命令全部不加载（只用全局）
     let load_project = load_project_resources(home, cli);
+    // 项目上下文（AGENTS.md 系）同样守信任门。
+    agent = agent.with_context_dirs(context_cwd(load_project, home), home.clone());
     let mut store = memory_store(home, load_project);
     if cli.no_memory {
         store.memory_enabled = false;
@@ -1266,6 +1280,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
+    // 项目上下文守信任门（与 run/chat 同 helper）。
+    agent = agent.with_context_dirs(context_cwd(load_project, home), home.clone());
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);

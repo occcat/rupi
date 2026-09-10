@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 pub mod review;
 pub use review::{HeuristicReviewer, LlmReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
+pub mod context;
+pub use context::{load_context_files, ContextFile};
 pub mod policy;
 pub use policy::{
     ApprovalAnswer, Approver, ChainPolicy, Decision, Policy, RulePolicy, SessionApprovalCache,
@@ -30,11 +32,26 @@ pub use hooks::{
 #[derive(Clone)]
 pub struct PromptBuilder {
     pub base: String,
+    /// 上下文文件搜索根：`(cwd, agent_dir)`。每 turn 重读拼块（改完即生效）；
+    /// `None` 则不拼（单测/内嵌调用默认）。
+    pub context_dirs: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl PromptBuilder {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into() }
+        Self {
+            base: base.into(),
+            context_dirs: None,
+        }
+    }
+
+    pub fn with_context_dirs(
+        mut self,
+        cwd: std::path::PathBuf,
+        agent_dir: std::path::PathBuf,
+    ) -> Self {
+        self.context_dirs = Some((cwd, agent_dir));
+        self
     }
 
     pub fn build(
@@ -47,6 +64,11 @@ impl PromptBuilder {
     ) -> String {
         let mut s = self.base.clone();
         s.push_str(&mem.system_block(frozen));
+        // 项目上下文（AGENTS.md 系）：记忆之后、skill 索引之前（对标上游相对位置）。
+        if let Some((cwd, agent_dir)) = self.context_dirs.as_ref() {
+            let files = crate::context::load_context_files(cwd, agent_dir);
+            s.push_str(&crate::context::format_context_block(&files));
+        }
         s.push_str(&skills.index_block());
         if !extra_tools.is_empty() {
             s.push_str("\n<AvailableTools>\n");
@@ -264,6 +286,17 @@ impl AgentLoop {
     /// 思考强度（对标上游 `/thinking`）：只影响主循环发模型的请求。
     pub fn with_thinking(mut self, thinking: ThinkingLevel) -> Self {
         self.thinking = Some(thinking);
+        self
+    }
+
+    /// 上下文文件搜索根（对标上游 `loadProjectContextFiles` 的 cwd/agentDir）：
+    /// 每 turn 重读 AGENTS.md 系并拼入系统提示。
+    pub fn with_context_dirs(
+        mut self,
+        cwd: std::path::PathBuf,
+        agent_dir: std::path::PathBuf,
+    ) -> Self {
+        self.builder = self.builder.with_context_dirs(cwd, agent_dir);
         self
     }
 
@@ -1084,6 +1117,32 @@ mod tests {
     use rupi_llm::{ChatResponse, MockProvider};
     use rupi_memory::MemoryStore;
     use rupi_memory::MemoryProvider;
+
+    #[test]
+    fn builder_injects_agents_md_between_memory_and_skills() {
+        // AGENTS.md 分层注入：project_context 块出现在记忆之后、skill 索引之前；
+        // 无 context_dirs 时零行为变化。
+        let base = std::env::temp_dir().join(format!("rupi-ctx-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("AGENTS.md"), "USE_TABS=true").unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mem = MemoryManager::new(MemoryStore::new(base.join("mem")));
+        let frozen = FrozenMemory::default();
+        let skills = SkillRegistry::default();
+        let plain = PromptBuilder::new("BASE")
+            .build(&frozen, &mem, &skills, &[], &[]);
+        assert!(!plain.contains("project_context"), "{plain}");
+        let with = PromptBuilder::new("BASE")
+            .with_context_dirs(proj, home)
+            .build(&frozen, &mem, &skills, &[], &[]);
+        assert!(with.contains("<project_context>"), "{with}");
+        assert!(with.contains("USE_TABS=true"), "{with}");
+        assert!(with.contains("<project_instructions path="), "{with}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[tokio::test]
     async fn loop_finishes_without_tool_calls() {
