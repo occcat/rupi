@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::{Message, SessionTree};
-use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
+use rupi_llm::{AnthropicProvider, LlmProvider, MockProvider, OpenAiCompatProvider};
 use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
@@ -312,6 +312,20 @@ fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet
 }
 
 async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
+    // claude-* 走 Anthropic 原生（缺 key 回 mock，不静默走错网关）
+    if model.starts_with("claude-") {
+        match AnthropicProvider::from_env(model.to_string()) {
+            Ok(p) => return Ok(Box::new(p)),
+            Err(e) => {
+                eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                return Ok(Box::new(MockProvider::new(vec![
+                    MockProvider::text_response(
+                        "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。",
+                    ),
+                ])));
+            }
+        }
+    }
     match OpenAiCompatProvider::from_env(model.to_string()) {
         Ok(p) => Ok(Box::new(p)),
         Err(_) => {
