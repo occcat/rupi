@@ -12,7 +12,7 @@ use crossterm::{
 };
 use futures::StreamExt as _;
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line as RLine, Span},
@@ -436,8 +436,9 @@ async fn drive_turn(
     }
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+/// 全屏绘制（Backend 泛型：生产走 Crossterm，单测走 TestBackend 真画一遍断言像素行）。
+fn draw<B: Backend>(
+    terminal: &mut Terminal<B>,
     view: &ChatView,
     input: &InputBuffer,
     scroll: u16,
@@ -556,6 +557,45 @@ mod tests {
             Builtin::Done(s) => s,
             _ => panic!("expected Done, got other"),
         }
+    }
+
+    #[test]
+    fn draw_renders_messages_input_completion_and_status() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut view = ChatView::default();
+        view.push_user("hello".into());
+        view.push_event(&rupi_core::AgentEvent::TextDelta {
+            delta: "world".into(),
+        });
+        let mut input = InputBuffer::default();
+        for c in "he".chars() {
+            input.push_char(c);
+        }
+        let completion = vec!["help".to_string(), "history".to_string()];
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        draw(&mut terminal, &view, &input, 0, false, &completion).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for want in [
+            "rupi",
+            "you: hello",
+            "world",
+            "> he",
+            "/help",
+            "/history",
+            "Tab",
+            "ready",
+        ] {
+            assert!(screen.contains(want), "缺 `{want}`:\n{screen}");
+        }
+        // 光标：输入框行首 x+3（"> " 后）+ 字符数，"he" → x=5；输入框 y=8 → 光标 y=9
+        let pos = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (5, 9), "光标位置不对");
     }
 
     #[test]
