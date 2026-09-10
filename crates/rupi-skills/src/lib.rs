@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -159,19 +161,41 @@ impl SkillRegistry {
     /// skill 根，不再下钻（skill 内部 `references/*.md` 不会被误收）；否则递归子目录
     /// （不限深度，支持 `base/group/<skill>/SKILL.md` 分组嵌套）；仅顶层直接 `.md`
     /// 子文件可回退为 skill（有 frontmatter description 才收，无则静默跳过）。
-    /// 条目按文件名排序，保证同名去重（先发现者胜）跨次稳定。
-    /// 已知差距：上游按 `.gitignore/.ignore/.fdignore` 逐目录过滤，本实现暂只跳过
-    /// 点文件与 `node_modules`（skills 多为专用目录，ignore 文件罕见；全量 gitignore
-    /// 语义需引入 `ignore` crate，后续补）。
+    /// `.gitignore/.ignore/.fdignore` 逐目录 honor（与上游同名文件同语义，点文件与
+    /// `node_modules` 照例先跳过）。条目按文件名排序，保证同名去重（先发现者胜）跨次稳定。
     pub fn refresh(&self, dirs: &[PathBuf]) -> usize {
         let mut skills: Vec<Skill> = vec![];
         let mut seen_files = std::collections::HashSet::new();
-        let mut seen_dirs = std::collections::HashSet::new();
         for base in dirs {
             if !base.exists() {
                 continue;
             }
-            Self::visit(base, base, true, &mut skills, &mut seen_files, &mut seen_dirs, 0);
+            // 预扫 ignore 规则一次建成 matcher（与 visit 同步遍历，规则集等价于懒收集）。
+            let mut builder = GitignoreBuilder::new(base);
+            Self::collect_ignore_lines(
+                base,
+                base,
+                &mut builder,
+                &mut std::collections::HashSet::new(),
+                0,
+            );
+            let ig = match builder.build() {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!("skill ignore rules invalid under {}: {e:#}", base.display());
+                    Gitignore::empty()
+                }
+            };
+            Self::visit(
+                base,
+                base,
+                true,
+                &ig,
+                &mut skills,
+                &mut seen_files,
+                &mut std::collections::HashSet::new(),
+                0,
+            );
         }
         // 同名去重：先发现者胜；后来者记 warning（对标上游 collision diagnostic）。
         let mut seen = std::collections::HashSet::new();
@@ -195,10 +219,13 @@ impl SkillRegistry {
     /// 递归扫描单个目录。`root` 为本次 base（算相对路径用），`include_root_files`
     /// 仅顶层为真。目录 symlink 跟随进入，但 canonical 目录去重（防环＋同一 skill
     /// 经 symlink 多路径到达只收一次）；断链 symlink 的 `is_file/is_dir` 为假，天然跳过。
+    /// 被忽略的 `SKILL.md` 不具终端语义（对标上游 `ignores → continue`，外层继续下钻）。
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         dir: &Path,
         root: &Path,
         include_root_files: bool,
+        ig: &Gitignore,
         out: &mut Vec<Skill>,
         seen_files: &mut std::collections::HashSet<PathBuf>,
         seen_dirs: &mut std::collections::HashSet<PathBuf>,
@@ -223,12 +250,14 @@ impl SkillRegistry {
                 return;
             }
         };
-        // skill 根优先：本目录有 SKILL.md 则收后即返，不再下钻。
+        // skill 根优先：未被忽略的 SKILL.md 收后即返，不再下钻。
+        // 注：matched 必须传完整路径（ignore 内部按 base 做 strip_prefix，
+        // 传相对路径恒为 NoMatch）。
         if let Some(md) = entries
             .iter()
             .find(|e| e.file_name().to_str() == Some("SKILL.md"))
             .map(|e| e.path())
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !ig.matched(p, false).is_ignore())
         {
             Self::collect(out, seen_files, root, &md, true);
             return;
@@ -241,12 +270,130 @@ impl SkillRegistry {
                 continue;
             }
             let p = e.path();
-            if p.is_dir() {
-                Self::visit(&p, root, false, out, seen_files, seen_dirs, depth + 1);
+            let is_dir = p.is_dir();
+            // 目录按完整路径测（ignore 内部自行相对 base 换算，目录加不加 `/` 皆可，
+            // 传完整路径即可；断链 symlink 双假，天然跳过）。
+            if ig.matched(&p, is_dir).is_ignore() {
+                continue;
+            }
+            if is_dir {
+                Self::visit(&p, root, false, ig, out, seen_files, seen_dirs, depth + 1);
             } else if include_root_files && p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
                 Self::collect(out, seen_files, root, &p, false);
             }
         }
+    }
+
+    /// base 下相对路径（POSIX 分隔，供 ignore 规则拼前缀）。root 自身返回全文，
+    /// 调用方以 `dir == root` 判空前缀；symlink 指外同样回退全文（规则按字面拼接，
+    /// 与上游 `relativeEnvPath` 回退一致：裸 pattern 照 basename 生效，锚定 pattern 不命中）。
+    fn rel_posix(root: &Path, p: &Path) -> String {
+        match p.strip_prefix(root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
+            _ => p.to_string_lossy().replace('\\', "/"),
+        }
+    }
+
+    /// 预扫 ignore 规则（对标上游 `addIgnoreRules` 逐目录收集）：`.gitignore/.ignore/.fdignore`
+    /// 按“相对 root 前缀”改写后一次建成 matcher。遍历与 visit 同步（含 SKILL.md 终端语义），
+    /// 规则集等价于边走边收。缺文件静默，读失败记 warn（与上游 file_info/read_failed 同约）。
+    fn collect_ignore_lines(
+        dir: &Path,
+        root: &Path,
+        builder: &mut GitignoreBuilder,
+        seen_dirs: &mut std::collections::HashSet<PathBuf>,
+        depth: usize,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !seen_dirs.insert(canon_dir) {
+            return;
+        }
+        let rel = Self::rel_posix(root, dir);
+        // root 自身 rel 为全文（rel_posix 回退），以 dir==root 判空前缀。
+        let prefix = if dir == root {
+            String::new()
+        } else {
+            format!("{rel}/")
+        };
+        for name in [".gitignore", ".ignore", ".fdignore"] {
+            let file = dir.join(name);
+            let content = match std::fs::read_to_string(&file) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!("skip unreadable {}: {e:#}", file.display());
+                    continue;
+                }
+            };
+            for line in content.lines() {
+                if let Some(pat) = Self::prefix_ignore_pattern(line, &prefix) {
+                    if let Err(err) = builder.add_line(None, &pat) {
+                        tracing::warn!("bad ignore pattern {}: {err}", file.display());
+                    }
+                }
+            }
+        }
+        let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.flatten().collect(),
+            Err(_) => return,
+        };
+        entries.sort_by_key(|a| a.file_name());
+        if entries
+            .iter()
+            .any(|e| e.file_name().to_str() == Some("SKILL.md") && e.path().is_file())
+        {
+            return;
+        }
+        for e in &entries {
+            let skip = e
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with('.') || n == "node_modules")
+                .unwrap_or(true);
+            if skip {
+                continue;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                Self::collect_ignore_lines(&p, root, builder, seen_dirs, depth + 1);
+            }
+        }
+    }
+
+    /// 上游 `prefixIgnorePattern` 同款移植：空行/注释丢弃，`!` 取反，`/` 去锚，
+    /// 再拼相对 root 前缀。唯二适配：无 slash 裸 pattern 在子目录前缀下强制锚定
+    /// （`group/*.log` 只拦 group 下；gitignore 裸 pattern 本会匹配任意层级），
+    /// `\#`/`\!` 转义保留反斜杠透传（预先剥掉会让 `#` 被当注释丢掉）。
+    fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.starts_with('#') && !trimmed.starts_with("\\#") {
+            return None;
+        }
+        let mut pattern = line.to_string();
+        let mut negated = false;
+        if pattern.starts_with('!') {
+            negated = true;
+            pattern.remove(0);
+        }
+        if pattern.starts_with('/') {
+            pattern.remove(0);
+        }
+        let anchored = pattern.contains('/') || pattern.ends_with('/') || prefix.is_empty();
+        let mut out = if anchored {
+            format!("{prefix}{pattern}")
+        } else {
+            format!("/{prefix}{pattern}")
+        };
+        if negated {
+            out.insert(0, '!');
+        }
+        Some(out)
     }
 
     /// 收单个 `.md` 为 skill：canonical 文件去重；`declared`（SKILL.md）失败记 warn，
@@ -666,6 +813,70 @@ mod tests {
         acc.propose("dup-skill", "first write", &["step".into()]).unwrap();
         assert!(acc.exists("dup-skill"));
         assert!(!acc.exists("other-skill"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gitignore_excluded_skill_dir_is_skipped() {
+        // .gitignore 排除 skill 目录：被排除者消失，兄弟 skill 存活。
+        let base = std::env::temp_dir().join(format!("rupi-skill-ign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for name in ["hidden", "visible"] {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\n\n# Body\nContent.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(base.join(".gitignore"), "hidden/\n").unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        assert!(reg.load_skill("hidden").is_none());
+        assert!(reg.load_skill("visible").is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gitignore_negation_reinstates_skill() {
+        // `!` 取反：`group/*` 排除内容但保留目录本身可再取回（gitignore 标准语义：
+        // 父目录本身被排除后子项不可取回，故此处用 `group/*` 而非 `group/`）。
+        let base = std::env::temp_dir().join(format!("rupi-skill-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for name in ["keep", "drop"] {
+            let dir = base.join("group").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\n\n# Body\nContent.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(base.join(".gitignore"), "group/*\n!group/keep/\n").unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        assert!(reg.load_skill("keep").is_some());
+        assert!(reg.load_skill("drop").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dotignore_file_also_filters_skills() {
+        // `.ignore` 文件同样生效（上游三件套之一），无命中 pattern 不影响发现。
+        let base = std::env::temp_dir().join(format!("rupi-skill-dotign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for name in ["gone", "stays"] {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\n\n# Body\nContent.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(base.join(".ignore"), "gone/\nno-such-skill-anywhere/\n").unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        assert!(reg.load_skill("gone").is_none());
+        assert!(reg.load_skill("stays").is_some());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
