@@ -200,6 +200,42 @@ fn heuristic_review_on_by_default_no_review_opts_out() {
 }
 
 #[test]
+fn chat_review_apply_persists_memory_and_failure() {
+    // --review-apply：启发式复盘的记忆/失败建议真正落盘（自积累端到端证据）。
+    // 落盘位置：<RUPI_HOME>/memories/MEMORY.md 与 failures.md。
+    let home = fresh_home();
+    let o = chat_with(
+        &home,
+        &["--review-apply"],
+        "请记住我爱喝乌龙茶\n/quit\n".as_bytes(),
+    );
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "--review-apply chat 非零退出: {o:?}");
+    assert!(
+        out.contains("[review] memory saved"),
+        "记忆建议未落盘:\n{out}"
+    );
+    let mem = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap_or_default();
+    assert!(mem.contains("乌龙茶"), "MEMORY.md 无复盘条目:\n{mem}");
+
+    let home2 = fresh_home();
+    let o = chat_with(
+        &home2,
+        &["--review-apply"],
+        "不对，你搞错了目录\n/quit\n".as_bytes(),
+    );
+    let (out2, _) = out_text(&o);
+    assert!(o.status.success(), "--review-apply chat 非零退出: {o:?}");
+    assert!(
+        out2.contains("[review] failure saved"),
+        "失败建议未落盘:\n{out2}"
+    );
+    let fails =
+        std::fs::read_to_string(home2.join("memories").join("failures.md")).unwrap_or_default();
+    assert!(fails.contains("目录"), "failures.md 无纠正条目:\n{fails}");
+}
+
+#[test]
 fn empty_states_exit_zero() {
     let home = fresh_home();
     for sub in ["ext-list", "commands"] {
