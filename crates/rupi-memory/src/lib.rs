@@ -230,6 +230,19 @@ impl MemoryStore {
         std::fs::create_dir_all(self.memories_dir())?;
         let path = self.memories_dir().join(FAILURES_FILE);
         let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+        // 幂等：同纠正反复出现只记一条（行首 `- [日期] ` 前缀剥掉再比，日期不同也算重复）
+        let want = entry.trim();
+        let dup = content.lines().any(|l| {
+            let body = l.trim().strip_prefix("- [").and_then(|r| r.split_once("] "));
+            match body {
+                Some((_, rest)) => rest.trim() == want,
+                None => l.trim() == want,
+            }
+        });
+        if dup {
+            tracing::debug!("failure entry skipped (already recorded)");
+            return Ok(());
+        }
         content.push_str(&format!(
             "- [{}] {}\n",
             chrono::Utc::now().format("%Y-%m-%d"),
@@ -279,6 +292,13 @@ impl MemoryStore {
         let mut content = std::fs::read_to_string(&path).unwrap_or_default();
         match op {
             "add" => {
+                // 幂等：逐行 strip 后精确命中即 no-op（逐轮复盘会把同一事实反复建议，
+                // 无脑追加会让 MEMORY.md 长出 N 行 identical；子串不算，不同表述照存）。
+                let want = entry.trim();
+                if content.lines().any(|l| l.trim() == want) {
+                    tracing::debug!("memory add skipped (already present)");
+                    return Ok(content);
+                }
                 content.push_str(entry);
                 if !entry.ends_with('\n') {
                     content.push('\n');
@@ -1319,8 +1339,39 @@ mod tests {
     }
 
     #[test]
-    fn memory_writes_mirror_into_sqlite_and_searchable() {
-        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
+    fn memory_add_is_idempotent_across_review_rounds() {
+        // 逐轮复盘把同一事实反复建议：add 必须幂等，空白差异也算重复；不同表述照存
+        let home = std::env::temp_dir().join(format!("rupi-mem-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        store.apply_write("add", "my editor is vim").unwrap();
+        store.apply_write("add", "  my editor is vim  ").unwrap();
+        store.apply_write("add", "my editor is vim with plugins").unwrap();
+        let content =
+            std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
+        assert_eq!(content.matches("my editor is vim").count(), 2, "{content}");
+        assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn failure_entries_dedup_across_rounds() {
+        // 同一纠正反复出现只记一条（日期前缀不同也算重复）；不同教训照记
+        let home = std::env::temp_dir().join(format!("rupi-mem-faildup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        store.record_failure("wrong directory; check pwd first").unwrap();
+        store.record_failure("wrong directory; check pwd first").unwrap();
+        store.record_failure("forgot to run tests").unwrap();
+        let content =
+            std::fs::read_to_string(home.join("memories").join("failures.md")).unwrap();
+        assert_eq!(content.matches("wrong directory").count(), 1, "{content}");
+        assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn memory_writes_mirror_into_sqlite_and_searchable() {        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
         store
