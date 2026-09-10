@@ -580,6 +580,15 @@ impl JsonlProvider {
 
     fn append_line(&self, line: &str) -> anyhow::Result<()> {
         use std::io::Write as _;
+        // 防腐：文件非空且缺尾换行（外部编辑/上次崩溃截断）时先补分隔符，
+        // 否则新行与旧尾粘连成一条非法 JSON（上游 #8345 同修）。
+        if self.file.exists() && std::fs::metadata(&self.file)?.len() > 0 {
+            let bytes = std::fs::read(&self.file)?;
+            if bytes.last() != Some(&b'\n') {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&self.file)?;
+                f.write_all(b"\n")?;
+            }
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -939,6 +948,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(miss, "no matches");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn jsonl_append_repairs_missing_trailing_newline() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-eol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        // 模拟外部编辑/崩溃留下的无尾换行文件
+        std::fs::write(home.join("turns.jsonl"), r#"{"ts":"t0","user":"old"}"#).unwrap();
+        p.sync_turn("new turn", "reply").await.unwrap();
+        let content = std::fs::read_to_string(home.join("turns.jsonl")).unwrap();
+        // 两行各自合法 JSON：旧尾与新行没有粘连
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for l in lines {
+            serde_json::from_str::<serde_json::Value>(l).expect("each line valid JSON");
+        }
+        assert!(content.ends_with('\n'));
         let _ = std::fs::remove_dir_all(&home);
     }
 
