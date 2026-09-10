@@ -1,0 +1,15 @@
+[package]
+name = "rupi-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rupi-core = { path = "../rupi-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }

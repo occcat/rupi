@@ -1,0 +1,24 @@
+[package]
+name = "rupi-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rupi"
+path = "src/main.rs"
+
+[dependencies]
+rupi-core = { path = "../rupi-core" }
+rupi-llm = { path = "../rupi-llm" }
+rupi-tools = { path = "../rupi-tools" }
+rupi-agent = { path = "../rupi-agent" }
+rupi-mcp = { path = "../rupi-mcp" }
+rupi-memory = { path = "../rupi-memory" }
+rupi-skills = { path = "../rupi-skills" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

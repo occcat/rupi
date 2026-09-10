@@ -1,0 +1,221 @@
+//! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
+
+use clap::{Parser, Subcommand};
+use rupi_agent::AgentLoop;
+use rupi_core::SessionTree;
+use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
+use rupi_memory::{MemoryManager, MemoryStore, SessionStore};
+use rupi_skills::{SkillAccumulator, SkillRegistry};
+use rupi_tools::ToolRegistry;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "rupi",
+    version,
+    about = "rupi — Pi Agent 的 Rust 复刻：最小 Harness + MCP + 记忆 + Skills"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    /// 模型名（OpenAI-compatible）
+    #[arg(long, default_value = "gpt-4o-mini")]
+    model: String,
+    #[arg(long, default_value_t = 20)]
+    max_turns: u32,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// 交互式聊天（默认）
+    Chat,
+    /// 显示记忆快照
+    MemoryShow,
+    /// 写入记忆
+    MemoryWrite { op: String, entry: String },
+    /// 列出 skills
+    SkillsList,
+    /// 加载 skill 全文
+    SkillLoad { name: String },
+    /// 从步骤提炼新 skill（自积累）
+    SkillDistill {
+        name: String,
+        description: String,
+        steps: Vec<String>,
+    },
+    /// 会话全文检索
+    SessionSearch { query: String },
+    /// MCP tools/list 探活
+    McpList { command: String, args: Vec<String> },
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("RUPI_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs_home().join(".rupi"))
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+fn skill_dirs(home: &PathBuf) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("skills/builtin"),
+        home.join("skills"),
+        PathBuf::from(".rupi/skills"),
+    ]
+}
+
+async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
+    match OpenAiCompatProvider::from_env(model.to_string()) {
+        Ok(p) => Ok(Box::new(p)),
+        Err(_) => {
+            eprintln!("[rupi] no RUPI_API_KEY/OPENAI_API_KEY — using mock provider (demo mode)");
+            Ok(Box::new(MockProvider::new(vec![
+                MockProvider::text_response(
+                    "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。",
+                ),
+            ])))
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .try_init()
+        .ok();
+    let cli = Cli::parse();
+    let home = home_dir();
+
+    match cli.cmd {
+        Some(Cmd::MemoryShow) => {
+            let store = MemoryStore::new(home);
+            let frozen = store.frozen_snapshot();
+            println!(
+                "--- MEMORY.md ---\n{}\n--- USER.md ---\n{}",
+                frozen.memory, frozen.user
+            );
+        }
+        Some(Cmd::MemoryWrite { op, entry }) => {
+            let store = MemoryStore::new(home);
+            let live = store.apply_write(&op, &entry)?;
+            println!("updated. live state:\n{live}");
+        }
+        Some(Cmd::SkillsList) => {
+            let reg = SkillRegistry::discover(&skill_dirs(&home));
+            println!("{}", reg.index_block());
+        }
+        Some(Cmd::SkillLoad { name }) => {
+            let reg = SkillRegistry::discover(&skill_dirs(&home));
+            match reg.load_skill(&name) {
+                Some(body) => println!("{body}"),
+                None => eprintln!("unknown skill: {name}"),
+            }
+        }
+        Some(Cmd::SkillDistill {
+            name,
+            description,
+            steps,
+        }) => {
+            let acc = SkillAccumulator::new(home.join("skills"));
+            let dir = acc.propose(&name, &description, &steps)?;
+            println!("skill drafted at {}", dir.display());
+        }
+        Some(Cmd::SessionSearch { query }) => {
+            let store = SessionStore::open(&home)?;
+            for (sid, snippet) in store.search(&query, 10)? {
+                println!("[{sid}] {snippet}");
+            }
+        }
+        Some(Cmd::McpList { command, args }) => {
+            let cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
+            let bridge = rupi_mcp::McpBridge::spawn(cfg).await?;
+            for t in bridge.list_tools().await? {
+                let d = rupi_mcp::mcp_tool_to_definition("mcp", &t);
+                println!("{} — {}", d.name, d.description);
+            }
+        }
+        Some(Cmd::Chat) | None => {
+            run_chat(&cli, &home).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
+    let provider = build_provider(&cli.model).await?;
+    let agent = AgentLoop::new(cli.max_turns);
+    let tools = ToolRegistry::with_builtins();
+    let store = MemoryStore::new(home.clone());
+    let frozen = store.frozen_snapshot();
+    let mem = MemoryManager::new(store);
+    let skills = SkillRegistry::discover(&skill_dirs(home));
+    let mut session = SessionTree::new();
+
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/skills 看技能");
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        print!("> ");
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/quit" {
+            break;
+        }
+        if input == "/skills" {
+            println!("{}", skills.index_block());
+            continue;
+        }
+        if input == "/rewind" {
+            if session.current_path.len() >= 2 {
+                let target = session.current_path[session.current_path.len() - 2].clone();
+                session.rewind_to(&target);
+                println!("[rewound]");
+            }
+            continue;
+        }
+        agent
+            .run(
+                provider.as_ref(),
+                &mut session,
+                &input,
+                &tools,
+                &mem,
+                &frozen,
+                &skills,
+                &[],
+                &|e| match e {
+                    rupi_core::AgentEvent::TextDelta { delta } => print!("{delta}"),
+                    rupi_core::AgentEvent::ToolStart { name, .. } => println!("\n[tool {name}]…"),
+                    rupi_core::AgentEvent::ToolEnd {
+                        name,
+                        content,
+                        is_error,
+                        ..
+                    } => {
+                        println!(
+                            "\n[{name} {}]\n{content}",
+                            if is_error { "error" } else { "ok" }
+                        )
+                    }
+                    _ => {}
+                },
+            )
+            .await?;
+        println!();
+    }
+    Ok(())
+}

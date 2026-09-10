@@ -1,0 +1,5 @@
+/target/
+.rupi/sessions/
+*.db
+*.db-wal
+*.db-shm
