@@ -41,6 +41,47 @@ pub struct McpTool {
     pub input_schema: serde_json::Value,
 }
 
+/// 暴露给 server 的根目录（MCP roots）：默认当前工作目录，文件类 server 据此定作用域。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRoot {
+    pub uri: String,
+    pub name: String,
+}
+
+impl McpRoot {
+    pub fn cwd() -> Self {
+        let dir = std::env::current_dir().unwrap_or_else(|_| Path::new("/tmp").to_path_buf());
+        Self {
+            uri: format!("file://{}", dir.display()),
+            name: dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "root".into()),
+        }
+    }
+}
+
+/// server→client 请求应答（纯函数，可单测）：roots/list 返回本机根目录，
+/// ping 回空结果，未知方法按 JSON-RPC 回 MethodNotFound；notification（无 id）返回 None。
+pub fn server_request_response(
+    method: &str,
+    id: Option<i64>,
+    roots: &[McpRoot],
+) -> Option<serde_json::Value> {
+    let id = id?;
+    let payload = match method {
+        "roots/list" => serde_json::json!({"roots": roots}),
+        "ping" => serde_json::json!({}),
+        _ => {
+            return Some(serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": format!("method not found: {method}")}
+            }));
+        }
+    };
+    Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": payload}))
+}
+
 /// 把 LLM 经常传成 string 的参数按 JSON Schema 纠正回 boolean / number / integer。
 /// 对应 pi-directx 的 `sanitizeParams`。
 pub fn sanitize_params(
@@ -83,6 +124,7 @@ type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>;
 /// MCP stdio 桥：拥有子进程 + JSON-RPC 路由（requestId 自增、30s 超时、退出清理）。
 pub struct McpBridge {
     pub config: McpServerConfig,
+    pub roots: Vec<McpRoot>,
     next_id: AtomicI64,
     pending: PendingMap,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -122,13 +164,28 @@ impl McpBridge {
             }
         });
         let pending_route = pending.clone();
+        let stdin_route = Arc::new(Mutex::new(stdin));
+        let roots_route = vec![McpRoot::cwd()];
+        let stdin_write = stdin_route.clone();
+        let roots_in_task = roots_route.clone();
         tokio::spawn(async move {
             while let Some(line) = rx_lines.recv().await {
                 let v: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+                let id = v.get("id").and_then(|i| i.as_i64());
+                // server→client 请求（含 roots/list、ping）：必须应答，否则 server 侧超时
+                if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+                    if let Some(resp) = server_request_response(method, id, &roots_in_task) {
+                        let mut stdin = stdin_write.lock().await;
+                        let _ = stdin.write_all(format!("{resp}\n").as_bytes()).await;
+                        let _ = stdin.flush().await;
+                    }
+                    continue;
+                }
+                // 无 method 即 Response：按 id 路由给挂起的 call
+                if let Some(id) = id {
                     if let Some(tx) = pending_route.lock().await.remove(&id) {
                         let _ = tx.send(v);
                     }
@@ -149,9 +206,10 @@ impl McpBridge {
 
         let bridge = Self {
             config,
+            roots: roots_route.clone(),
             next_id: AtomicI64::new(1),
             pending,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin: stdin_route,
             _child: child,
             _reader_task: reader_task,
             _stderr_task: stderr_task,
@@ -161,7 +219,7 @@ impl McpBridge {
                 "initialize",
                 serde_json::json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {},
+                    "capabilities": {"roots": {"listChanged": false}},
                     "clientInfo": {"name": "rupi", "version": "0.1.0"}
                 }),
             )
@@ -186,9 +244,14 @@ impl McpBridge {
             stdin.write_all(format!("{}\n", req).as_bytes()).await?;
             stdin.flush().await?;
         }
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("MCP {method} timed out after 30s"))??;
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(r) => r?,
+            Err(_) => {
+                // 超时即摘掉挂起项：迟到响应无人认领，不留泄漏
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!("MCP {method} timed out after 30s");
+            }
+        };
         if let Some(err) = resp.get("error") {
             anyhow::bail!("MCP error for {method}: {err}");
         }
@@ -364,47 +427,55 @@ impl rupi_tools::Tool for McpToolExecutor {
 
 /// 多 server 管理器：对标 `registerToolsFromMCP`，为每个 server spawn 一座桥，
 /// 把全部远端工具注册进 `ToolRegistry`（命名 `{server}_{tool}`，首注册者胜）。
+/// config 与 bridge 配对存放：某 server 启动失败只跳过自己，不错位后续配对。
 pub struct McpManager {
-    pub bridges: Vec<Arc<McpBridge>>,
+    pub entries: Vec<McpServerEntry>,
+}
+
+pub struct McpServerEntry {
+    pub config: McpServerConfig,
+    pub bridge: Arc<McpBridge>,
 }
 
 impl McpManager {
     pub async fn spawn_all(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
-        let mut bridges = vec![];
+        let mut entries = vec![];
         for cfg in configs {
             match McpBridge::spawn(cfg.clone()).await {
-                Ok(b) => bridges.push(Arc::new(b)),
+                Ok(b) => entries.push(McpServerEntry {
+                    config: cfg.clone(),
+                    bridge: Arc::new(b),
+                }),
                 Err(e) => tracing::warn!("MCP server '{}' failed to start: {e:#}", cfg.name),
             }
         }
-        Ok(Self { bridges })
+        Ok(Self { entries })
     }
 
     /// 发现全部远端工具并注册进 registry。返回成功注册的工具名。
-    pub async fn register_all(
-        &self,
-        registry: &mut rupi_tools::ToolRegistry,
-        configs: &[McpServerConfig],
-    ) -> Vec<String> {
+    pub async fn register_all(&self, registry: &mut rupi_tools::ToolRegistry) -> Vec<String> {
         let mut registered = vec![];
-        for (bridge, cfg) in self.bridges.iter().zip(configs.iter()) {
-            match bridge.list_tools().await {
+        for entry in &self.entries {
+            match entry.bridge.list_tools().await {
                 Ok(tools) => {
                     for t in tools {
-                        let name = format!("{}_{}", cfg.name, t.name);
+                        let name = format!("{}_{}", entry.config.name, t.name);
                         if registered.contains(&name) {
                             tracing::warn!("MCP tool name conflict: {name}; first wins");
                             continue;
                         }
                         registry.register(Arc::new(McpToolExecutor::new(
-                            &cfg.name,
-                            bridge.clone(),
+                            &entry.config.name,
+                            entry.bridge.clone(),
                             &t,
                         )));
                         registered.push(name);
                     }
                 }
-                Err(e) => tracing::warn!("MCP tools/list failed for '{}': {e:#}", cfg.name),
+                Err(e) => tracing::warn!(
+                    "MCP tools/list failed for '{}': {e:#}",
+                    entry.config.name
+                ),
             }
         }
         registered

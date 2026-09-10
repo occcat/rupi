@@ -468,7 +468,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
         let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
-        let names = manager.register_all(&mut tools, &configs).await;
+        let names = manager.register_all(&mut tools).await;
         println!("[mcp] {} tools: {}", names.len(), names.join(", "));
         Some(manager)
     } else {
@@ -611,7 +611,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
         let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
-        let names = manager.register_all(&mut tools, &configs).await;
+        let names = manager.register_all(&mut tools).await;
         eprintln!("[mcp] {} tools: {}", names.len(), names.join(", "));
         Some(manager)
     } else {

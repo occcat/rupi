@@ -11,7 +11,7 @@
 | `pi-ai`（统一 LLM API，多 provider） | `rupi-llm`（`LlmProvider` trait + `OpenAiCompatProvider` + `MockProvider`，`complete_streaming` 真 SSE） |
 | 默认四工具 Read/Write/Edit/Bash | `rupi-tools`（`ToolRegistry::with_builtins`） |
 | sessions are trees（branch/rewind/summary） | `SessionTree::branch_from` / `rewind_to` / `prompt_history` 压缩窗口 + `AgentLoop::maybe_compress` |
-| 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + `sanitize_params` + `mcp_tool_to_definition`） |
+| 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + `sanitize_params` + `mcp_tool_to_definition` + server→client 请求应答 roots/ping + `McpManager` 配对注册） |
 | Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill` 工具） |
 | Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + provider/manager + `SessionStore` 触发器同步 FTS + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
 | Skill 自积累（后台 review 沉淀） | `SkillAccumulator::propose` + `rupi skill-distill` |

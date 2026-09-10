@@ -8,6 +8,9 @@
 import json
 import sys
 
+# server 收到的 roots/list 应答存在这里，roots_probe 工具读出来给测试断言
+seen_roots = None
+
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -15,6 +18,7 @@ def send(obj):
 
 
 def main():
+    global seen_roots
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -23,8 +27,15 @@ def main():
             req = json.loads(line)
         except json.JSONDecodeError:
             continue
+        # 无 method 即对我方请求的应答（roots/list 回包）：记下来，不报错
+        if "method" not in req:
+            if req.get("id") == 9001:
+                seen_roots = req.get("result", {}).get("roots")
+            continue
         if "id" not in req:
-            # notification，直接忽略
+            # notification：initialized 到达即反向请求 roots/list，验证桥会应答
+            if req.get("method") == "notifications/initialized":
+                send({"jsonrpc": "2.0", "id": 9001, "method": "roots/list", "params": {}})
             continue
         method = req.get("method")
         rid = req.get("id")
@@ -54,6 +65,11 @@ def main():
                                 "description": "always fails as tool error",
                                 "inputSchema": {"type": "object"},
                             },
+                            {
+                                "name": "roots_probe",
+                                "description": "returns roots/list answers seen from client",
+                                "inputSchema": {"type": "object"},
+                            },
                         ]
                     },
                 }
@@ -81,6 +97,18 @@ def main():
                         "result": {
                             "content": [{"type": "text", "text": "boom"}],
                             "isError": True,
+                        },
+                    }
+                )
+            elif name == "roots_probe":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {
+                            "content": [
+                                {"type": "text", "text": json.dumps(seen_roots)}
+                            ]
                         },
                     }
                 )
