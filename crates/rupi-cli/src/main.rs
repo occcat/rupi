@@ -93,6 +93,9 @@ struct Cli {
     /// 本次直接信任项目资源（跳过信任提问，不记住）
     #[arg(long, default_value_t = false)]
     trust_project: bool,
+    /// 渐进式工具发现：只注入常驻工具 schema，其余按关键词搜出后再可见（省上下文）
+    #[arg(long, default_value_t = false)]
+    discover_tools: bool,
 }
 
 #[derive(Subcommand)]
@@ -549,6 +552,12 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
         println!("[parallel tools] tool calls in one turn run concurrently");
     }
+    if cli.discover_tools {
+        agent = agent.with_discovery(rupi_agent::DiscoveryConfig::default());
+        println!(
+            "[discover tools] only resident tool schemas injected; search_tools to reveal more"
+        );
+    }
     if cli.plan {
         println!("[plan mode] read-only: write/edit/bash disabled");
     }
@@ -798,6 +807,12 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     if cli.parallel_tools {
         agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
         eprintln!("[parallel tools] tool calls in one turn run concurrently");
+    }
+    if cli.discover_tools {
+        agent = agent.with_discovery(rupi_agent::DiscoveryConfig::default());
+        eprintln!(
+            "[discover tools] only resident tool schemas injected; search_tools to reveal more"
+        );
     }
     if cli.subagents {
         let sub = SubagentTool::new(
