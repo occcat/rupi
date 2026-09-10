@@ -3,9 +3,7 @@
 use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::{Message, SessionTree};
-use rupi_llm::{
-    AnthropicProvider, GeminiProvider, LlmProvider, MockProvider, OpenAiCompatProvider,
-};
+use rupi_llm::{LlmProvider, MockProvider};
 use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
@@ -317,42 +315,25 @@ fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet
 }
 
 async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
-    // claude-* 走 Anthropic 原生（缺 key 回 mock，不静默走错网关）
-    if model.starts_with("claude-") {
-        match AnthropicProvider::from_env(model.to_string()) {
-            Ok(p) => return Ok(Box::new(p)),
-            Err(e) => {
+    // 路由收敛到 rupi_llm::provider_for_model（与 TUI /model 同源）；缺 key 回 mock，
+    // 各家提示沿用此前的文案（claude-/gemini- 带原错误，其余走固定缺 key 行）。
+    match rupi_llm::provider_for_model(model) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let demo = if model.starts_with("claude-") {
                 eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
-                return Ok(Box::new(MockProvider::new(vec![
-                    MockProvider::text_response(
-                        "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。",
-                    ),
-                ])));
-            }
-        }
-    }
-    // gemini-* 走 Gemini 原生
-    if model.starts_with("gemini-") {
-        match GeminiProvider::from_env(model.to_string()) {
-            Ok(p) => return Ok(Box::new(p)),
-            Err(e) => {
+                "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。"
+            } else if model.starts_with("gemini-") {
                 eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
-                return Ok(Box::new(MockProvider::new(vec![
-                    MockProvider::text_response(
-                        "demo mode：设置 RUPI_GEMINI_KEY 后可接 Gemini。已收到你的请求，工具链就绪。",
-                    ),
-                ])));
-            }
-        }
-    }
-    match OpenAiCompatProvider::from_env(model.to_string()) {
-        Ok(p) => Ok(Box::new(p)),
-        Err(_) => {
-            eprintln!("[rupi] no RUPI_API_KEY/OPENAI_API_KEY — using mock provider (demo mode)");
+                "demo mode：设置 RUPI_GEMINI_KEY 后可接 Gemini。已收到你的请求，工具链就绪。"
+            } else {
+                eprintln!(
+                    "[rupi] no RUPI_API_KEY/OPENAI_API_KEY — using mock provider (demo mode)"
+                );
+                "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。"
+            };
             Ok(Box::new(MockProvider::new(vec![
-                MockProvider::text_response(
-                    "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。",
-                ),
+                MockProvider::text_response(demo),
             ])))
         }
     }
@@ -1025,7 +1006,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // thinking 档位先验：非法值在建会话前 bail，不污染会话库
     let thinking = thinking_for(cli)?;
-    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
@@ -1147,8 +1128,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         session.summary.clone().unwrap_or_default(),
     ));
     let ctx = rupi_tui::TuiContext {
-        provider: &*provider,
-        agent: &agent,
+        provider: &mut provider,
+        agent: &mut agent,
         session: &mut session,
         tools: &tools,
         mem: &*mem,

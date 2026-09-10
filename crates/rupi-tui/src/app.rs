@@ -29,9 +29,11 @@ use std::io::Stdout;
 use std::sync::Arc;
 
 /// TUI 运行上下文：与 REPL 版 `run_chat` 同构的装配。
+/// `agent` / `provider` 可变：TUI 内建命令（/plan /thinking /model）会话内切换，
+/// 其余只读引用（mem/skills 等切换命令不碰）。
 pub struct TuiContext<'a> {
-    pub provider: &'a dyn LlmProvider,
-    pub agent: &'a AgentLoop,
+    pub provider: &'a mut Arc<dyn LlmProvider>,
+    pub agent: &'a mut AgentLoop,
     pub session: &'a mut SessionTree,
     pub tools: &'a ToolRegistry,
     pub mem: &'a MemoryManager,
@@ -134,7 +136,7 @@ async fn run_loop(
     ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -195,6 +197,71 @@ async fn run_loop(
                     }
                     continue;
                 }
+                // 内建命令（与 REPL 同语义）：拦截在先，绝不把命令文本发给模型
+                if text.trim() == "/rewind" {
+                    if ctx.session.current_path.len() >= 2 {
+                        let target =
+                            ctx.session.current_path[ctx.session.current_path.len() - 2].clone();
+                        ctx.session.rewind_to(&target);
+                        view.push_system("[rewound]".into());
+                    } else {
+                        view.push_system("[rewind] nothing to undo".into());
+                    }
+                    continue;
+                }
+                if text.trim() == "/plan" {
+                    ctx.agent.plan_mode = !ctx.agent.plan_mode;
+                    view.push_system(format!(
+                        "[plan mode {}]",
+                        if ctx.agent.plan_mode { "on" } else { "off" }
+                    ));
+                    continue;
+                }
+                if text.trim() == "/thinking" || text.trim().starts_with("/thinking ") {
+                    let arg = text.trim().strip_prefix("/thinking").unwrap().trim();
+                    if arg.is_empty() {
+                        match ctx.agent.thinking {
+                            Some(t) => view.push_system(format!("[thinking {t:?}]")),
+                            None => {
+                                view.push_system("[thinking default (provider default)]".into())
+                            }
+                        }
+                    } else {
+                        match arg.parse::<rupi_llm::ThinkingLevel>() {
+                            Ok(t) => {
+                                ctx.agent.thinking = Some(t);
+                                view.push_system(format!("[thinking switched to {t:?}]"));
+                            }
+                            Err(e) => {
+                                view.push_system(format!("[thinking] {e:#}; staying on current"))
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if text.trim() == "/model" || text.trim().starts_with("/model ") {
+                    let arg = text.trim().strip_prefix("/model").unwrap().trim();
+                    if arg.is_empty() {
+                        view.push_system(format!("[model {}]", ctx.provider.name()));
+                    } else {
+                        match rupi_llm::provider_for_model(arg) {
+                            Ok(p) => {
+                                *ctx.provider = p.into();
+                                view.push_system(format!("[model switched to {arg}]"));
+                            }
+                            Err(e) => view.push_system(format!("[model] switch failed ({e:#})")),
+                        }
+                    }
+                    continue;
+                }
+                if text.trim() == "/reload" {
+                    // 热重载要 ExtensionSet 所有权 + 可变工具表（REPL 专属路径），TUI 只读装配
+                    view.push_system(
+                        "[reload] hot reload is REPL-only; restart TUI to pick up extension changes"
+                            .into(),
+                    );
+                    continue;
+                }
                 // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
                 let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
                 let mut send_text = text.clone();
@@ -211,7 +278,7 @@ async fn run_loop(
                 match drive_turn(
                     terminal,
                     ctx.agent,
-                    ctx.provider,
+                    &**ctx.provider,
                     ctx.session,
                     ctx.tools,
                     ctx.mem,

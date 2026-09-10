@@ -5,7 +5,7 @@
 
 /// 与 REPL 同构的内建斜杠命令（`/quit` 单独处理，此处仅用于提示）。
 pub const BUILTINS: &[&str] = &[
-    "commands", "goto", "model", "plan", "quit", "reload", "rewind", "skills", "tree",
+    "commands", "goto", "model", "plan", "quit", "reload", "rewind", "skills", "thinking", "tree",
 ];
 
 /// 计算候选：`input` 以 `/` 开头且首 token 无空白时，按前缀过滤并排序去重；否则空。
@@ -78,6 +78,7 @@ mod tests {
     #[test]
     fn prefix_filters_builtins_and_customs() {
         assert_eq!(candidates("/sk", &[]), vec!["skills".to_string()]);
+        assert_eq!(candidates("/th", &[]), vec!["thinking".to_string()]);
         assert_eq!(
             candidates("/f", &customs()),
             vec!["fix".to_string(), "format".to_string()]
