@@ -84,6 +84,61 @@ impl Policy for RulePolicy {
     }
 }
 
+/// 三态审批答案（对标 pi-mcp-adapter 的 Allow once / Allow for session / Deny）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalAnswer {
+    Once,
+    Session,
+    Deny,
+}
+
+impl ApprovalAnswer {
+    /// y/yes/once → 本次放行；a/all/session/always → 本会话记住；其余（含空行）→ 拒绝。
+    pub fn parse(line: &str) -> Self {
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" | "once" => ApprovalAnswer::Once,
+            "a" | "all" | "session" | "always" => ApprovalAnswer::Session,
+            _ => ApprovalAnswer::Deny,
+        }
+    }
+}
+
+/// 会话级审批记忆：用户选过 "for session" 的（工具 + 规则原因），本会话内不再打扰。
+/// key 带 reason：如 bash_block 的不同命中各自记忆，避免一次放行污染整类工具。
+#[derive(Debug, Default)]
+pub struct SessionApprovalCache {
+    approved: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl SessionApprovalCache {
+    fn key(tool: &str, reason: &str) -> String {
+        format!("{tool}\0{reason}")
+    }
+
+    pub fn is_approved(&self, tool: &str, reason: &str) -> bool {
+        self.approved.lock().unwrap().contains(&Self::key(tool, reason))
+    }
+
+    pub fn approve_session(&self, tool: &str, reason: &str) {
+        self.approved.lock().unwrap().insert(Self::key(tool, reason));
+    }
+
+    /// 交互式审批器共用入口：先查记忆，未命中则调 `ask` 问用户并按三态处理。
+    pub fn decide_with(&self, tool: &str, reason: &str, ask: impl FnOnce() -> ApprovalAnswer) -> bool {
+        if self.is_approved(tool, reason) {
+            return true;
+        }
+        match ask() {
+            ApprovalAnswer::Deny => false,
+            ApprovalAnswer::Once => true,
+            ApprovalAnswer::Session => {
+                self.approve_session(tool, reason);
+                true
+            }
+        }
+    }
+}
+
 /// 组合策略：依次裁决，首个非 Allow 生效。
 pub struct ChainPolicy(pub Vec<Box<dyn Policy>>);
 impl Policy for ChainPolicy {
@@ -130,6 +185,29 @@ mod tests {
             p.decide("bash", &serde_json::json!({"command": "rm -rf /tmp/x"})),
             Decision::Ask(_)
         ));
+    }
+
+    #[test]
+    fn approval_answer_parse() {
+        assert_eq!(ApprovalAnswer::parse("y"), ApprovalAnswer::Once);
+        assert_eq!(ApprovalAnswer::parse("YES"), ApprovalAnswer::Once);
+        assert_eq!(ApprovalAnswer::parse("a"), ApprovalAnswer::Session);
+        assert_eq!(ApprovalAnswer::parse("all"), ApprovalAnswer::Session);
+        assert_eq!(ApprovalAnswer::parse(""), ApprovalAnswer::Deny);
+        assert_eq!(ApprovalAnswer::parse("n"), ApprovalAnswer::Deny);
+    }
+
+    #[test]
+    fn session_cache_remembers_per_tool_and_reason() {
+        let c = SessionApprovalCache::default();
+        assert!(c.decide_with("bash", "r1", || ApprovalAnswer::Session));
+        // 同工具同原因不再问
+        assert!(c.decide_with("bash", "r1", || panic!("should not ask again")));
+        // 同工具不同原因仍要问
+        assert!(!c.decide_with("bash", "r2", || ApprovalAnswer::Deny));
+        // Once 不记忆
+        assert!(c.decide_with("write", "r", || ApprovalAnswer::Once));
+        assert!(!c.is_approved("write", "r"));
     }
 
     #[test]

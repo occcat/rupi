@@ -306,16 +306,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 终端审批器：Ask 裁决时 stdin 问一句 `[y/N]`，默认拒绝。
-struct TerminalApprover;
+/// 终端审批器：Ask 裁决时 stdin 问一句 `[y/a(ll session)/N]`，默认拒绝。
+/// 选 a 的（工具 + 规则原因）本会话内不再打扰。
+struct TerminalApprover {
+    cache: rupi_agent::SessionApprovalCache,
+}
+
+impl Default for TerminalApprover {
+    fn default() -> Self {
+        Self {
+            cache: rupi_agent::SessionApprovalCache::default(),
+        }
+    }
+}
+
 impl rupi_agent::Approver for TerminalApprover {
     fn approve(&self, tool: &str, args: &serde_json::Value, reason: &str) -> bool {
-        eprintln!("[approve] {tool} {args} — {reason} [y/N]");
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return false;
-        }
-        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+        self.cache.decide_with(tool, reason, || {
+            eprintln!("[approve] {tool} {args} — {reason} [y(es once)/a(ll session)/N]");
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return rupi_agent::ApprovalAnswer::Deny;
+            }
+            rupi_agent::ApprovalAnswer::parse(&line)
+        })
     }
 }
 
@@ -404,7 +418,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
     agent = agent
         .with_policy(Arc::new(default_policy()))
-        .with_approver(Arc::new(TerminalApprover))
+        .with_approver(Arc::new(TerminalApprover::default()))
         .with_plan_mode(cli.plan);
     if cli.plan {
         println!("[plan mode] read-only: write/edit/bash disabled");
@@ -590,7 +604,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     agent = agent
         .with_policy(Arc::new(default_policy()))
-        .with_approver(Arc::new(rupi_tui::TuiApprover))
+        .with_approver(Arc::new(rupi_tui::TuiApprover::default()))
         .with_plan_mode(cli.plan);
     if cli.subagents {
         let sub = SubagentTool::new(

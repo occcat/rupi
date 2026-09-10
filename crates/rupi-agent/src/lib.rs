@@ -13,7 +13,9 @@ use std::sync::Arc;
 pub mod review;
 pub use review::{HeuristicReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
 pub mod policy;
-pub use policy::{Approver, ChainPolicy, Decision, Policy, RulePolicy};
+pub use policy::{
+    ApprovalAnswer, Approver, ChainPolicy, Decision, Policy, RulePolicy, SessionApprovalCache,
+};
 pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
 

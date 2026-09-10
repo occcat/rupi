@@ -59,21 +59,46 @@ impl Drop for Guard {
     }
 }
 
-/// TUI 内审批器：Ask 裁决时暂停全屏 UI 回主屏问一句 `[y/N]`，默认拒绝。
+/// TUI 内审批器：Ask 裁决时暂停全屏 UI 回主屏问一句 `[y/a(ll session)/N]`，默认拒绝。
 /// 与 REPL 的 `TerminalApprover` 同语义；失败（无 TTY / 读不到行）一律拒绝。
-pub struct TuiApprover;
+/// 选 a 的（工具 + 规则原因）本会话内不再打扰。
+pub struct TuiApprover {
+    cache: rupi_agent::SessionApprovalCache,
+}
+
+impl Default for TuiApprover {
+    fn default() -> Self {
+        Self {
+            cache: rupi_agent::SessionApprovalCache::default(),
+        }
+    }
+}
+
 impl rupi_agent::Approver for TuiApprover {
     fn approve(&self, tool: &str, args: &serde_json::Value, reason: &str) -> bool {
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        if self.cache.is_approved(tool, reason) {
+            return true;
+        }
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-        eprintln!("[approve] {tool} {args} — {reason} [y/N]");
+        eprintln!("[approve] {tool} {args} — {reason} [y(es once)/a(ll session)/N]");
         let mut line = String::new();
-        let ok = std::io::stdin().read_line(&mut line).is_ok()
-            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
+        let answer = if std::io::stdin().read_line(&mut line).is_ok() {
+            rupi_agent::ApprovalAnswer::parse(&line)
+        } else {
+            rupi_agent::ApprovalAnswer::Deny
+        };
         let _ = execute!(std::io::stdout(), EnterAlternateScreen);
         let _ = enable_raw_mode();
-        ok
+        match answer {
+            rupi_agent::ApprovalAnswer::Deny => false,
+            rupi_agent::ApprovalAnswer::Once => true,
+            rupi_agent::ApprovalAnswer::Session => {
+                self.cache.approve_session(tool, reason);
+                true
+            }
+        }
     }
 }
 
