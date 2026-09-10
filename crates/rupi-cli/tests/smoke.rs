@@ -163,6 +163,21 @@ fn chat_quit_exits_zero() {
 }
 
 #[test]
+fn chat_bare_goto_shows_usage_without_model_call() {
+    // 裸 `/goto` 必须本地拦截给用法：stdout 有 usage，且 stdout 无 demo mode
+    //（无模型回包=没漏进模型白烧一轮；stderr 的 mock 横幅恒含 demo mode，只能断言 stdout）。
+    let home = fresh_home();
+    let o = chat_with(&home, &[], b"/goto\n/quit\n");
+    assert!(o.status.success(), "chat 裸 /goto 非零退出: {o:?}");
+    let (out, _) = out_text(&o);
+    assert!(out.contains("usage:"), "裸 /goto 未给用法:\n{out}");
+    assert!(
+        !out.contains("demo mode"),
+        "裸 /goto 漏进模型白烧一轮:\n{out}"
+    );
+}
+
+#[test]
 fn heuristic_review_on_by_default_no_review_opts_out() {
     // 默认启发式复盘：“请记住”触发 memory 建议并打印；--no-review 关闭后无声。
     let home = fresh_home();

@@ -967,11 +967,20 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 let target = session.current_path[session.current_path.len() - 2].clone();
                 session.rewind_to(&target);
                 println!("[rewound]");
+            } else {
+                // 空历史给反馈（与 TUI 同文案）；此前静默 continue，用户以为卡死。
+                println!("[rewind] nothing to undo");
             }
             continue;
         }
         if input == "/tree" {
             print!("{}", session.tree_view());
+            continue;
+        }
+        // 裸 `/goto`（无参数）必须拦截给用法提示：此前漏进自定义命令查找，
+        // 查不到就当普通消息发给模型，白烧一轮（TUI 同语义，见 dispatch_builtin）。
+        if input == "/goto" {
+            println!("[goto] usage: /goto <短id>（/tree 查看节点）");
             continue;
         }
         if let Some(prefix) = input.strip_prefix("/goto ") {

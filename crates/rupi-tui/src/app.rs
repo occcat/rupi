@@ -155,6 +155,10 @@ fn dispatch_builtin(
     if t == "/tree" {
         return Builtin::Done(session.tree_view());
     }
+    if t == "/goto" {
+        // 裸 `/goto` 拦截给用法（与 REPL 同语义）；此前 Pass 会漏进模型白烧一轮。
+        return Builtin::Done("[goto] usage: /goto <短id>（/tree 查看节点）".into());
+    }
     if let Some(prefix) = t.strip_prefix("/goto ") {
         let prefix = prefix.trim();
         return match session.resolve_short_id(prefix) {
@@ -579,18 +583,16 @@ mod tests {
             ),
             Builtin::Pass
         ));
-        // 内建前缀但无参数的 /goto 走 Pass（与 REPL 一致，不拦截）
-        assert!(matches!(
-            dispatch_builtin(
-                "/goto",
-                &mut agent,
-                &mut session,
-                &mut provider,
-                &skills,
-                &[]
-            ),
-            Builtin::Pass
+        // 裸 `/goto` 拦截给用法（与 REPL 同语义，不再 Pass 漏进模型）
+        let msg = done_text(dispatch_builtin(
+            "/goto",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
         ));
+        assert!(msg.contains("usage:"), "{msg}");
     }
 
     #[test]
