@@ -424,7 +424,8 @@ fn persist_turn(
 }
 
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
-    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
+    let mut model = cli.model.clone();
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&model).await?.into();
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
     let mut agent =
@@ -499,7 +500,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -529,6 +530,22 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         if input == "/plan" {
             agent.plan_mode = !agent.plan_mode;
             println!("[plan mode {}]", if agent.plan_mode { "on" } else { "off" });
+            continue;
+        }
+        if input == "/model" || input.starts_with("/model ") {
+            let arg = input.strip_prefix("/model").unwrap().trim();
+            if arg.is_empty() {
+                println!("[model {model}]");
+            } else {
+                match build_provider(arg).await {
+                    Ok(p) => {
+                        provider = p.into();
+                        model = arg.to_string();
+                        println!("[model switched to {model}]");
+                    }
+                    Err(e) => eprintln!("[model] switch failed ({e:#}); staying on {model}"),
+                }
+            }
             continue;
         }
         if input == "/rewind" {

@@ -8,7 +8,7 @@
 | Pi / 生态 | rupi |
 |---|---|
 | `pi-agent-core`（agent loop / state / events，~300 行核心） | `rupi-core`（`Message`/`SessionTree`/`AgentEvent`/`ToolDefinition`/`Extension`） + `rupi-agent`（`AgentLoop`/`PromptBuilder`） |
-| `pi-ai`（统一 LLM API，多 provider） | `rupi-llm`（`LlmProvider` trait + `OpenAiCompatProvider` + `MockProvider`，`complete_streaming` 真 SSE） |
+| `pi-ai`（统一 LLM API，多 provider） | `rupi-llm`（`LlmProvider` trait + `OpenAiCompatProvider` + `MockProvider`，`complete_streaming` 真 SSE；`--model` 启动指定，REPL `/model [名]` 会话内切换） |
 | 默认四工具 Read/Write/Edit/Bash | `rupi-tools`（`ToolRegistry::with_builtins`） |
 | sessions are trees（branch/rewind/summary） | `SessionTree::branch_from` / `rewind_to` / `prompt_history` 压缩窗口 + `AgentLoop::maybe_compress` |
 | 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + `sanitize_params` + `mcp_tool_to_definition` + server→client 请求应答 roots/ping + `McpManager` 配对注册） |
