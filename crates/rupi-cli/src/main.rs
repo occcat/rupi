@@ -96,6 +96,12 @@ struct Cli {
     /// 渐进式工具发现：只注入常驻工具 schema，其余按关键词搜出后再可见（省上下文）
     #[arg(long, default_value_t = false)]
     discover_tools: bool,
+    /// Ask 裁决自动放行（危险：非交互/脚本用；交互模式默认问询）
+    #[arg(long, default_value_t = false)]
+    approve: bool,
+    /// Ask 裁决一律拒绝且不问（与 --approve 互斥）
+    #[arg(long, default_value_t = false)]
+    no_approve: bool,
 }
 
 #[derive(Subcommand)]
@@ -104,6 +110,11 @@ enum Cmd {
     Chat,
     /// 全屏终端界面（ratatui）
     Tui,
+    /// 非交互执行一次并退出（对标 pi -p；问询默认拒绝，加 --approve 放行）
+    Run {
+        /// 任务描述（多词自动拼接，无需引号）
+        prompt: Vec<String>,
+    },
     /// 显示记忆快照
     MemoryShow,
     /// 写入记忆（op: add/replace/remove/failure；scope: global/project）
@@ -165,14 +176,10 @@ fn memory_store(home: &PathBuf, load_project: bool) -> MemoryStore {
     s
 }
 
-/// 项目信任门（对标上游 project_trust）：项目根有本地资源且未被记住时问一次。
-/// 返回是否加载项目资源。无项目根 / 无项目资源 / 已记住 → true 不打扰；
-/// 非交互（管道/EOF）默认跳过并提示。
-fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
-    let cwd = match std::env::current_dir() {
-        Ok(c) => c,
-        Err(_) => return true,
-    };
+/// 项目资源探测（只读）：有项目根且现存本地资源时返回 (root, 清单），否则 None。
+/// 发现语义与加载侧一致：cwd 相对路径。
+fn project_resources() -> Option<(PathBuf, Vec<String>)> {
+    let cwd = std::env::current_dir().ok()?;
     let root = match MemoryStore::discover_project(&cwd) {
         Some(r) => r,
         // 回退：无 .git 的普通目录自带 .rupi 资源也视为项目（否则永不设门）
@@ -184,9 +191,8 @@ fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
         {
             cwd.clone()
         }
-        None => return true,
+        None => return None,
     };
-    // 现存的项目资源才值得问（发现语义与加载侧一致：cwd 相对路径）
     let mut resources: Vec<String> = vec![];
     let pm = root.join(".rupi").join(rupi_memory::MEMORY_FILE);
     if pm.exists() {
@@ -198,8 +204,19 @@ fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
         }
     }
     if resources.is_empty() {
-        return true;
+        return None;
     }
+    Some((root, resources))
+}
+
+/// 项目信任门（对标上游 project_trust）：项目根有本地资源且未被记住时问一次。
+/// 返回是否加载项目资源。无项目根 / 无项目资源 / 已记住 → true 不打扰；
+/// 非交互（管道/EOF）默认跳过并提示。
+fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
+    let (root, resources) = match project_resources() {
+        Some(r) => r,
+        None => return true,
+    };
     let mut store = rupi_core::trust::TrustStore::open(home.join("trusted_projects"));
     if store.contains(&root) {
         return true;
@@ -408,6 +425,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} — {}", d.name, d.description);
             }
         }
+        Some(Cmd::Run { ref prompt }) => {
+            run_once(&cli, &home, &prompt.join(" ")).await?;
+        }
         Some(Cmd::Chat) | None => {
             run_chat(&cli, &home).await?;
         }
@@ -443,6 +463,34 @@ impl rupi_agent::Approver for TerminalApprover {
             rupi_agent::ApprovalAnswer::parse(&line)
         })
     }
+}
+
+/// 非交互审批器：Ask 按构造值一锤定音（--approve 全放行；run 默认不挂审批器=拒绝）。
+struct AutoApprover(bool);
+
+impl rupi_agent::Approver for AutoApprover {
+    fn approve(&self, _tool: &str, _args: &serde_json::Value, _reason: &str) -> bool {
+        self.0
+    }
+}
+
+/// 三档审批装配：--approve 全放行 / --no-approve 全拒绝（互斥，错配直接 bail）
+/// / 默认走各端交互审批器（REPL 问询 / TUI 弹窗 / run 无审批=拒绝）。
+fn approver_for(
+    cli: &Cli,
+    fallback: Option<std::sync::Arc<dyn rupi_agent::Approver>>,
+) -> anyhow::Result<Option<std::sync::Arc<dyn rupi_agent::Approver>>> {
+    if cli.approve && cli.no_approve {
+        anyhow::bail!("--approve 与 --no-approve 互斥");
+    }
+    if cli.approve {
+        eprintln!("[approve] --approve: Ask 裁决自动放行");
+        return Ok(Some(std::sync::Arc::new(AutoApprover(true))));
+    }
+    if cli.no_approve {
+        return Ok(None);
+    }
+    Ok(fallback)
 }
 
 /// 默认规则：危险 bash 子串转人工（REPL 有审批器；非交互/TUI 无审批则拒绝）。
@@ -537,6 +585,106 @@ fn persist_turn(
     }
 }
 
+/// 非交互执行一次（对标 pi -p）：跑完即退出，回合落盘进会话库。
+/// 无问询：Ask 无审批器即拒绝（除非 --approve）；项目资源默认跳过（除非 --trust-project）。
+/// stdout 只走模型正文（可管道），诊断走 stderr。
+async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()> {
+    // 审批档位先验（互斥错配直接 bail，不建会话不落盘）
+    let approver = approver_for(cli, None)?;
+    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
+    let mut tools = sandboxed_tools();
+    let _mcp = if let Some(path) = &cli.mcp_config {
+        let configs = rupi_mcp::load_configs(path)?;
+        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let names = manager.register_all(&mut tools).await;
+        eprintln!("[mcp] {} tools: {}", names.len(), names.join(", "));
+        Some(manager)
+    } else {
+        None
+    };
+    let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
+    // 非交互不提问：有项目资源且未 --trust-project 则跳过并告知
+    let load_project = match project_resources() {
+        None => true,
+        Some((root, _)) if cli.trust_project => {
+            eprintln!(
+                "[trust] --trust-project: 本次加载项目资源 {}",
+                root.display()
+            );
+            true
+        }
+        Some(_) => {
+            eprintln!("[trust] 非交互默认跳过项目资源（加 --trust-project 加载）");
+            false
+        }
+    };
+    let store = memory_store(home, load_project);
+    let frozen = store.frozen_snapshot();
+    let mut mem_mgr = MemoryManager::new(store);
+    maybe_external_memory(cli, home, &mut mem_mgr).await?;
+    let mem = Arc::new(mem_mgr);
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
+    let sess_db = SessionStore::open(home)?;
+    let (mut session, sid) = restore_or_new(cli, &sess_db)?;
+    let mut agent =
+        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    agent = agent
+        .with_policy(Arc::new(default_policy()))
+        .with_plan_mode(cli.plan);
+    if let Some(a) = approver {
+        agent = agent.with_approver(a);
+    }
+    if cli.parallel_tools {
+        agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
+    }
+    if cli.discover_tools {
+        agent = agent.with_discovery(rupi_agent::DiscoveryConfig::default());
+    }
+    if cli.subagents {
+        let sub = SubagentTool::new(
+            provider.clone(),
+            Arc::new(tools.clone()),
+            mem.clone(),
+            frozen.clone(),
+            skills.clone(),
+            cli.max_turns,
+        )
+        .with_plan_mode(cli.plan);
+        tools.register(Arc::new(sub));
+        eprintln!("[subagents] subagent tool enabled");
+    }
+    let before_len = session.current_path.len();
+    use std::io::Write as _;
+    agent
+        .run(
+            &*provider,
+            &mut session,
+            prompt,
+            &tools,
+            &*mem,
+            &frozen,
+            &*skills,
+            &[],
+            &|e| match e {
+                rupi_core::AgentEvent::TextDelta { delta } => {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                }
+                rupi_core::AgentEvent::ToolStart { name, .. } => {
+                    eprintln!("\n[tool {name}]…")
+                }
+                rupi_core::AgentEvent::ToolEnd { name, is_error, .. } => {
+                    eprintln!("\n[{name} {}]", if is_error { "error" } else { "ok" })
+                }
+                _ => {}
+            },
+        )
+        .await?;
+    println!();
+    persist_turn(&sess_db, &sid, prompt, &session, before_len);
+    Ok(())
+}
+
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut model = cli.model.clone();
     let mut provider: Arc<dyn LlmProvider> = build_provider(&model).await?.into();
@@ -546,8 +694,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
     agent = agent
         .with_policy(Arc::new(default_policy()))
-        .with_approver(Arc::new(TerminalApprover::default()))
         .with_plan_mode(cli.plan);
+    if let Some(a) = approver_for(cli, Some(Arc::new(TerminalApprover::default())))? {
+        agent = agent.with_approver(a);
+    }
     if cli.parallel_tools {
         agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
         println!("[parallel tools] tool calls in one turn run concurrently");
@@ -802,8 +952,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     agent = agent
         .with_policy(Arc::new(default_policy()))
-        .with_approver(Arc::new(rupi_tui::TuiApprover::default()))
         .with_plan_mode(cli.plan);
+    if let Some(a) = approver_for(cli, Some(Arc::new(rupi_tui::TuiApprover::default())))? {
+        agent = agent.with_approver(a);
+    }
     if cli.parallel_tools {
         agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
         eprintln!("[parallel tools] tool calls in one turn run concurrently");
