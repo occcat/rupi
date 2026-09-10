@@ -410,7 +410,26 @@ impl FrozenMemory {
     }
 }
 
-/// 外部记忆 provider 契约：7 方法生命周期（Hermes `MemoryProvider` 对齐）。
+/// 最近一次 prefetch 注入了什么：确定性 recall 指示器的输入
+/// （Hermes `RecallStatus` 对齐；`count == 0` 表有内容无离散计数，渲染为通用文案）。
+#[derive(Debug, Clone)]
+pub struct RecallStatus {
+    pub provider_label: String,
+    pub count: usize,
+    pub glyph: String,
+}
+
+impl RecallStatus {
+    pub fn new(provider_label: impl Into<String>, count: usize) -> Self {
+        Self {
+            provider_label: provider_label.into(),
+            count,
+            glyph: "🧠".into(),
+        }
+    }
+}
+
+/// 外部记忆 provider 契约：8 方法生命周期（Hermes `MemoryProvider` 对齐）。
 #[async_trait]
 pub trait MemoryProvider: Send + Sync {
     async fn initialize(&mut self, home: &Path) -> anyhow::Result<()>;
@@ -421,6 +440,12 @@ pub trait MemoryProvider: Send + Sync {
     /// 每轮 API 调用前触发，必须立即返回（后台预热缓存，慢 backend 不阻塞首字）。
     async fn prefetch(&self) -> String {
         String::new()
+    }
+    /// 最近一次 `prefetch` 实际注入了什么（`None` = 无指示器）。
+    /// 只反映 LAST prefetch，由 manager 在每次 `prefetch_all` 后快照，
+    /// 寒暄门短路时快照清空，永不展示陈旧计数（Hermes `recall_status` 同约）。
+    fn recall_status(&self) -> Option<RecallStatus> {
+        None
     }
     /// 每轮结束后异步持久化。
     async fn sync_turn(&self, _user: &str, _assistant: &str) -> anyhow::Result<()> {
@@ -460,6 +485,9 @@ pub struct MemoryManager {
     external_name: Option<String>,
     external: Option<Box<dyn MemoryProvider>>,
     tool_to_provider: HashMap<String, String>,
+    /// 最近一次 `prefetch_all` 实际注入的回想状态（寒暄门短路/超时即清空，
+    /// `describe_recall` 只读快照，永不展示陈旧计数）。
+    last_recall: std::sync::Mutex<Vec<RecallStatus>>,
 }
 
 impl MemoryManager {
@@ -469,6 +497,7 @@ impl MemoryManager {
             external_name: None,
             external: None,
             tool_to_provider: HashMap::new(),
+            last_recall: std::sync::Mutex::new(vec![]),
         }
     }
 
@@ -521,11 +550,13 @@ impl MemoryManager {
     pub async fn prefetch_all(&self, query: &str) -> String {
         // 寒暄/应答/斜杠命令跳过外部 recall（对标 Hermes prefetch 门）：
         // 省后端往返，且陈旧上下文不带偏单字回复；显式 recall/memory_search 工具不受影响。
+        // 短路时同步清空回想快照：describe_recall 永不展示上一轮的陈旧计数。
         if is_trivial_prompt(query) {
             tracing::debug!("memory prefetch skipped for trivial prompt");
+            self.last_recall.lock().unwrap().clear();
             return String::new();
         }
-        match &self.external {
+        let text = match &self.external {
             Some(e) => {
                 match tokio::time::timeout(std::time::Duration::from_secs(3), e.prefetch()).await {
                     Ok(s) => s,
@@ -536,7 +567,35 @@ impl MemoryManager {
                 }
             }
             None => String::new(),
+        };
+        // 快照本轮实际注入：空文本（无货/超时/无 provider）即无指示器。
+        let mut last = self.last_recall.lock().unwrap();
+        last.clear();
+        if !text.trim().is_empty() {
+            if let Some(e) = &self.external {
+                last.extend(e.recall_status());
+            }
         }
+        text
+    }
+
+    /// 确定性 recall 指示行（如 `🧠 jsonl — recalled 2 memories`），无注入回空串。
+    /// 紧跟 `prefetch_all` 调，让用户即使模型沉默也看得到记忆被用了
+    /// （Hermes `describe_recall` 同约；`count == 0` 渲染通用文案）。
+    pub fn describe_recall(&self) -> String {
+        let last = self.last_recall.lock().unwrap();
+        let parts: Vec<String> = last
+            .iter()
+            .map(|s| {
+                let detail = match s.count {
+                    0 => "recalled relevant memory".to_string(),
+                    1 => "recalled 1 memory".to_string(),
+                    n => format!("recalled {n} memories"),
+                };
+                format!("{} {} — {detail}", s.glyph, s.provider_label)
+            })
+            .collect();
+        parts.join("  ")
     }
 
     pub async fn sync_all(&self, user: &str, assistant: &str) {
@@ -610,6 +669,8 @@ pub struct JsonlProvider {
     file: PathBuf,
     recent: std::sync::Mutex<Vec<String>>,
     recent_n: usize,
+    /// 最近一次 `prefetch` 实际返回的条数（`recall_status` 只读此快照，不读旧账）。
+    last_hits: std::sync::Mutex<usize>,
 }
 
 impl JsonlProvider {
@@ -618,6 +679,7 @@ impl JsonlProvider {
             file: PathBuf::new(),
             recent: std::sync::Mutex::new(vec![]),
             recent_n,
+            last_hits: std::sync::Mutex::new(0),
         }
     }
 
@@ -670,8 +732,25 @@ impl MemoryProvider for JsonlProvider {
     }
 
     async fn prefetch(&self) -> String {
-        // 必须立即返回：只读内存缓存，后台 sync 后刷新
-        self.recent.lock().unwrap().join("\n")
+        // 必须立即返回：只读内存缓存，后台 sync 后刷新；同步记录条数供 recall_status
+        let guard = self.recent.lock().unwrap();
+        let n = if guard.iter().any(|l| !l.trim().is_empty()) {
+            guard.len()
+        } else {
+            0
+        };
+        let out = guard.join("\n");
+        *self.last_hits.lock().unwrap() = n;
+        out
+    }
+
+    fn recall_status(&self) -> Option<RecallStatus> {
+        let n = *self.last_hits.lock().unwrap();
+        if n == 0 {
+            None
+        } else {
+            Some(RecallStatus::new("jsonl", n))
+        }
     }
 
     async fn sync_turn(&self, user: &str, assistant: &str) -> anyhow::Result<()> {
@@ -1059,6 +1138,46 @@ mod tests {
         assert_eq!(mgr.prefetch_all("hi").await, "");
         assert_eq!(mgr.prefetch_all("thanks!").await, "");
         assert_eq!(mgr.prefetch_all("/tree").await, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn recall_status_tracks_last_prefetch_only() {
+        // provider 级：未 prefetch/空缓存 → None；有货 → Some(n)，只反映 LAST。
+        let home = std::env::temp_dir().join(format!("rupi-mem-recall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        assert!(p.recall_status().is_none(), "未 prefetch 不应有状态");
+        assert_eq!(p.prefetch().await, "");
+        assert!(p.recall_status().is_none(), "空缓存不应有状态");
+        p.sync_turn("buy oolong tea", "noted").await.unwrap();
+        p.sync_turn("buy green tea", "noted").await.unwrap();
+        let ctx = p.prefetch().await;
+        assert!(ctx.contains("oolong"));
+        let st = p.recall_status().expect("有注入应有状态");
+        assert_eq!(st.provider_label, "jsonl");
+        assert_eq!(st.count, 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn describe_recall_reports_and_clears_on_trivial() {
+        // manager 级：实义 query 报计数；随后寒暄短路必须同步清空（陈旧计数不清零就是 bug）。
+        let home = std::env::temp_dir().join(format!("rupi-mem-describe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut mgr = MemoryManager::new(MemoryStore::new(home.clone()));
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        mgr.register_external("jsonl".into(), Box::new(p)).unwrap();
+        assert_eq!(mgr.describe_recall(), "", "无注入时无指示器");
+        mgr.sync_all("buy oolong tea", "noted").await;
+        mgr.sync_all("buy green tea", "noted").await;
+        let ctx = mgr.prefetch_all("what tea did I buy?").await;
+        assert!(!ctx.is_empty());
+        assert_eq!(mgr.describe_recall(), "🧠 jsonl — recalled 2 memories");
+        assert_eq!(mgr.prefetch_all("hi").await, "");
+        assert_eq!(mgr.describe_recall(), "", "寒暄门必须同步清空回想快照");
         let _ = std::fs::remove_dir_all(&home);
     }
 

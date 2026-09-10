@@ -367,6 +367,14 @@ impl AgentLoop {
         all_tools.extend(skills.tool_definitions());
         // 记忆 prefetch：注入到本轮（不污染冻结快照）；寒暄门在 manager 内
         let recalled = mem.prefetch_all(user_input).await;
+        // 回想指示紧跟 prefetch（Hermes describe_recall 同约）：有注入才发射，
+        // 模型沉默用户也看得到记忆被用了；寒暄短路/无货时 describe 回空，不扰屏。
+        let recall_line = mem.describe_recall();
+        if !recall_line.is_empty() {
+            on_event(AgentEvent::MemoryRecall {
+                detail: recall_line,
+            });
+        }
 
         let mut tool_names: Vec<String> = vec![];
         // 溢出恢复不占 turn 配额：强制压实后重发同一 turn（`turn -= 1; continue` 回绕，
@@ -828,6 +836,7 @@ mod tests {
     use super::*;
     use rupi_llm::{ChatResponse, MockProvider};
     use rupi_memory::MemoryStore;
+    use rupi_memory::MemoryProvider;
 
     #[tokio::test]
     async fn loop_finishes_without_tool_calls() {
@@ -858,6 +867,89 @@ mod tests {
             .unwrap();
         assert!(matches!(reason, StopReason::Done));
         assert!(session.history().len() >= 2);
+    }
+
+    async fn mem_with_jsonl_history(
+        tag: &str,
+    ) -> (MemoryManager, FrozenMemory, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "rupi-agent-recall-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut mem = MemoryManager::new(MemoryStore::new(home.clone()));
+        let mut p = rupi_memory::JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        mem.register_external("jsonl".into(), Box::new(p)).unwrap();
+        mem.sync_all("buy oolong tea", "noted").await;
+        mem.sync_all("buy green tea", "noted").await;
+        (mem, FrozenMemory::default(), home)
+    }
+
+    #[tokio::test]
+    async fn memory_recall_event_emitted_when_memory_injected() {
+        // 有外部记忆注入 → MemoryRecall 事件带计数行（用户即使模型沉默也看得到）。
+        let (mem, frozen, home) = mem_with_jsonl_history("emit").await;
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let skills = SkillRegistry::default();
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let reason = agent
+            .run(
+                &MockProvider::new(vec![MockProvider::text_response("done")]),
+                &mut session,
+                "what tea did I buy?",
+                &tools,
+                &mem,
+                &frozen,
+                &skills,
+                &[],
+                &|e| {
+                    if let AgentEvent::MemoryRecall { detail } = e {
+                        hit.store(true, std::sync::atomic::Ordering::SeqCst);
+                        *seen.lock().unwrap() = detail;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Done));
+        assert!(hit.load(std::sync::atomic::Ordering::SeqCst), "应发射回想指示");
+        assert_eq!(*seen.lock().unwrap(), "🧠 jsonl — recalled 2 memories");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn memory_recall_event_silent_for_trivial_prompt() {
+        // 寒暄纵使缓存有货 → 无事件（快照已清空，不扰屏）。
+        let (mem, frozen, home) = mem_with_jsonl_history("silent").await;
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let skills = SkillRegistry::default();
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        agent
+            .run(
+                &MockProvider::new(vec![MockProvider::text_response("hi")]),
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &frozen,
+                &skills,
+                &[],
+                &|e| {
+                    if matches!(e, AgentEvent::MemoryRecall { .. }) {
+                        hit.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!hit.load(std::sync::atomic::Ordering::SeqCst), "寒暄不应有回想指示");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

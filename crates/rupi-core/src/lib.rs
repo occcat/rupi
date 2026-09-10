@@ -350,6 +350,11 @@ pub enum AgentEvent {
         tool: String,
         approved: bool,
     },
+    /// 回想指示（对标 Hermes `describe_recall`）：本轮 prefetch 实际注入了外部记忆，
+    /// 即使模型沉默用户也看得到记忆被用了；无注入时不发射。
+    MemoryRecall {
+        detail: String,
+    },
     Error {
         message: String,
     },

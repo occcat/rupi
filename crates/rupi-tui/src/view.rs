@@ -113,6 +113,9 @@ impl ChatView {
             | AgentEvent::RunEnd { .. }
             | AgentEvent::UiPromptStart { .. }
             | AgentEvent::UiPromptEnd { .. } => {}
+            AgentEvent::MemoryRecall { detail } => {
+                self.lines.push(Line::System(detail.clone()));
+            }
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }
@@ -174,5 +177,17 @@ mod tests {
         assert_eq!(v.lines[1], Line::AssistantText("hello".into()));
         assert!(matches!(v.lines[3], Line::Tool(_)));
         assert_eq!(v.lines[4], Line::AssistantText("done".into()));
+    }
+
+    #[test]
+    fn memory_recall_renders_as_system_line() {
+        let mut v = ChatView::default();
+        v.push_event(&AgentEvent::MemoryRecall {
+            detail: "🧠 jsonl — recalled 2 memories".into(),
+        });
+        assert_eq!(
+            v.lines,
+            vec![Line::System("🧠 jsonl — recalled 2 memories".into())]
+        );
     }
 }

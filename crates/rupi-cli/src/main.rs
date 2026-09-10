@@ -864,6 +864,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
                 rupi_core::AgentEvent::ToolEnd { name, is_error, .. } => {
                     eprintln!("\n[{name} {}]", if is_error { "error" } else { "ok" })
                 }
+                rupi_core::AgentEvent::MemoryRecall { detail } => {
+                    eprintln!("{detail}")
+                }
                 _ => {}
             },
         )
@@ -1129,6 +1132,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                             "\n[{name} {}]\n{content}",
                             if is_error { "error" } else { "ok" }
                         )
+                    }
+                    rupi_core::AgentEvent::MemoryRecall { detail } => {
+                        println!("{detail}")
                     }
                     _ => {}
                 },
