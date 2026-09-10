@@ -242,8 +242,10 @@ impl SkillAccumulator {
             anyhow::bail!("skill {name} already exists");
         }
         std::fs::create_dir_all(dir.join("references"))?;
-        let mut body =
-            format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n");
+        // description 进 YAML frontmatter：转义反斜杠/引号并消除 `---`，
+        // 否则模型输出的特殊字符会让下次 refresh 解析失败、skill 静默丢失。
+        let safe_description = description.replace("---", "—").replace('\\', "\\\\").replace('"', "\\\"");
+        let mut body = format!("---\nname: {name}\ndescription: \"{safe_description}\"\n---\n\n# {name}\n\n");
         body.push_str(" distilled from a successful session. Follow these steps:\n\n");
         for (i, st) in steps.iter().take(50).enumerate() {
             body.push_str(&format!("{}. {}\n", i + 1, st));
