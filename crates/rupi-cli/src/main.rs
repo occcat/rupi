@@ -245,6 +245,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::SessionShow { id }) => {
             let store = SessionStore::open(&home)?;
+            let summary = store.get_summary(&id).unwrap_or_default();
+            if !summary.is_empty() {
+                println!("== summary ==\n{summary}");
+            }
             for (role, content, created) in store.session_messages(&id, 200)? {
                 println!("== {role} @ {created} ==\n{content}");
             }
@@ -422,6 +426,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 
     println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
+    let mut saved_summary = String::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -490,6 +495,16 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             )
             .await?;
         persist_turn(&sess_db, &sid, &input, &session);
+        // 压缩摘要落盘（变化才写）
+        if let Some(sum) = &session.summary {
+            if *sum != saved_summary {
+                if let Err(e) = sess_db.set_summary(&sid, sum) {
+                    tracing::warn!("persist summary failed: {e:#}");
+                } else {
+                    saved_summary = sum.clone();
+                }
+            }
+        }
         if cli.review_apply {
             apply_suggestions(home, &pending);
         }
@@ -584,6 +599,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }),
         );
     }
+    let saved = Arc::new(std::sync::Mutex::new(String::new()));
     let ctx = rupi_tui::TuiContext {
         provider: &*provider,
         agent: &agent,
@@ -600,6 +616,15 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             if let Err(e) = db.add_message(&sid, "assistant", &t.assistant) {
                 tracing::warn!("persist assistant msg failed: {e:#}");
+            }
+            if let Some(sum) = &t.summary {
+                if *sum != *saved.lock().unwrap() {
+                    if let Err(e) = db.set_summary(&sid, sum) {
+                        tracing::warn!("persist summary failed: {e:#}");
+                    } else {
+                        *saved.lock().unwrap() = sum.clone();
+                    }
+                }
             }
         })),
     };

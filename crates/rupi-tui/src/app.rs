@@ -47,6 +47,8 @@ pub struct TuiContext<'a> {
 pub struct TurnRecord {
     pub user: String,
     pub assistant: String,
+    /// 本轮结束时的会话压缩摘要（无压缩则为 None）。
+    pub summary: Option<String>,
 }
 
 struct Guard;
@@ -234,6 +236,7 @@ async fn drive_turn(
                         cb(TurnRecord {
                             user: text.clone(),
                             assistant,
+                            summary: session.summary.clone(),
                         });
                     }
                 }

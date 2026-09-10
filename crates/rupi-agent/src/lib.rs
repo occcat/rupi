@@ -328,6 +328,22 @@ impl AgentLoop {
         if session.history_chars() <= self.compress_threshold_chars {
             return;
         }
+        // 已压缩过且新增不足一窗：跳过，避免每轮重复烧模型
+        // tail = 上次压缩点之后未压缩的消息数；首轮压缩后 tail == keep，
+        // 新增 new_count 条后 tail == keep + new_count；new_count <= keep 时跳过。
+        if let Some(through) = &session.summary_through {
+            if session.summary.is_some() {
+                let pos = session
+                    .current_path
+                    .iter()
+                    .position(|id| id == through)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                if session.current_path.len().saturating_sub(pos) <= self.compress_keep_last * 2 {
+                    return;
+                }
+            }
+        }
         let total = session.current_path.len();
         if total <= self.compress_keep_last {
             return;
@@ -501,6 +517,28 @@ mod tests {
         // 树全量保留，prompt 窗口缩小
         assert!(session.history().len() >= 8);
         assert!(session.prompt_history(2).len() <= 4);
+    }
+
+    #[tokio::test]
+    async fn compress_skips_when_little_new_content() {
+        let agent = AgentLoop::new(3).with_compression(50, 2);
+        let mut session = SessionTree::new();
+        for i in 0..6 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let home = std::env::temp_dir().join("rupi-agent-compress-skip");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        // 首轮压出 SUMMARY-1；次轮纵使 provider 给出 SUMMARY-2 也不应采用
+        let p1 = MockProvider::new(vec![MockProvider::text_response("SUMMARY-1")]);
+        agent.maybe_compress(&p1, &mut session, &mem).await;
+        assert!(session.summary.as_ref().unwrap().contains("SUMMARY-1"));
+        session.push(Message::text(Role::User, "tiny"));
+        let p2 = MockProvider::new(vec![MockProvider::text_response("SUMMARY-2")]);
+        agent.maybe_compress(&p2, &mut session, &mem).await;
+        assert!(session.summary.as_ref().unwrap().contains("SUMMARY-1"));
     }
 
     #[tokio::test]

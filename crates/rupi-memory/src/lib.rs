@@ -460,6 +460,24 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// 写回压缩摘要（`sessions.summary`）。
+    pub fn set_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET summary = ? WHERE id = ?",
+            rusqlite::params![summary, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// 读回压缩摘要（resume 时可预热窗口；当前 CLI 只展示）。
+    pub fn get_summary(&self, session_id: &str) -> anyhow::Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT summary FROM sessions WHERE id = ?",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO messages(id, session_id, role, content, created_at) VALUES(?,?,?,?,?)",
@@ -644,6 +662,9 @@ mod tests {
         let msgs = store.session_messages(&sid, 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].0, "user");
+        // 摘要写回与读回
+        store.set_summary(&sid, "talked tea").unwrap();
+        assert_eq!(store.get_summary(&sid).unwrap(), "talked tea");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
