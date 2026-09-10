@@ -73,7 +73,8 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
   （name 小写-数字-连字符 ≤64，description ≤1024，body 建议 <5000 tokens / <500 行）。
 - 渐进披露：`skills-list`（metadata 索引）→ `skill-load`（全文）→ `read_resource` 按需读
   `references/`/`assets/`；agent 内以 `load_skill` 工具激活。
-- 自积累：`skill-distill --name x --description d --steps s1 s2` 生成新 `SKILL.md` 草稿到
-  `~/.rupi/skills/<name>/`，落盘前需校验（已实现 name 校验 + 重名拒绝）。
+- 自积累：`skill-distill <name> <description> [steps...]` 生成新 `SKILL.md` 草稿到
+  `~/.rupi/skills/<name>/`，落盘前校验（name 规范 + description 压单行 1..=1024 + steps 非空 + 重名拒绝）。
+  REPL/TUI 每轮发送前热刷新注册表，会话内新蒸馏 skill 下一轮即对模型可见，无需重启。
 - 后台 review：`chat --review` 每轮后安静复盘并打印记忆/Skill 建议，
   `--review-apply` 直接落盘（`MEMORY.md` add + skill 草稿；已存在 skill 跳过不覆盖）。

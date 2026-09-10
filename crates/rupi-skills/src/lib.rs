@@ -81,13 +81,21 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// Skill 注册表：多目录发现（内建 / 用户 / 项目级），渐进披露加载。
+/// 内部可变：`refresh` 原地热更新，会话内新蒸馏的 skill 下一轮即对模型可见。
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
-    pub skills: Vec<Skill>,
+    skills: std::sync::RwLock<Vec<Skill>>,
 }
 
 impl SkillRegistry {
     pub fn discover(dirs: &[PathBuf]) -> Self {
+        let mut this = Self::default();
+        this.refresh(dirs);
+        this
+    }
+
+    /// 重扫目录并原地替换，返回 skill 数量。失败的目录只 warning（与初次发现同语义）。
+    pub fn refresh(&self, dirs: &[PathBuf]) -> usize {
         let mut skills = vec![];
         for base in dirs {
             if !base.exists() {
@@ -112,16 +120,19 @@ impl SkillRegistry {
         // 同名去重：先发现者胜
         let mut seen = std::collections::HashSet::new();
         skills.retain(|s| seen.insert(s.meta.name.clone()));
-        Self { skills }
+        let n = skills.len();
+        *self.skills.write().unwrap() = skills;
+        n
     }
 
     /// 系统提示索引块（阶段 1）。
     pub fn index_block(&self) -> String {
-        if self.skills.is_empty() {
+        let skills = self.skills.read().unwrap();
+        if skills.is_empty() {
             return String::new();
         }
         let mut s = String::from("\n<AvailableSkills>\nLoad full instructions with load_skill(name) when a task matches.\n");
-        for sk in &self.skills {
+        for sk in skills.iter() {
             s.push_str(&sk.advertise());
             s.push('\n');
         }
@@ -132,6 +143,8 @@ impl SkillRegistry {
     /// 阶段 2：激活 skill，返回全文指令。
     pub fn load_skill(&self, name: &str) -> Option<String> {
         self.skills
+            .read()
+            .unwrap()
             .iter()
             .find(|s| s.meta.name == name)
             .map(|s| s.instructions.clone())
@@ -139,8 +152,8 @@ impl SkillRegistry {
 
     /// 阶段 3：按需读资源文件（references/、assets/、templates/）。
     pub fn read_resource(&self, name: &str, rel: &str) -> anyhow::Result<String> {
-        let sk = self
-            .skills
+        let skills = self.skills.read().unwrap();
+        let sk = skills
             .iter()
             .find(|s| s.meta.name == name)
             .ok_or_else(|| anyhow::anyhow!("unknown skill {name}"))?;
@@ -149,6 +162,11 @@ impl SkillRegistry {
             anyhow::bail!("path escapes skill dir");
         }
         Ok(std::fs::read_to_string(&p)?)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.skills.read().unwrap().len()
     }
 }
 
@@ -164,6 +182,8 @@ impl SkillAccumulator {
     }
 
     /// 启发式提炼：调用者传入“任务描述 + 关键步骤”，生成符合规范的 SKILL.md。
+    /// 落盘前校验：description 压成单行且 1..=1024 字符（否则写出的 frontmatter 下次发现即跳过），
+    /// steps 非空（空流程没有复用价值），超 50 步截断。
     pub fn propose(
         &self,
         name: &str,
@@ -171,6 +191,16 @@ impl SkillAccumulator {
         steps: &[String],
     ) -> anyhow::Result<PathBuf> {
         validate_name(name)?;
+        let description: String = description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if description.is_empty() || description.len() > 1024 {
+            anyhow::bail!("skill description must be 1..=1024 chars");
+        }
+        if steps.is_empty() {
+            anyhow::bail!("skill steps must be non-empty");
+        }
         let dir = self.dest_dir.join(name);
         if dir.exists() {
             anyhow::bail!("skill {name} already exists");
@@ -179,7 +209,7 @@ impl SkillAccumulator {
         let mut body =
             format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n");
         body.push_str(" distilled from a successful session. Follow these steps:\n\n");
-        for (i, st) in steps.iter().enumerate() {
+        for (i, st) in steps.iter().take(50).enumerate() {
             body.push_str(&format!("{}. {}\n", i + 1, st));
         }
         body.push_str("\nMove details to `references/` if this file grows past 500 lines.\n");
@@ -204,7 +234,7 @@ mod tests {
         )
         .unwrap();
         let reg = SkillRegistry::discover(&[base.clone()]);
-        assert_eq!(reg.skills.len(), 1);
+        assert_eq!(reg.len(), 1);
         assert!(reg.index_block().contains("demo-skill"));
         assert!(reg.load_skill("demo-skill").unwrap().contains("Do X"));
         let _ = std::fs::remove_dir_all(&base);
@@ -214,5 +244,47 @@ mod tests {
     fn accumulator_rejects_bad_names() {
         let acc = SkillAccumulator::new(std::env::temp_dir());
         assert!(acc.propose("Bad_Name", "d", &[]).is_err());
+    }
+
+    #[test]
+    fn accumulator_validates_description_and_steps() {
+        let base = std::env::temp_dir().join(format!("rupi-skill-acc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let acc = SkillAccumulator::new(base.clone());
+        // 空步骤 / 空描述 / 超长描述拒绝
+        assert!(acc.propose("s1", "ok", &[]).is_err());
+        assert!(acc.propose("s2", "  \n ", &["step".into()]).is_err());
+        assert!(acc.propose("s3", &"x".repeat(2000), &["step".into()]).is_err());
+        // 换行描述压单行，落盘后可被重新发现
+        let dir = acc
+            .propose("multiline-desc", "line one\nline two", &["do it".into()])
+            .unwrap();
+        let raw = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(raw.contains("line one line two"));
+        let reg = SkillRegistry::discover(&[base.clone()]);
+        assert!(reg.load_skill("multiline-desc").is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn registry_refresh_picks_up_new_skills() {
+        let base = std::env::temp_dir().join(format!("rupi-skill-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let reg = SkillRegistry::discover(&[base.clone()]);
+        assert_eq!(reg.len(), 0);
+        assert!(reg.index_block().is_empty());
+        // 会话中途新增 skill：refresh 后立即可见（自积累闭环）
+        let dir = base.join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: fresh-skill\ndescription: just arrived\n---\n\n# Fresh\nGo.\n",
+        )
+        .unwrap();
+        assert_eq!(reg.refresh(&[base.clone()]), 1);
+        assert!(reg.index_block().contains("fresh-skill"));
+        assert!(reg.load_skill("fresh-skill").unwrap().contains("Go."));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

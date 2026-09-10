@@ -526,8 +526,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             continue;
         }
-        // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）
+        // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）；
+        // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
         refresh_extensions(&mut tools, &mut ext_set);
+        skills.refresh(&skill_dirs(home));
         agent
             .run(
                 &*provider,
@@ -682,6 +684,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         mem: &*mem,
         frozen: &frozen,
         skills: &*skills,
+        skill_dirs: skill_dirs(home),
         review_lines,
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();

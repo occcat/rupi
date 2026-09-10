@@ -36,6 +36,8 @@ pub struct TuiContext<'a> {
     pub mem: &'a MemoryManager,
     pub frozen: &'a FrozenMemory,
     pub skills: &'a SkillRegistry,
+    /// skill 发现目录：每轮发送前 `refresh`，会话内新蒸馏 skill 即时可见（与 REPL 同闭环）。
+    pub skill_dirs: Vec<std::path::PathBuf>,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
@@ -158,6 +160,8 @@ async fn run_loop(
                 }
                 view.push_user(text.clone());
                 scroll = 0;
+                // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
+                ctx.skills.refresh(&ctx.skill_dirs);
                 match drive_turn(
                     terminal,
                     ctx.agent,
