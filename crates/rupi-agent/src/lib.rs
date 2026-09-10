@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 pub mod review;
 pub use review::{HeuristicReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
+pub mod policy;
+pub use policy::{Approver, ChainPolicy, Decision, Policy, RulePolicy};
 
 pub struct PromptBuilder {
     pub base: String,
@@ -60,6 +62,11 @@ pub struct AgentLoop {
     /// 会话压缩：历史超 `compress_threshold_chars` 时摘要最旧部分，只把摘要 + 近期送模型。
     pub compress_threshold_chars: usize,
     pub compress_keep_last: usize,
+    /// 权限门：默认全放行；计划模式/规则/审批按需装配。
+    pub policy: Arc<dyn Policy>,
+    pub approver: Option<Arc<dyn Approver>>,
+    /// 计划模式：禁 write/edit/bash（只侦察、不动手），并在系统提示中声明。
+    pub plan_mode: bool,
 }
 
 impl AgentLoop {
@@ -73,6 +80,9 @@ impl AgentLoop {
             on_suggestion: None,
             compress_threshold_chars: 60_000,
             compress_keep_last: 20,
+            policy: Arc::new(policy::AllowAll),
+            approver: None,
+            plan_mode: false,
         }
     }
 
@@ -90,6 +100,25 @@ impl AgentLoop {
         self.compress_threshold_chars = threshold_chars;
         self.compress_keep_last = keep_last;
         self
+    }
+
+    pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    pub fn with_plan_mode(mut self, plan_mode: bool) -> Self {
+        self.plan_mode = plan_mode;
+        self
+    }
+
+    fn is_mutating(tool: &str) -> bool {
+        matches!(tool, "write" | "edit" | "bash")
     }
 
     /// 运行一轮用户请求直到 `done` / 无工具调用 / max_turns。每步推 `AgentEvent`。
@@ -116,6 +145,9 @@ impl AgentLoop {
             .build(frozen, mem, skills, &tools.definitions(), extensions);
         if !recalled.is_empty() {
             system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
+        }
+        if self.plan_mode {
+            system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
         }
 
         let mut tool_names: Vec<String> = vec![];
@@ -196,6 +228,51 @@ impl AgentLoop {
                     name: name.clone(),
                     arguments: args.clone(),
                 });
+                // 权限门：拒绝 / 无审批的 Ask 一律转 tool error 回模型，主循环不中断
+                let denied: Option<rupi_tools::ToolOutput> = match self.policy.decide(&name, &args)
+                {
+                    Decision::Allow => None,
+                    Decision::Deny(reason) => Some(rupi_tools::ToolOutput::err(format!(
+                        "denied by policy: {reason}"
+                    ))),
+                    Decision::Ask(reason) => {
+                        let ok = match &self.approver {
+                            Some(a) => a.approve(&name, &args, &reason),
+                            None => false,
+                        };
+                        if ok {
+                            None
+                        } else {
+                            Some(rupi_tools::ToolOutput::err(format!(
+                                "denied (approval required): {reason}"
+                            )))
+                        }
+                    }
+                };
+                // 计划模式兜底：即使策略放行，变更类工具也不执行
+                let denied = denied.or_else(|| {
+                    if self.plan_mode && Self::is_mutating(&name) {
+                        Some(rupi_tools::ToolOutput::err(format!(
+                            "plan mode: {name} is disabled; describe the plan instead"
+                        )))
+                    } else {
+                        None
+                    }
+                });
+                if let Some(out) = denied {
+                    on_event(AgentEvent::ToolEnd {
+                        tool_call_id: id.clone(),
+                        name: name.clone(),
+                        content: out.content.clone(),
+                        is_error: out.is_error,
+                    });
+                    results.push(ContentBlock::ToolResult {
+                        tool_call_id: id,
+                        content: out.content,
+                        is_error: out.is_error,
+                    });
+                    continue;
+                }
                 let out = if name == "load_skill" {
                     let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     match skills.load_skill(sk) {
@@ -344,7 +421,7 @@ impl Extension for ToolExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupi_llm::MockProvider;
+    use rupi_llm::{ChatResponse, MockProvider};
     use rupi_memory::MemoryStore;
 
     #[tokio::test]
@@ -445,5 +522,137 @@ mod tests {
         // 兜底摘要照样落盘，窗口照样缩小
         assert!(session.summary.is_some());
         assert_eq!(session.prompt_history(1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_write_without_executing() {
+        use rupi_core::ContentBlock;
+        let script = vec![
+            ChatResponse {
+                message: Message {
+                    id: "a".into(),
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({"path": "/tmp/rupi-plan-guard.txt", "content": "x"}),
+                    }],
+                    provider: None,
+                    created_at: chrono::Utc::now(),
+                },
+                stop_reason: "tool_calls".into(),
+            },
+            MockProvider::text_response("planned"),
+        ];
+        let provider = MockProvider::new(script);
+        let agent = AgentLoop::new(5).with_plan_mode(true);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-plan");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "create file",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!std::path::Path::new("/tmp/rupi-plan-guard.txt").exists());
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("plan mode"));
+    }
+
+    #[tokio::test]
+    async fn ask_policy_with_approver_gates_execution() {
+        use rupi_core::ContentBlock;
+        struct Yes;
+        impl crate::Approver for Yes {
+            fn approve(&self, _t: &str, _a: &serde_json::Value, _r: &str) -> bool {
+                true
+            }
+        }
+        let mk_call = || ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo approved"}),
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let ask = RulePolicy {
+            ask_tools: vec!["bash".into()],
+            ..Default::default()
+        };
+        // 无审批器 → 拒绝
+        let agent = AgentLoop::new(5).with_policy(Arc::new(ask.clone()));
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-ask");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &MockProvider::new(vec![mk_call(), MockProvider::text_response("d")]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("approval required"));
+        // 有审批器放行 → 真执行
+        let agent = AgentLoop::new(5)
+            .with_policy(Arc::new(ask))
+            .with_approver(Arc::new(Yes));
+        let mut session = SessionTree::new();
+        agent
+            .run(
+                &MockProvider::new(vec![mk_call(), MockProvider::text_response("d")]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("approved"));
     }
 }

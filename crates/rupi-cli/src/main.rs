@@ -9,7 +9,6 @@ use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
-
 /// 把 review 建议落盘：memory add 写 `MEMORY.md`，skill 草稿写 `~/.rupi/skills/<name>/`。
 /// 已存在的 skill 跳过（不覆盖人工成果），失败只打印不中断聊天。
 fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSuggestion>>>) {
@@ -67,6 +66,9 @@ struct Cli {
     /// 外部扩展目录（*.json manifests），默认 ~/.rupi/extensions
     #[arg(long)]
     ext_dir: Option<PathBuf>,
+    /// 计划模式：只侦察不动手（禁 write/edit/bash）
+    #[arg(long, default_value_t = false)]
+    plan: bool,
 }
 
 #[derive(Subcommand)]
@@ -240,12 +242,40 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 终端审批器：Ask 裁决时 stdin 问一句 `[y/N]`，默认拒绝。
+struct TerminalApprover;
+impl rupi_agent::Approver for TerminalApprover {
+    fn approve(&self, tool: &str, args: &serde_json::Value, reason: &str) -> bool {
+        eprintln!("[approve] {tool} {args} — {reason} [y/N]");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    }
+}
+
+/// 默认规则：危险 bash 子串转人工（REPL 有审批器；非交互/TUI 无审批则拒绝）。
+fn default_policy() -> rupi_agent::RulePolicy {
+    rupi_agent::RulePolicy {
+        bash_block: vec!["rm -rf /".into(), "mkfs".into(), "dd if=".into()],
+        ..Default::default()
+    }
+}
+
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let provider = build_provider(&cli.model).await?;
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    agent = agent
+        .with_policy(Arc::new(default_policy()))
+        .with_approver(Arc::new(TerminalApprover))
+        .with_plan_mode(cli.plan);
+    if cli.plan {
+        println!("[plan mode] read-only: write/edit/bash disabled");
+    }
     if cli.review || cli.review_apply {
         let pending_clone = pending.clone();
         agent = agent.with_reviewer(
@@ -289,7 +319,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let skills = SkillRegistry::discover(&skill_dirs(home));
     let mut session = SessionTree::new();
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/skills 看技能");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -313,6 +343,11 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         }
         if input == "/reload" {
             refresh_extensions(&mut tools, &mut ext_set);
+            continue;
+        }
+        if input == "/plan" {
+            agent.plan_mode = !agent.plan_mode;
+            println!("[plan mode {}]", if agent.plan_mode { "on" } else { "off" });
             continue;
         }
         if input == "/rewind" {
@@ -381,6 +416,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut session = SessionTree::new();
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    // TUI 内无 stdin 审批：Ask 一律拒绝；plan mode 同 REPL
+    agent = agent
+        .with_policy(Arc::new(default_policy()))
+        .with_plan_mode(cli.plan);
     let review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>> = if cli.review || cli.review_apply
     {
         Some(Arc::new(std::sync::Mutex::new(vec![])))
