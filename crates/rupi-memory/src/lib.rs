@@ -124,12 +124,38 @@ impl MemoryStore {
 
     fn read_limited(&self, path: &Path, limit: usize) -> String {
         let content = std::fs::read_to_string(path).unwrap_or_default();
+        Self::fit_to_limit(&content, limit)
+    }
+
+    /// 容量压实（Hermes auto-consolidation 的确定性底层）：超限时按行丢最旧、保最新；
+    /// 单行超长才按字节截尾。读路径与写路径共用，不变量：输出永远 ≤ limit（+ 一行标记）。
+    fn fit_to_limit(content: &str, limit: usize) -> String {
         if content.len() <= limit {
-            return content;
+            return content.to_string();
         }
-        // 超限保留尾部（最新写入在尾部）
-        let start = content.len() - limit;
-        format!("...[truncated]\n{}", &content[start..])
+        let mut lines: Vec<&str> = content.lines().collect();
+        let mut kept: Vec<&str> = vec![];
+        let mut bytes = 0;
+        while let Some(line) = lines.pop() {
+            let cost = line.len() + 1;
+            if !kept.is_empty() && bytes + cost > limit {
+                break;
+            }
+            bytes += cost;
+            kept.push(line);
+        }
+        kept.reverse();
+        let mut out = String::from("...[compacted: oldest entries dropped]\n");
+        out.push_str(&kept.join("\n"));
+        if content.ends_with('\n') {
+            out.push('\n');
+        }
+        // 极端：单行即超限
+        if out.len() > limit + 128 {
+            let start = out.len() - limit;
+            out = format!("...[truncated]\n{}", &out[start..]);
+        }
+        out
     }
 
     pub fn memory_text(&self) -> String {
@@ -185,6 +211,7 @@ impl MemoryStore {
         ));
         std::fs::write(&path, &content)?;
         self.mirror_memory("failure", entry);
+        self.compact_file(&path);
         Ok(())
     }
 
@@ -248,7 +275,23 @@ impl MemoryStore {
         }
         std::fs::write(&path, &content)?;
         self.mirror_memory(mirror_target, entry);
-        Ok(content)
+        self.compact_file(&path);
+        Ok(std::fs::read_to_string(&path).unwrap_or(content))
+    }
+
+    /// 写后压实：文件超限即按行丢最旧，保证磁盘文件永远有界（读路径不再是唯一防线）。
+    fn compact_file(&self, path: &Path) {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let fitted = Self::fit_to_limit(&content, self.memory_char_limit);
+        if fitted.len() < content.len() {
+            tracing::info!(
+                "memory compacted: {} -> {} bytes ({})",
+                content.len(),
+                fitted.len(),
+                path.display()
+            );
+            let _ = std::fs::write(path, &fitted);
+        }
     }
 
     pub fn memory_tool_definition(&self) -> Option<ToolDefinition> {
@@ -1028,6 +1071,26 @@ mod tests {
             .unwrap();
         assert!(hit.contains("[project]"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_path_compacts_oldest_lines_first() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut store = MemoryStore::new(home.clone());
+        store.memory_char_limit = 200;
+        for i in 0..30 {
+            store.apply_write("add", &format!("fact number {i}")).unwrap();
+        }
+        // 磁盘文件有界，保最新、丢最旧，且按整行切（无半截行）
+        let raw = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
+        assert!(raw.len() <= 200 + 128);
+        assert!(raw.contains("fact number 29"));
+        assert!(!raw.contains("fact number 0"));
+        assert!(raw.lines().all(|l| !l.ends_with("fact num")));
+        // 读路径同样整行
+        assert!(store.memory_text().contains("fact number 29"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
