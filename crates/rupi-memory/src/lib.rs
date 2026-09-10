@@ -716,7 +716,9 @@ impl SessionStore {
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
              CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT);
-             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid');
+             -- trigram 分词：中英文统一按子串可召回（unicode61 把中文整句当一个 token，
+             -- 子串永远查不到）；case_sensitive 0 保英文大小写不敏感
+             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
              -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
              CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
                INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -732,7 +734,7 @@ impl SessionStore {
                content TEXT NOT NULL,
                created_at TEXT NOT NULL
              );
-             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid');
+             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
              CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
              END;
@@ -744,6 +746,20 @@ impl SessionStore {
                SELECT rowid, content FROM messages
                WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
         )?;
+        // 分词器迁移（user_version<2 的 unicode61 老库）：FTS 表只是内容表的索引位，
+        // 删了按 trigram 重建再全量回填即可，触发器不受影响；新库建表即 trigram，直接标版本。
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS messages_fts;
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+                 INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;
+                 DROP TABLE IF EXISTS memory_fts;
+                 CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+                 INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;
+                 PRAGMA user_version = 2;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -1111,18 +1127,60 @@ mod tests {
         let hits = db.memory_search("tea", 5).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits[0].1.contains("ritual"), "高频条目未排前: {:?}", hits);
-        // 会话检索同享排名：limit=1 截到的是最相关的那条
+        // 会话检索同享排名：limit=1 截到的是最相关的那条（标志词放句首，避开 snippet 尾截断）
         let sid = db.create_session("test").unwrap();
         db.add_message(&sid, "user", "mentions tea once").unwrap();
-        db.add_message(&sid, "user", "tea tea tea tea deepdive")
+        db.add_message(&sid, "user", "bravo tea tea tea tea")
             .unwrap();
         let shits = db.search("tea", 1).unwrap();
         assert_eq!(shits.len(), 1);
         assert!(
-            shits[0].1.contains("deepdive"),
+            shits[0].1.contains("bravo"),
             "session limit=1 未截到最相关: {:?}",
             shits
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn memory_search_matches_chinese_substring() {
+        // 中文按字面子串可召回（unicode61 把整句当一个 token，子串永远查不到）
+        let home = std::env::temp_dir().join(format!("rupi-mem-cjk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let db = SessionStore::open(&home).unwrap();
+        db.mirror_memory_entry("memory", "请记住我爱喝乌龙茶")
+            .unwrap();
+        let hits = db.memory_search("乌龙茶", 5).unwrap();
+        assert_eq!(hits.len(), 1, "中文子串未召回: {hits:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_unicode61_db_migrates_to_trigram() {
+        // 手工造 unicode61 老库（user_version 0）：open 后应自动迁移且中文可查
+        let home = std::env::temp_dir().join(format!("rupi-mem-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let conn = rusqlite::Connection::open(home.join("sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT);
+             CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid');
+             CREATE TABLE memories(id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid');
+             INSERT INTO memories(target, content, created_at) VALUES('memory', '请记住我爱喝乌龙茶', '2026-01-01');
+             INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = SessionStore::open(&home).unwrap();
+        let hits = db.memory_search("乌龙茶", 5).unwrap();
+        assert_eq!(hits.len(), 1, "老库迁移后中文仍查不到: {hits:?}");
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 
