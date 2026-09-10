@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use rupi_core::{ContentBlock, Message, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
+pub mod anthropic;
+pub use anthropic::AnthropicProvider;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub system: String,

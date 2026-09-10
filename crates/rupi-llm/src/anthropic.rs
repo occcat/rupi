@@ -1,0 +1,596 @@
+//! Anthropic Messages API 原生 provider（对标 Pi 的 Anthropic 接入）。
+//!
+//! 与 OpenAI 格式的三处关键差异：system 独立参数、Tool 结果走 user 角色的
+//! `tool_result` 内容项、消息必须严格 user/assistant 交替（同角色相邻合并）。
+
+use async_trait::async_trait;
+use rupi_core::{ContentBlock, Message, Role, ToolDefinition};
+
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+#[derive(Debug, Clone)]
+pub struct AnthropicProvider {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    client: reqwest::Client,
+}
+
+impl AnthropicProvider {
+    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+        Self {
+            base_url,
+            api_key,
+            model,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn from_env(model: String) -> anyhow::Result<Self> {
+        let api_key = std::env::var("RUPI_ANTHROPIC_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .map_err(|_| anyhow::anyhow!("set RUPI_ANTHROPIC_KEY or ANTHROPIC_API_KEY"))?;
+        let base_url =
+            std::env::var("RUPI_ANTHROPIC_BASE").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        Ok(Self::new(base_url, api_key, model))
+    }
+
+    fn headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+    }
+
+    fn body(&self, req: &super::ChatRequest, stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "max_tokens": req.max_tokens.unwrap_or(4096),
+            "system": req.system,
+            "messages": to_anthropic_messages(&req.messages),
+            "tools": to_anthropic_tools(&req.tools),
+            "temperature": req.temperature.unwrap_or(0.2),
+            "stream": stream,
+        })
+    }
+}
+
+/// 内部消息 → Anthropic messages（同角色相邻合并，保证严格交替）。
+pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = vec![];
+    let mut push = |role: &str, items: Vec<serde_json::Value>| {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+                if let Some(a) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    a.extend(items);
+                    return;
+                }
+            }
+        }
+        out.push(serde_json::json!({"role": role, "content": items}));
+    };
+    for m in messages {
+        match m.role {
+            // system 会话消息极少见，降级为 user 文本（Anthropic 只认独立 system 参数）
+            Role::System | Role::User => {
+                let t = m.full_text();
+                if !t.is_empty() {
+                    push("user", vec![serde_json::json!({"type": "text", "text": t})]);
+                }
+            }
+            Role::Assistant => {
+                let mut items = vec![];
+                for b in &m.blocks {
+                    match b {
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                items.push(serde_json::json!({"type": "text", "text": text}));
+                            }
+                        }
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => items.push(serde_json::json!({
+                            "type": "tool_use", "id": id, "name": name, "input": arguments,
+                        })),
+                        _ => {}
+                    }
+                }
+                push("assistant", items);
+            }
+            Role::Tool => {
+                let mut items = vec![];
+                for b in &m.blocks {
+                    if let ContentBlock::ToolResult {
+                        tool_call_id,
+                        content,
+                        is_error,
+                    } = b
+                    {
+                        let mut item = serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": [{"type": "text", "text": content}],
+                        });
+                        if *is_error {
+                            item["is_error"] = true.into();
+                        }
+                        items.push(item);
+                    }
+                }
+                push("user", items);
+            }
+        }
+    }
+    out
+}
+
+pub fn to_anthropic_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
+        .collect()
+}
+
+/// 错误回包提消息（`{error: {message}}`），调用方拼状态码。
+pub fn error_text(v: &serde_json::Value) -> Option<&str> {
+    v.pointer("/error/message").and_then(|s| s.as_str())
+}
+
+pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::ChatResponse> {
+    if error_text(&v).is_some() {
+        anyhow::bail!("anthropic error: {}", v.pointer("/error/message").unwrap());
+    }
+    let content = v
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| anyhow::anyhow!("bad anthropic response: {v}"))?;
+    let mut blocks = vec![];
+    for item in content {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if !text.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: text.to_owned(),
+                    });
+                }
+            }
+            Some("tool_use") => blocks.push(ContentBlock::ToolCall {
+                id: item
+                    .get("id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("call-0")
+                    .to_string(),
+                name: item
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                arguments: item.get("input").cloned().unwrap_or(serde_json::json!({})),
+            }),
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: String::new(),
+        });
+    }
+    Ok(super::ChatResponse {
+        message: Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Assistant,
+            blocks,
+            provider: Some("anthropic".into()),
+            created_at: chrono::Utc::now(),
+        },
+        stop_reason: v
+            .get("stop_reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("end_turn")
+            .to_string(),
+    })
+}
+
+/// Anthropic SSE 累积器（纯逻辑，可单测）：text 增量直推，tool_use 按 index 拼 input_json。
+#[derive(Debug, Default)]
+pub struct AnthropicAccumulator {
+    text: String,
+    frags: Vec<Frag>,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Frag {
+    is_tool: bool,
+    id: String,
+    name: String,
+    buf: String,
+}
+
+impl AnthropicAccumulator {
+    fn slot(&mut self, index: usize) -> &mut Frag {
+        while self.frags.len() <= index {
+            self.frags.push(Frag::default());
+        }
+        &mut self.frags[index]
+    }
+
+    pub async fn apply_event(
+        &mut self,
+        event: &str,
+        data: &serde_json::Value,
+        tx: &tokio::sync::mpsc::Sender<super::StreamEvent>,
+    ) {
+        match event {
+            "content_block_start" => {
+                let index = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let block = data.get("content_block");
+                let kind = block
+                    .and_then(|b| b.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("text");
+                let slot = self.slot(index);
+                if kind == "tool_use" {
+                    slot.is_tool = true;
+                    slot.id = block
+                        .and_then(|b| b.get("id"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    slot.name = block
+                        .and_then(|b| b.get("name"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            "content_block_delta" => {
+                let index = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let delta = match data.get("delta") {
+                    Some(d) => d,
+                    None => return,
+                };
+                match delta.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        let t = delta.get("text").and_then(|s| s.as_str()).unwrap_or("");
+                        if !t.is_empty() {
+                            self.text.push_str(t);
+                            self.slot(index).buf.push_str(t);
+                            let _ = tx.send(super::StreamEvent::TextDelta(t.to_string())).await;
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let p = delta
+                            .get("partial_json")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        self.slot(index).buf.push_str(p);
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(s) = data.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
+                    self.stop_reason = Some(s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn finish(self, default_stop: &str) -> super::ChatResponse {
+        let mut blocks = vec![];
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text { text: self.text });
+        }
+        for (i, f) in self.frags.into_iter().enumerate() {
+            if !f.is_tool {
+                continue;
+            }
+            blocks.push(ContentBlock::ToolCall {
+                id: if f.id.is_empty() {
+                    format!("call-{i}")
+                } else {
+                    f.id
+                },
+                name: if f.name.is_empty() {
+                    "unknown".into()
+                } else {
+                    f.name
+                },
+                arguments: serde_json::from_str(&f.buf).unwrap_or(serde_json::json!({})),
+            });
+        }
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: String::new(),
+            });
+        }
+        super::ChatResponse {
+            message: Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                blocks,
+                provider: Some("anthropic".into()),
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: self.stop_reason.unwrap_or_else(|| default_stop.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl super::LlmProvider for AnthropicProvider {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .headers(self.client.post(&url))
+            .json(&self.body(&req, false))
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = error_text(&v).unwrap_or("anthropic request failed");
+            anyhow::bail!("anthropic {status}: {msg}");
+        }
+        parse_anthropic_response(v)
+    }
+
+    /// 真 SSE 流：`event:` + `data:` 配对，文本直推、tool_use 内部累积。
+    async fn complete_streaming(
+        &self,
+        req: super::ChatRequest,
+        tx: tokio::sync::mpsc::Sender<super::StreamEvent>,
+    ) -> anyhow::Result<super::ChatResponse> {
+        use futures::StreamExt as _;
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .headers(self.client.post(&url))
+            .json(&self.body(&req, true))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+            let msg = error_text(&v).unwrap_or("anthropic request failed");
+            anyhow::bail!("anthropic {status}: {msg}");
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut event = String::new();
+        let mut acc = AnthropicAccumulator::default();
+        'stream: while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string();
+                buf = buf[pos + 1..].to_string();
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                if let Some(name) = line.strip_prefix("event:").map(str::trim) {
+                    event = name.to_string();
+                    if event == "message_stop" {
+                        break 'stream;
+                    }
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if event.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(data)?;
+                acc.apply_event(&event, &v, &tx).await;
+            }
+        }
+        Ok(acc.finish("end_turn"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rupi_core::Message;
+
+    fn assistant_tool_msg() -> Message {
+        Message {
+            id: "a".into(),
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "let me check".into(),
+                },
+                ContentBlock::ToolCall {
+                    id: "tu1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                },
+            ],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn maps_roles_and_merges_adjacent_users() {
+        let tool_msg = Message {
+            id: "t".into(),
+            role: Role::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_call_id: "tu1".into(),
+                content: "fn main() {}".into(),
+                is_error: false,
+            }],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        };
+        let msgs = vec![
+            Message::text(Role::User, "read a.rs"),
+            assistant_tool_msg(),
+            tool_msg,
+        ];
+        let out = to_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"][1]["type"], "tool_use");
+        assert_eq!(out[1]["content"][1]["input"]["path"], "a.rs");
+        // tool 结果并入 user 角色
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["type"], "tool_result");
+        assert_eq!(out[2]["content"][0]["tool_use_id"], "tu1");
+    }
+
+    #[test]
+    fn merges_consecutive_same_role() {
+        let msgs = vec![
+            Message::text(Role::User, "one"),
+            Message {
+                id: "t".into(),
+                role: Role::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_call_id: "x".into(),
+                    content: "two".into(),
+                    is_error: true,
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        let out = to_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["content"][1]["is_error"], true);
+    }
+
+    #[test]
+    fn parses_text_and_tool_use() {
+        let v = serde_json::json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu9", "name": "bash",
+                 "input": {"command": "ls"}},
+            ],
+            "stop_reason": "tool_use",
+        });
+        let r = parse_anthropic_response(v).unwrap();
+        assert_eq!(r.stop_reason, "tool_use");
+        assert_eq!(r.message.blocks.len(), 2);
+        match &r.message.blocks[1] {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "tu9");
+                assert_eq!(name, "bash");
+                assert_eq!(arguments["command"], "ls");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn error_payload_is_surfaced() {
+        let v = serde_json::json!({"type": "error",
+            "error": {"type": "invalid_request", "message": "bad key"}});
+        assert_eq!(error_text(&v), Some("bad key"));
+        assert!(parse_anthropic_response(v).is_err());
+    }
+
+    #[tokio::test]
+    async fn accumulator_assembles_text_and_tool_use() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut acc = AnthropicAccumulator::default();
+        async fn feed(
+            acc: &mut AnthropicAccumulator,
+            tx: &tokio::sync::mpsc::Sender<super::super::StreamEvent>,
+            e: &str,
+            d: serde_json::Value,
+        ) {
+            acc.apply_event(e, &d, tx).await;
+        }
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_start",
+            serde_json::json!({"index": 0,
+            "content_block": {"type": "text"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 0,
+            "delta": {"type": "text_delta", "text": "hi"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_start",
+            serde_json::json!({"index": 1,
+            "content_block": {"type": "tool_use", "id": "tu1", "name": "read"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "\"a.rs\"}"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "message_delta",
+            serde_json::json!({"delta": {"stop_reason": "tool_use"}}),
+        )
+        .await;
+        drop(tx);
+        let mut deltas = vec![];
+        while let Some(d) = rx.recv().await {
+            deltas.push(d);
+        }
+        // 只有文本进 delta 通道
+        assert_eq!(deltas.len(), 1);
+        let r = acc.finish("end_turn");
+        assert_eq!(r.stop_reason, "tool_use");
+        assert_eq!(r.message.blocks.len(), 2);
+        match &r.message.blocks[1] {
+            ContentBlock::ToolCall { arguments, .. } => {
+                assert_eq!(arguments["path"], "a.rs");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+}
