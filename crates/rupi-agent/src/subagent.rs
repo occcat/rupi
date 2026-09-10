@@ -99,6 +99,9 @@ pub struct SubagentTool {
     skills: Arc<SkillRegistry>,
     max_turns: u32,
     plan_mode: bool,
+    /// 父会话思考强度快照（构造时传入；`run_subagents` 扇出走 agent clone 自动继承，
+    /// 这里委托工具自建循环，需显式透传，否则子任务永远跑 provider 默认档）。
+    thinking: Option<rupi_llm::ThinkingLevel>,
     depth: u8,
     max_depth: u8,
 }
@@ -121,6 +124,7 @@ impl SubagentTool {
             skills,
             max_turns,
             plan_mode: false,
+            thinking: None,
             depth: 0,
             max_depth: 2,
         }
@@ -134,6 +138,11 @@ impl SubagentTool {
 
     pub fn with_plan_mode(mut self, plan_mode: bool) -> Self {
         self.plan_mode = plan_mode;
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Option<rupi_llm::ThinkingLevel>) -> Self {
+        self.thinking = thinking;
         self
     }
 }
@@ -179,13 +188,17 @@ impl rupi_tools::Tool for SubagentTool {
                 skills: self.skills.clone(),
                 max_turns: self.max_turns,
                 plan_mode: self.plan_mode,
+                thinking: self.thinking,
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
             }) as Arc<dyn rupi_tools::Tool>);
         } else {
             child_registry.unregister(SUBAGENT_TOOL_NAME);
         }
-        let agent = AgentLoop::new(self.max_turns).with_plan_mode(self.plan_mode);
+        let mut agent = AgentLoop::new(self.max_turns).with_plan_mode(self.plan_mode);
+        if let Some(t) = self.thinking {
+            agent = agent.with_thinking(t);
+        }
         let mut session = SessionTree::new();
         fn noop(_: AgentEvent) {}
         let reason = agent
@@ -253,6 +266,58 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("sub done"));
+    }
+
+    /// 子任务思考强度透传：父档位进子循环请求，默认 None 不干预。
+    #[tokio::test]
+    async fn thinking_level_reaches_child_loop() {
+        struct Capture {
+            seen: std::sync::Mutex<Vec<Option<rupi_llm::ThinkingLevel>>>,
+        }
+        #[async_trait::async_trait]
+        impl rupi_llm::LlmProvider for Capture {
+            fn name(&self) -> &str {
+                "capture"
+            }
+            async fn complete(
+                &self,
+                req: rupi_llm::ChatRequest,
+            ) -> anyhow::Result<rupi_llm::ChatResponse> {
+                self.seen.lock().unwrap().push(req.thinking);
+                Ok(MockProvider::text_response("sub done"))
+            }
+        }
+        async fn run_with(
+            thinking: Option<rupi_llm::ThinkingLevel>,
+        ) -> Vec<Option<rupi_llm::ThinkingLevel>> {
+            let cap = Arc::new(Capture {
+                seen: std::sync::Mutex::new(vec![]),
+            });
+            let tool = SubagentTool::new(
+                cap.clone() as Arc<dyn rupi_llm::LlmProvider>,
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(MemoryManager::new(MemoryStore::new(
+                    std::env::temp_dir().join("rupi-sub-think"),
+                ))),
+                FrozenMemory::default(),
+                Arc::new(SkillRegistry::default()),
+                2,
+            )
+            .with_thinking(thinking);
+            let out = tool
+                .execute(serde_json::json!({"goal": "x"}))
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let seen = cap.seen.lock().unwrap().clone();
+            assert!(!seen.is_empty());
+            seen
+        }
+        assert_eq!(
+            run_with(Some(rupi_llm::ThinkingLevel::High)).await,
+            vec![Some(rupi_llm::ThinkingLevel::High)]
+        );
+        assert_eq!(run_with(None).await, vec![None]);
     }
 
     #[tokio::test]
