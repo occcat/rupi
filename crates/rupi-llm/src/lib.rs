@@ -248,10 +248,11 @@ impl SseAccumulator {
             Some(d) => d,
             None => return,
         };
-        if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
+        if let Some(content) = delta.get("content") {
+            let t = extract_text(content);
             if !t.is_empty() {
-                self.text.push_str(t);
-                let _ = tx.send(StreamEvent::TextDelta(t.to_string())).await;
+                self.text.push_str(&t);
+                let _ = tx.send(StreamEvent::TextDelta(t)).await;
             }
         }
         if let Some(frags) = delta.get("tool_calls").and_then(|c| c.as_array()) {
@@ -315,18 +316,54 @@ impl SseAccumulator {
     }
 }
 
+/// 提取消息文本：兼容 string / content-parts 数组（OpenAI `[{type:text}]`、
+/// 经 OpenRouter 等网关的 Anthropic 风格）/ null。数组外未知形状忽略，不丢整段。
+pub fn extract_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                if let Some(s) = p.as_str() {
+                    return Some(s.to_string());
+                }
+                let t = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if t == "text" {
+                    p.get("text").and_then(|x| x.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// 解析工具参数：标准为 JSON 字符串；部分兼容服务直接给对象，原样采用；
+/// 字符串解析失败回 `{}`（调用方报未知参数而非崩溃）。
+pub fn parse_arguments(raw: &serde_json::Value) -> serde_json::Value {
+    match raw {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+        }
+        serde_json::Value::Object(_) => raw.clone(),
+        _ => serde_json::json!({}),
+    }
+}
+
 fn parse_openai_response(v: serde_json::Value) -> anyhow::Result<ChatResponse> {
     let choice = v
         .pointer("/choices/0/message")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("bad openai response: {v}"))?;
     let mut blocks = vec![];
-    if let Some(text) = choice.get("content").and_then(|c| c.as_str()) {
-        if !text.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: text.to_string(),
-            });
-        }
+    let text = choice
+        .get("content")
+        .map(extract_text)
+        .unwrap_or_default();
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text { text });
     }
     if let Some(calls) = choice.get("tool_calls").and_then(|c| c.as_array()) {
         for c in calls {
@@ -340,12 +377,10 @@ fn parse_openai_response(v: serde_json::Value) -> anyhow::Result<ChatResponse> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let args_str = c
+            let arguments = c
                 .pointer("/function/arguments")
-                .and_then(|s| s.as_str())
-                .unwrap_or("{}");
-            let arguments: serde_json::Value =
-                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                .map(parse_arguments)
+                .unwrap_or(serde_json::json!({}));
             blocks.push(ContentBlock::ToolCall {
                 id,
                 name,
@@ -520,5 +555,58 @@ mod tests {
         }
         assert!(n >= 2);
         assert_eq!(all, "abcdefghij12345");
+    }
+
+    #[test]
+    fn extract_text_handles_parts_array_and_null() {
+        assert_eq!(extract_text(&serde_json::json!("hi")), "hi");
+        assert_eq!(
+            extract_text(&serde_json::json!([
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {}},
+                "b"
+            ])),
+            "ab"
+        );
+        assert_eq!(extract_text(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn parse_openai_response_keeps_array_content_and_object_args() {
+        let v = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}],
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": {"name": "read", "arguments": {"path": "a"}}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let r = parse_openai_response(v).unwrap();
+        let texts: Vec<&str> = r
+            .message
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                rupi_core::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hello world"]);
+        let (_, args) = r
+            .message
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                rupi_core::ContentBlock::ToolCall { name, arguments, .. } => {
+                    Some((name.clone(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .expect("tool call rebuilt");
+        assert_eq!(args["path"], serde_json::json!("a"));
     }
 }
