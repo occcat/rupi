@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "echo": {
+      "command": "python3",
+      "args": ["crates/rupi-mcp/tests/echo_server.py"]
+    }
+  }
+}

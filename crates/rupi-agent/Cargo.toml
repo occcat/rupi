@@ -1,0 +1,29 @@
+[package]
+name = "rupi-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pi-style agent runtime: tool loop, sessions, compaction, coding tools"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+ignore.workspace = true
+regex.workspace = true
+rupi-ai = { path = "../rupi-ai" }
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

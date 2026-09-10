@@ -1,0 +1,8 @@
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "compaction": { "enabled": true, "reserve_tokens": 16384 },
+  "memory": { "enabled": true, "write_approval": false },
+  "skills": { "self_accumulate": true, "write_approval": false },
+  "mcp": { "direct_tools": true }
+}

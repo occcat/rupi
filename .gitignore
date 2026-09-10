@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.rupi/
+*.db
+.idea/
+.vscode/
+.DS_Store

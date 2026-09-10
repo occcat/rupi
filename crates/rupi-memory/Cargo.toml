@@ -1,0 +1,22 @@
+[package]
+name = "rupi-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hermes-style persistent memory: MEMORY.md, USER.md, FTS session recall"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+regex.workspace = true
+rupi-agent = { path = "../rupi-agent" }
+rupi-ai = { path = "../rupi-ai" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
