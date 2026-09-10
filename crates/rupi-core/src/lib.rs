@@ -178,11 +178,21 @@ impl SessionTree {
     }
 
     /// 分叉：从 `from_node` 切出一条新游标（side-quest 修工具不污染主上下文）。
+    /// 压缩边界随动：摘要覆盖点落在分叉路径内才继承，否则清零——否则分叉会带着
+    /// 描述“别人家历史”的摘要进 prompt（上游 #8990 同类），缺失时宁可重压。
     pub fn branch_from(&self, from_node: &str) -> Option<Self> {
         let idx = self.current_path.iter().position(|id| id == from_node)?;
         let mut forked = self.clone();
         forked.id = Uuid::new_v4().to_string();
         forked.current_path = self.current_path[..=idx].to_vec();
+        if forked
+            .summary_through
+            .as_ref()
+            .is_some_and(|t| !forked.current_path.contains(t))
+        {
+            forked.summary = None;
+            forked.summary_through = None;
+        }
         Some(forked)
     }
 
@@ -453,6 +463,23 @@ mod tests {
         assert_eq!(w.len(), 3);
         assert!(w[0].full_text().contains("early stuff"));
         assert!(w[2].full_text().contains("msg 4"));
+    }
+
+    #[test]
+    fn branch_from_drops_out_of_path_summary() {
+        let mut s = SessionTree::new();
+        for i in 0..5 {
+            s.push(Message::text(Role::User, format!("msg {i}")));
+        }
+        let through = s.current_path[2].clone();
+        s.set_summary("early stuff".into(), through);
+        // 从摘要覆盖点之前分叉：摘要描述的是“别人家历史”，必须清零。
+        let early = s.branch_from(&s.current_path[0].clone()).unwrap();
+        assert!(early.summary.is_none());
+        assert!(early.summary_through.is_none());
+        // 从覆盖点之后分叉：路径仍包含覆盖点，摘要保留。
+        let late = s.branch_from(&s.current_path[4].clone()).unwrap();
+        assert!(late.summary.as_deref() == Some("early stuff"));
     }
 
     #[test]
