@@ -515,6 +515,9 @@ impl AgentLoop {
                 provider: None,
                 created_at: chrono::Utc::now(),
             });
+            // 轮中压实：大工具结果可能一步冲破阈值，必须在下一轮送模型前摘要，
+            // 否则超窗历史先发出去才壓缩（上游 #6879 同修）。
+            self.maybe_compress(provider, session, mem).await;
             on_event(AgentEvent::TurnEnd {
                 turn,
                 stop_reason: StopReason::Done,
@@ -781,6 +784,56 @@ mod tests {
         // 兜底摘要照样落盘，窗口照样缩小
         assert!(session.summary.is_some());
         assert_eq!(session.prompt_history(1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mid_run_compresses_after_big_tool_result() {
+        use rupi_core::ContentBlock;
+        // 剧本：工具调用（未知工具→error 结果撑大历史）→ 轮中摘要 → 收尾文本
+        let script = vec![
+            ChatResponse {
+                message: Message {
+                    id: "a".into(),
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "nope-missing-tool".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    provider: None,
+                    created_at: chrono::Utc::now(),
+                },
+                stop_reason: "tool_calls".into(),
+            },
+            MockProvider::text_response("MID-SUMMARY of tool work"),
+            MockProvider::text_response("final"),
+        ];
+        let provider = MockProvider::new(script);
+        let agent = AgentLoop::new(5).with_compression(10, 1);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-midrun");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        // 工具结果入历史后、第二轮送模型前已压出摘要（上游 #6879 语义）
+        assert!(session
+            .summary
+            .as_ref()
+            .expect("mid-run summary set")
+            .contains("MID-SUMMARY"));
     }
 
     #[tokio::test]
