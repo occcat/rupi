@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """最小 fake MCP server：stdio 上换行分隔 JSON-RPC 2.0。
 
-实现 initialize / notifications/initialized / tools/list / tools/call(echo, fail)，
+实现 initialize / notifications/initialized / tools/list / tools/call(echo, fail) /
+resources/list + resources/read（单个静态文本资源），
 供 rupi-mcp 集成测试做真实子进程联调。
 """
 
@@ -118,6 +119,48 @@ def main():
                         "jsonrpc": "2.0",
                         "id": rid,
                         "error": {"code": -32602, "message": "unknown tool"},
+                    }
+                )
+        elif method == "resources/list":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "result": {
+                        "resources": [
+                            {
+                                "uri": "test://notes/hello",
+                                "name": "hello-notes",
+                                "mimeType": "text/plain",
+                            }
+                        ]
+                    },
+                }
+            )
+        elif method == "resources/read":
+            uri = req.get("params", {}).get("uri", "")
+            if uri == "test://notes/hello":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": "text/plain",
+                                    "text": "HELLO-RESOURCE-CONTENT",
+                                }
+                            ]
+                        },
+                    }
+                )
+            else:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {"code": -32602, "message": "unknown resource"},
                     }
                 )
         else:

@@ -1,5 +1,6 @@
 //! rupi-mcp: MCP-Direct 桥（Pi 官方立场：core 无 MCP，能力走扩展）。
-//! 实现 `spawn server → initialize → tools/list → registerTool` 全链路：
+//! 实现 `spawn server → initialize → tools/list → registerTool` 全链路，
+//! 外加 `resources/list → resources/read`（每 server 一个 `{server}_read_resource` 原生工具）：
 //! stdio 上跑换行分隔的 JSON-RPC 2.0，30s 超时，`sanitize_params` 把 LLM 传回的
 //! string 宽容转回 boolean/number，`prompt_snippet` 必填否则 agent 看不见工具。
 
@@ -357,6 +358,79 @@ pub struct McpToolResult {
     pub structured: Option<serde_json::Value>,
 }
 
+/// MCP 资源描述（`resources/list` 条目）：uri 唯一定位，name/mime 供展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    pub mime_type: Option<String>,
+}
+
+impl McpBridge {
+    /// `resources/list`（支持 cursor 分页）→ 全部资源。
+    pub async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
+        let mut out = vec![];
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(c) = cursor {
+                params["cursor"] = serde_json::json!(c);
+            }
+            let result = self.call("resources/list", params).await?;
+            if let Some(arr) = result.get("resources").and_then(|r| r.as_array()) {
+                for r in arr {
+                    out.push(McpResource {
+                        uri: r
+                            .get("uri")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        name: r
+                            .get("name")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        mime_type: r
+                            .get("mimeType")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                    });
+                }
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `resources/read`：把 contents 里的 text 拼起来回给模型；未知 uri 走协议 error。
+    pub async fn read_resource(&self, uri: &str) -> anyhow::Result<String> {
+        let result = self
+            .call("resources/read", serde_json::json!({"uri": uri}))
+            .await?;
+        let text = result
+            .get("contents")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| result.to_string());
+        Ok(text)
+    }
+}
+
 /// 把 MCP 工具转成 Pi 原生工具定义。`prompt_snippet` 必填——没有它 agent 看不见工具。
 pub fn mcp_tool_to_definition(prefix: &str, tool: &McpTool) -> ToolDefinition {
     ToolDefinition {
@@ -373,6 +447,73 @@ pub fn mcp_tool_to_definition(prefix: &str, tool: &McpTool) -> ToolDefinition {
                 &tool.description
             }
         )),
+    }
+}
+
+/// MCP 资源读取器：每 server 注册一个 `{server}_read_resource` 原生工具。
+/// description 内嵌注册时列出的可用 URI（模型不用猜）；执行期按 uri 直读远端。
+/// 桥断了也不崩主循环：转成 tool error 回给模型（与 McpToolExecutor 同策略）。
+pub struct McpResourceReader {
+    definition: ToolDefinition,
+    bridge: Arc<McpBridge>,
+}
+
+impl McpResourceReader {
+    pub fn tool_name(server: &str) -> String {
+        format!("{server}_read_resource")
+    }
+
+    pub fn new(server: &str, bridge: Arc<McpBridge>, resources: &[McpResource]) -> Self {
+        let uris = resources
+            .iter()
+            .map(|r| r.uri.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let description = if uris.is_empty() {
+            format!("Read an MCP resource from server '{server}' by URI.")
+        } else {
+            format!("Read an MCP resource from server '{server}' by URI. Available: {uris}")
+        };
+        Self {
+            definition: ToolDefinition {
+                name: Self::tool_name(server),
+                description,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"uri": {"type": "string"}},
+                    "required": ["uri"],
+                }),
+                prompt_snippet: Some(format!(
+                    "read_resource (MCP via {server}): read a server-provided resource by URI"
+                )),
+            },
+            bridge,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rupi_tools::Tool for McpResourceReader {
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        let uri = arguments.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+        if uri.is_empty() {
+            return Ok(rupi_tools::ToolOutput::err(
+                "missing required argument: uri",
+            ));
+        }
+        match self.bridge.read_resource(uri).await {
+            Ok(text) => Ok(rupi_tools::ToolOutput::ok(text)),
+            Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                "MCP resource read failed: {e:#}"
+            ))),
+        }
     }
 }
 
@@ -474,6 +615,30 @@ impl McpManager {
                 }
                 Err(e) => {
                     tracing::warn!("MCP tools/list failed for '{}': {e:#}", entry.config.name)
+                }
+            }
+            // 资源读入口：每 server 一个 `{server}_read_resource`，description 自带可用 URI。
+            // resources/list 失败只跳过自己（与工具侧同等的失败隔离），无资源也不注册空工具。
+            match entry.bridge.list_resources().await {
+                Ok(resources) if !resources.is_empty() => {
+                    let name = McpResourceReader::tool_name(&entry.config.name);
+                    if registered.contains(&name) {
+                        tracing::warn!("MCP tool name conflict: {name}; first wins");
+                    } else {
+                        registry.register(Arc::new(McpResourceReader::new(
+                            &entry.config.name,
+                            entry.bridge.clone(),
+                            &resources,
+                        )));
+                        registered.push(name);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "MCP resources/list failed for '{}': {e:#}",
+                        entry.config.name
+                    )
                 }
             }
         }

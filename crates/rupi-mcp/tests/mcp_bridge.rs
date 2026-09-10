@@ -41,6 +41,64 @@ async fn bridge_lists_and_calls_tools() {
 }
 
 #[tokio::test]
+async fn bridge_lists_and_reads_resources() {
+    let bridge = rupi_mcp::McpBridge::spawn(fake_config())
+        .await
+        .expect("spawn");
+    let resources = bridge.list_resources().await.expect("list");
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].uri, "test://notes/hello");
+    assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+
+    let text = bridge
+        .read_resource("test://notes/hello")
+        .await
+        .expect("read");
+    assert_eq!(text, "HELLO-RESOURCE-CONTENT");
+
+    // 未知 uri 走协议 error（Err），不伪装成空文本
+    assert!(bridge.read_resource("test://notes/missing").await.is_err());
+}
+
+#[tokio::test]
+async fn manager_registers_resource_reader_as_native() {
+    let configs = vec![fake_config()];
+    let manager = McpManager::spawn_all(&configs).await.expect("spawn all");
+    let mut registry = ToolRegistry::with_builtins();
+    let names = manager.register_all(&mut registry).await;
+    assert!(names.contains(&"fake_read_resource".to_string()));
+
+    // description 自带可用 URI（模型不用猜），原生执行真读远端
+    let defs = registry.definitions();
+    let reader_def = defs
+        .iter()
+        .find(|d| d.name == "fake_read_resource")
+        .unwrap();
+    assert!(reader_def.prompt_snippet.is_some());
+    assert!(
+        reader_def.description.contains("test://notes/hello"),
+        "description 未内嵌可用 URI: {}",
+        reader_def.description
+    );
+
+    let tool: Arc<dyn Tool> = Arc::new(rupi_mcp::McpResourceReader::new(
+        "fake",
+        manager.entries[0].bridge.clone(),
+        &[],
+    ));
+    let out = tool
+        .execute(serde_json::json!({"uri": "test://notes/hello"}))
+        .await
+        .expect("exec");
+    assert!(!out.is_error);
+    assert_eq!(out.content, "HELLO-RESOURCE-CONTENT");
+
+    // 缺 uri 参数与未知资源都转 tool error，不抛
+    let out = tool.execute(serde_json::json!({})).await.expect("exec");
+    assert!(out.is_error);
+}
+
+#[tokio::test]
 async fn manager_registers_remote_tools_as_native() {
     let configs = vec![fake_config()];
     let manager = McpManager::spawn_all(&configs).await.expect("spawn all");
