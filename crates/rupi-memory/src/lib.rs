@@ -272,6 +272,15 @@ impl MemoryManager {
         }
     }
 
+    /// 压缩前钩子（Hermes `_compress_context` 对齐）：给外部 provider 落盘/收尾机会，失败只 warning。
+    pub async fn pre_compress_all(&self) {
+        if let Some(e) = &self.external {
+            if let Err(err) = e.on_pre_compress().await {
+                tracing::warn!("memory pre_compress failed: {err:#}");
+            }
+        }
+    }
+
     pub async fn handle_tool_call(
         &self,
         name: &str,

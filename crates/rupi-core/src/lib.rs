@@ -87,6 +87,9 @@ pub struct SessionTree {
     pub nodes: HashMap<String, SessionNode>,
     /// 从 root 到当前游标的节点 id 链
     pub current_path: Vec<String>,
+    /// 压缩摘要：覆盖 `summary_through` 之前全部历史；prompt 只带摘要 + 近期窗口
+    pub summary: Option<String>,
+    pub summary_through: Option<String>,
 }
 
 impl SessionTree {
@@ -95,6 +98,8 @@ impl SessionTree {
             id: Uuid::new_v4().to_string(),
             nodes: HashMap::new(),
             current_path: vec![],
+            summary: None,
+            summary_through: None,
         }
     }
 
@@ -120,6 +125,33 @@ impl SessionTree {
             .iter()
             .filter_map(|id| self.nodes.get(id).map(|n| &n.message))
             .collect()
+    }
+
+    /// 历史总字符数（压缩触发依据）。
+    pub fn history_chars(&self) -> usize {
+        self.history().iter().map(|m| m.full_text().len()).sum()
+    }
+
+    /// 记录压缩摘要：`through` 为摘要覆盖到的最后一个节点 id。
+    pub fn set_summary(&mut self, summary: String, through: String) {
+        self.summary = Some(summary);
+        self.summary_through = Some(through);
+    }
+
+    /// prompt 用窗口：无摘要时全量；有摘要时 `[摘要, 近 keep_last 条]`。
+    /// 树本身不动，rewind/branch 语义不受影响。
+    pub fn prompt_history(&self, keep_last: usize) -> Vec<Message> {
+        let all: Vec<Message> = self.history().into_iter().cloned().collect();
+        let Some(summary) = &self.summary else {
+            return all;
+        };
+        let start = all.len().saturating_sub(keep_last);
+        let mut out = vec![Message::text(
+            Role::System,
+            format!("[Conversation summary so far]\n{summary}"),
+        )];
+        out.extend(all[start..].iter().cloned());
+        out
     }
 
     /// 分叉：从 `from_node` 切出一条新游标（side-quest 修工具不污染主上下文）。
@@ -229,6 +261,23 @@ mod tests {
         assert_eq!(s.history().len(), 1);
         let forked = s.branch_from(&a).expect("branch");
         assert_eq!(forked.history().len(), 1);
+    }
+
+    #[test]
+    fn prompt_history_uses_summary_plus_window() {
+        let mut s = SessionTree::new();
+        for i in 0..5 {
+            s.push(Message::text(Role::User, format!("msg {i}")));
+        }
+        // 无摘要：全量
+        assert_eq!(s.prompt_history(2).len(), 5);
+        let through = s.current_path[2].clone();
+        s.set_summary("early stuff".into(), through);
+        // 有摘要：1 条摘要 + 近 2 条
+        let w = s.prompt_history(2);
+        assert_eq!(w.len(), 3);
+        assert!(w[0].full_text().contains("early stuff"));
+        assert!(w[2].full_text().contains("msg 4"));
     }
 
     #[test]

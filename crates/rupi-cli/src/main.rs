@@ -58,6 +58,12 @@ struct Cli {
     /// 把 review 建议直接落盘（memory add + skill 草稿）
     #[arg(long, default_value_t = false)]
     review_apply: bool,
+    /// 会话压缩阈值（历史字符数，超限摘要最旧部分）
+    #[arg(long, default_value_t = 60_000)]
+    compress_threshold: usize,
+    /// 压缩后保留的近期消息条数
+    #[arg(long, default_value_t = 20)]
+    compress_keep: usize,
 }
 
 #[derive(Subcommand)]
@@ -186,7 +192,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let provider = build_provider(&cli.model).await?;
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
-    let mut agent = AgentLoop::new(cli.max_turns);
+    let mut agent =
+        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
     if cli.review || cli.review_apply {
         let pending_clone = pending.clone();
         agent = agent.with_reviewer(

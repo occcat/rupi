@@ -57,6 +57,9 @@ pub struct AgentLoop {
     /// 后台 review：主循环结束后安静复盘，提炼记忆/Skill 建议。默认关闭。
     pub reviewer: Option<Arc<dyn Reviewer>>,
     pub on_suggestion: Option<Arc<dyn Fn(ReviewSuggestion) + Send + Sync>>,
+    /// 会话压缩：历史超 `compress_threshold_chars` 时摘要最旧部分，只把摘要 + 近期送模型。
+    pub compress_threshold_chars: usize,
+    pub compress_keep_last: usize,
 }
 
 impl AgentLoop {
@@ -68,6 +71,8 @@ impl AgentLoop {
             ),
             reviewer: None,
             on_suggestion: None,
+            compress_threshold_chars: 60_000,
+            compress_keep_last: 20,
         }
     }
 
@@ -78,6 +83,12 @@ impl AgentLoop {
     ) -> Self {
         self.reviewer = Some(reviewer);
         self.on_suggestion = Some(on_suggestion);
+        self
+    }
+
+    pub fn with_compression(mut self, threshold_chars: usize, keep_last: usize) -> Self {
+        self.compress_threshold_chars = threshold_chars;
+        self.compress_keep_last = keep_last;
         self
     }
 
@@ -96,6 +107,8 @@ impl AgentLoop {
         on_event: &dyn Fn(AgentEvent),
     ) -> anyhow::Result<StopReason> {
         session.push(Message::text(Role::User, user_input));
+        // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
+        self.maybe_compress(provider, session, mem).await;
         // 记忆 prefetch：注入到本轮（不污染冻结快照）
         let recalled = mem.prefetch_all().await;
         let mut system = self
@@ -108,7 +121,7 @@ impl AgentLoop {
         let mut tool_names: Vec<String> = vec![];
         for turn in 1..=self.max_turns {
             on_event(AgentEvent::TurnStart { turn });
-            let history: Vec<Message> = session.history().into_iter().cloned().collect();
+            let history: Vec<Message> = session.prompt_history(self.compress_keep_last);
             let req = ChatRequest {
                 system: system.clone(),
                 messages: history,
@@ -116,22 +129,30 @@ impl AgentLoop {
                 max_tokens: None,
                 temperature: Some(0.2),
             };
-            let resp = provider.complete(req).await?;
+            // 流式补全：delta 到达即推 TextDelta（TUI 逐字渲染），最终仍得完整响应
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<rupi_llm::StreamEvent>(64);
+            let fut = provider.complete_streaming(req, tx);
+            tokio::pin!(fut);
+            let resp = loop {
+                tokio::select! {
+                    r = &mut fut => break r?,
+                    msg = rx.recv() => match msg {
+                        Some(rupi_llm::StreamEvent::TextDelta(delta)) => {
+                            on_event(AgentEvent::TextDelta { delta });
+                        }
+                        None => continue,
+                    },
+                }
+            };
+            // select 竞速可能提前 break，排空残留 delta 保顺序完整
+            while let Ok(rupi_llm::StreamEvent::TextDelta(delta)) = rx.try_recv() {
+                on_event(AgentEvent::TextDelta { delta });
+            }
             let has_calls = resp
                 .message
                 .blocks
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolCall { .. }));
-            // 文本增量事件
-            for b in &resp.message.blocks {
-                if let ContentBlock::Text { text } = b {
-                    if !text.is_empty() {
-                        on_event(AgentEvent::TextDelta {
-                            delta: text.clone(),
-                        });
-                    }
-                }
-            }
             session.push(resp.message.clone());
 
             if !has_calls {
@@ -211,6 +232,68 @@ impl AgentLoop {
             });
         }
         Ok(StopReason::MaxTurns)
+    }
+
+    /// 会话压缩：历史超阈值时，用 provider 把最旧部分摘要掉；失败则启发式兜底。永不抛错。
+    pub async fn maybe_compress(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+    ) {
+        if session.history_chars() <= self.compress_threshold_chars {
+            return;
+        }
+        let total = session.current_path.len();
+        if total <= self.compress_keep_last {
+            return;
+        }
+        let cut = total - self.compress_keep_last;
+        let chunk: Vec<String> = session.history()[..cut]
+            .iter()
+            .map(|m| m.full_text())
+            .collect();
+        let through = session.current_path[cut - 1].clone();
+        // 先给外部记忆落盘/收尾机会（Hermes on_pre_compress）
+        mem.pre_compress_all().await;
+
+        let mut input = String::new();
+        if let Some(old) = &session.summary {
+            input.push_str(&format!("Previous summary:\n{old}\n\nNew messages:\n"));
+        }
+        input.push_str(&chunk.join("\n---\n"));
+        let req = ChatRequest {
+            system: "Summarize this conversation prefix concisely. Keep durable facts, decisions, and open loops. Be brief.".into(),
+            messages: vec![Message::text(Role::User, input)],
+            tools: vec![],
+            max_tokens: None,
+            temperature: Some(0.0),
+        };
+        let summary = match provider.complete(req).await {
+            Ok(r) => r.message.full_text(),
+            Err(e) => {
+                tracing::warn!("summarization failed, heuristic fallback: {e:#}");
+                // 兜底：每条取首行拼接，保证窗口一定能缩小
+                chunk
+                    .iter()
+                    .take(10)
+                    .map(|t| {
+                        t.lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+        session.set_summary(summary, through);
+        tracing::info!(
+            "session compressed: {total} msgs, kept last {}",
+            self.compress_keep_last
+        );
     }
 
     /// 后台 review：主流程结束后安静复盘，非空建议推给 `on_suggestion`。永不抛错。
@@ -293,5 +376,74 @@ mod tests {
             .unwrap();
         assert!(matches!(reason, StopReason::Done));
         assert!(session.history().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn compress_summarizes_prefix_and_shrinks_window() {
+        // 剧本：首个 complete 是压缩摘要，第二个是正常回合答复
+        let provider = MockProvider::new(vec![
+            MockProvider::text_response("SUMMARY: talked about tea"),
+            MockProvider::text_response("hello"),
+        ]);
+        let agent = AgentLoop::new(3).with_compression(50, 2);
+        let mut session = SessionTree::new();
+        for i in 0..6 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-compress");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let frozen = FrozenMemory::default();
+        let skills = SkillRegistry::default();
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &frozen,
+                &skills,
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let summary = session.summary.as_ref().expect("summary set");
+        assert!(summary.contains("SUMMARY"));
+        // 树全量保留，prompt 窗口缩小
+        assert!(session.history().len() >= 8);
+        assert!(session.prompt_history(2).len() <= 4);
+    }
+
+    #[tokio::test]
+    async fn compress_falls_back_when_provider_fails() {
+        struct Fail;
+        #[async_trait::async_trait]
+        impl rupi_llm::LlmProvider for Fail {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            async fn complete(&self, _req: ChatRequest) -> anyhow::Result<rupi_llm::ChatResponse> {
+                anyhow::bail!("down")
+            }
+        }
+        let agent = AgentLoop::new(3).with_compression(10, 1);
+        let mut session = SessionTree::new();
+        for i in 0..4 {
+            session.push(Message::text(
+                Role::User,
+                format!("message {i} padding yyyyy"),
+            ));
+        }
+        let home = std::env::temp_dir().join("rupi-agent-compress-fb");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent.maybe_compress(&Fail, &mut session, &mem).await;
+        // 兜底摘要照样落盘，窗口照样缩小
+        assert!(session.summary.is_some());
+        assert_eq!(session.prompt_history(1).len(), 2);
     }
 }
