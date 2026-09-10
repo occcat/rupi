@@ -121,7 +121,7 @@ impl rupi_tools::Tool for ExternalTool {
             }
         }
         let out = tokio::time::timeout(
-            std::time::Duration::from_secs(m.timeout_secs),
+            std::time::Duration::from_secs(m.timeout_secs.max(1)),
             child.wait_with_output(),
         )
         .await;
@@ -199,13 +199,14 @@ impl ExtensionSet {
     }
 
     /// 增量重载：返回 (新增/修改 manifests, 删除的工具名)。无变化返回空。
-    pub fn refresh(&mut self) -> (Vec<ExtensionManifest>, Vec<String>) {
-        let current = self.manifests();
+    /// manifest 改名视为“删旧名 + 加新名”，调用方先注销再注册，无 stale 工具。
+    pub fn refresh(&mut self) -> (Vec<ExtensionManifest>, Vec<String>) {        let current = self.manifests();
         let mut current_map = HashMap::new();
         for (key, path, mtime) in &current {
             current_map.insert(key.clone(), (*mtime, path.clone()));
         }
         let mut changed = vec![];
+        let mut removed_later = vec![];
         for (key, (mtime, path)) in &current_map {
             let stale = self
                 .snapshot
@@ -217,13 +218,19 @@ impl ExtensionSet {
             }
             match load_one(path) {
                 Ok(m) => {
+                    // 改名：旧工具名必须注销，否则 registry 里永远残留
+                    if let Some((_, old_name)) = self.snapshot.get(key) {
+                        if *old_name != m.name {
+                            removed_later.push(old_name.clone());
+                        }
+                    }
                     self.snapshot.insert(key.clone(), (*mtime, m.name.clone()));
                     changed.push(m);
                 }
                 Err(e) => tracing::warn!("skip extension {}: {e:#}", path.display()),
             }
         }
-        let mut removed = vec![];
+        let mut removed = removed_later;
         let known: Vec<String> = self.snapshot.keys().cloned().collect();
         for key in known {
             if !current_map.contains_key(&key) {
@@ -330,5 +337,36 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].description, "UPPER v2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_rename_unregisters_old_tool_name() {
+        let dir = std::env::temp_dir().join(format!("rupi-ext-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "a.json", ECHO_MANIFEST);
+        let mut set = ExtensionSet::new(dir.clone());
+        assert_eq!(set.load_all().len(), 1);
+        // 同文件改名：旧工具名必须出现在 removed，否则 registry 残留 stale 工具
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&dir, "a.json", &ECHO_MANIFEST.replace("\"upper\"", "\"shout\""));
+        let (changed, removed) = set.refresh();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].name, "shout");
+        assert_eq!(removed, vec!["upper".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_is_clamped_not_instant() {
+        let m: ExtensionManifest = serde_json::from_str(
+            r#"{"name": "z", "description": "x", "input_schema": {}, "command": "echo", "args": ["hi"], "timeout_secs": 0}"#,
+        )
+        .unwrap();
+        let out = ExternalTool::new(m)
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("hi"));
     }
 }
