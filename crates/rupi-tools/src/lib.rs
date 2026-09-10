@@ -1,4 +1,4 @@
-//! rupi-tools: Tool trait + Pi 默认四件套 Read / Write / Edit / Bash + 注册表。
+//! rupi-tools: Tool trait + Pi 默认七件套 Read / Write / Edit / Bash / Glob / Grep / Think + 注册表。
 
 use async_trait::async_trait;
 use rupi_core::ToolDefinition;
@@ -66,17 +66,21 @@ impl ToolRegistry {
         }
     }
 
-    /// 默认四件套，与 Pi 保持一致。
+    /// 默认七件套，与 Pi 保持一致（read/write/edit/bash/glob/grep/think）。
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
         r.register(Arc::new(BashTool));
+        r.register(Arc::new(GlobTool));
+        r.register(Arc::new(GrepTool));
+        r.register(Arc::new(ThinkTool));
         r
     }
 
-    /// 沙箱四件套：read/write/edit 的 `path` 约束在 `root` 内（bash/mcp/扩展进程不在此层约束）。
+    /// 沙箱七件套：read/write/edit/glob/grep 的 `path` 约束在 `root` 内
+    ///（bash/mcp/扩展进程不在此层约束；glob 的 `pattern` 另禁 `..` 与绝对路径）。
     pub fn with_sandboxed_builtins(root: &std::path::Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut r = Self::new();
@@ -93,6 +97,15 @@ impl ToolRegistry {
             root.clone(),
         )));
         r.register(Arc::new(BashTool));
+        r.register(Arc::new(SandboxedTool::new(
+            Arc::new(GlobTool),
+            root.clone(),
+        )));
+        r.register(Arc::new(SandboxedTool::new(
+            Arc::new(GrepTool),
+            root.clone(),
+        )));
+        r.register(Arc::new(ThinkTool));
         r
     }
 }
@@ -362,6 +375,207 @@ impl Tool for BashTool {
     }
 }
 
+/// 按 glob 列文件（`**/*.rs`）。`path` 为基准目录（沙箱改写到 root 内），
+/// `pattern` 禁 `..` 与绝对路径：两者配合结果恒在基准目录下。
+pub struct GlobTool;
+#[async_trait]
+impl Tool for GlobTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "glob".into(),
+            description: "List files matching a glob pattern under path (capped at 200)".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "glob like **/*.rs (no .., no absolute)"},
+                    "path": {"type": "string", "description": "base dir (default .)"}
+                },
+                "required": ["pattern"]
+            }),
+            prompt_snippet: Some("glob(pattern, path?): list matching files".into()),
+        }
+    }
+    async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if pattern.contains("..") {
+            return Ok(ToolOutput::err("glob pattern must not contain '..'"));
+        }
+        if std::path::Path::new(pattern).is_absolute() {
+            return Ok(ToolOutput::err("glob pattern must be relative"));
+        }
+        let base = arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let full = std::path::Path::new(base).join(pattern);
+        let mut hits: Vec<String> = vec![];
+        match glob::glob(&full.to_string_lossy()) {
+            Ok(paths) => {
+                for p in paths.flatten() {
+                    hits.push(p.to_string_lossy().into_owned());
+                    if hits.len() >= 200 {
+                        break;
+                    }
+                }
+            }
+            Err(e) => return Ok(ToolOutput::err(format!("bad glob pattern: {e}"))),
+        }
+        hits.sort();
+        Ok(ToolOutput::ok(hits.join("\n")))
+    }
+}
+
+/// 正则搜文件内容（`path` 文件或目录，目录递归；跳隐藏文件与二进制/超大文件，结果按行 capped）。
+pub struct GrepTool;
+#[async_trait]
+impl Tool for GrepTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "grep".into(),
+            description: "Search file contents by regex (path file or dir; capped at 50 hits)"
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "regex"},
+                    "path": {"type": "string", "description": "file or dir (default .)"},
+                    "include": {"type": "string", "description": "optional glob filter like *.rs"},
+                    "max_results": {"type": "integer", "description": "default 50, max 200"}
+                },
+                "required": ["pattern"]
+            }),
+            prompt_snippet: Some("grep(pattern, path?, include?): regex search contents".into()),
+        }
+    }
+    async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        let pat = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let re = match regex::Regex::new(pat) {
+            Ok(re) => re,
+            Err(e) => return Ok(ToolOutput::err(format!("bad regex: {e}"))),
+        };
+        let base = arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let include = arguments.get("include").and_then(|v| v.as_str());
+        let max_results = arguments
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+        let include_re = match include {
+            Some(g) => match glob::Pattern::new(g) {
+                Ok(p) => Some(p),
+                Err(e) => return Ok(ToolOutput::err(format!("bad include glob: {e}"))),
+            },
+            None => None,
+        };
+        let base_path = std::path::Path::new(base);
+        // 单文件直接读；目录 walk（跳隐藏、跳 >2MB、最多看 2000 文件防爆）
+        let mut files: Vec<std::path::PathBuf> = vec![];
+        if base_path.is_file() {
+            files.push(base_path.to_path_buf());
+        } else if base_path.is_dir() {
+            for e in walkdir::WalkDir::new(base_path)
+                .follow_links(false)
+                .into_iter()
+                .flatten()
+            {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                if p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with('.'))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                if p.metadata().map(|m| m.len() > 2 << 20).unwrap_or(true) {
+                    continue;
+                }
+                files.push(p.to_path_buf());
+                if files.len() >= 2000 {
+                    break;
+                }
+            }
+        } else {
+            return Ok(ToolOutput::err(format!("grep path not found: {base}")));
+        }
+        let mut hits: Vec<String> = vec![];
+        let mut truncated = 0usize;
+        'files: for f in &files {
+            if let Some(inc) = &include_re {
+                if !inc.matches_path(f) {
+                    continue;
+                }
+            }
+            // 非 UTF-8（二进制）直接跳过
+            let body = match std::fs::read_to_string(f) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            for (i, line) in body.lines().enumerate() {
+                if re.is_match(line) {
+                    if hits.len() >= max_results {
+                        truncated += 1;
+                        continue;
+                    }
+                    let mut l: String = line.chars().take(500).collect();
+                    if line.chars().count() > 500 {
+                        l.push('…');
+                    }
+                    hits.push(format!("{}:{}:{l}", f.to_string_lossy(), i + 1));
+                }
+            }
+            if truncated > 0 && hits.len() >= max_results {
+                break 'files;
+            }
+        }
+        let mut out = hits.join("\n");
+        if truncated > 0 {
+            out.push_str(&format!("\n...[truncated {truncated} more matches]"));
+        }
+        Ok(ToolOutput::ok(out))
+    }
+}
+
+/// 思考通道：模型写下扩展推理，无执行副作用，回固定确认（正文已在 ToolCall 历史里）。
+pub struct ThinkTool;
+#[async_trait]
+impl Tool for ThinkTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "think".into(),
+            description: "Record extended reasoning (no side effects)".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string"}
+                },
+                "required": ["thought"]
+            }),
+            prompt_snippet: Some("think(thought): reason out loud before acting".into()),
+        }
+    }
+    async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        let thought = arguments
+            .get("thought")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if thought.is_empty() {
+            return Ok(ToolOutput::err("think requires non-empty thought"));
+        }
+        Ok(ToolOutput::ok("noted."))
+    }
+}
+
 /// 工具回包有界：超限保留首尾、中部折叠并标注截掉字符数，保上下文窗口不被大输出撑爆。
 pub const MAX_TOOL_OUTPUT: usize = 12_000;
 
@@ -401,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn builtins_register_and_unknown_errors() {
         let r = ToolRegistry::with_builtins();
-        assert_eq!(r.definitions().len(), 4);
+        assert_eq!(r.definitions().len(), 7);
         let out = r.execute("nope", serde_json::json!({})).await.unwrap();
         assert!(out.is_error);
     }
@@ -556,5 +770,130 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.content, "sess-hook-test");
+    }
+
+    #[tokio::test]
+    async fn glob_finds_by_pattern_and_rejects_escapes() {
+        let dir = std::env::temp_dir().join(format!("rupi-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.rs"), "x").unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        std::fs::write(dir.join("sub/c.rs"), "x").unwrap();
+        let r = ToolRegistry::with_builtins();
+        let base = dir.to_string_lossy().to_string();
+        let out = r
+            .execute(
+                "glob",
+                serde_json::json!({"pattern": "**/*.rs", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.rs"));
+        assert!(out.content.contains("c.rs"));
+        assert!(!out.content.contains("b.txt"));
+        // `..` 与绝对 pattern 拒绝
+        let esc = r
+            .execute("glob", serde_json::json!({"pattern": "../x", "path": base}))
+            .await
+            .unwrap();
+        assert!(esc.is_error);
+        let abs = r
+            .execute(
+                "glob",
+                serde_json::json!({"pattern": "/tmp/x", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(abs.is_error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_finds_regex_skips_binary_and_bad_pattern() {
+        let dir = std::env::temp_dir().join(format!("rupi-grep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello\nneedle here\nbye\n").unwrap();
+        std::fs::write(dir.join("bin.dat"), [0u8, 159, 0, 1]).unwrap();
+        let r = ToolRegistry::with_builtins();
+        let base = dir.to_string_lossy().to_string();
+        let out = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "needle", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.txt:2:needle here"));
+        assert!(!out.content.contains("bin.dat"));
+        // 非法正则判错不炸
+        let bad = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "[unclosed", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(bad.is_error);
+        assert!(bad.content.contains("bad regex"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn think_notes_and_requires_content() {
+        let r = ToolRegistry::with_builtins();
+        let ok = r
+            .execute(
+                "think",
+                serde_json::json!({"thought": "consider edge cases first"}),
+            )
+            .await
+            .unwrap();
+        assert!(!ok.is_error);
+        assert_eq!(ok.content, "noted.");
+        let empty = r
+            .execute("think", serde_json::json!({"thought": ""}))
+            .await
+            .unwrap();
+        assert!(empty.is_error);
+    }
+
+    #[tokio::test]
+    async fn sandboxed_glob_and_grep_stay_inside_root() {
+        let root = std::env::temp_dir().join(format!("rupi-gg-sbx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("in.rs"), "needle\n").unwrap();
+        let r = ToolRegistry::with_sandboxed_builtins(&root);
+        // 相对 path 解析到 root 内，正常命中
+        let out = r
+            .execute("glob", serde_json::json!({"pattern": "*.rs", "path": "."}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("in.rs"));
+        let g = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "needle", "path": "."}),
+            )
+            .await
+            .unwrap();
+        assert!(!g.is_error, "{}", g.content);
+        assert!(g.content.contains("in.rs"));
+        // root 外绝对路径拒绝
+        let esc = r
+            .execute(
+                "glob",
+                serde_json::json!({"pattern": "*.rs", "path": "/tmp"}),
+            )
+            .await
+            .unwrap();
+        assert!(esc.is_error);
+        assert!(esc.content.contains("escapes workspace root"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
