@@ -278,6 +278,11 @@ fn run_review_apply_persists_memory() {
     );
     let mem = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap_or_default();
     assert!(mem.contains("乌龙茶"), "MEMORY.md 无复盘条目:\n{mem}");
+    // 同一轮的会话落盘也按 trigram 可查（中文会话召回不断）
+    let o = rupi(&home, &["session-search", "乌龙茶"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "session-search 非零退出: {o:?}");
+    assert!(out.contains("乌龙茶"), "会话中文未召回:\n{out}");
 }
 
 #[test]
