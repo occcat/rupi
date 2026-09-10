@@ -110,7 +110,9 @@ impl ChatView {
             }
             AgentEvent::TurnStart { .. }
             | AgentEvent::TurnEnd { .. }
-            | AgentEvent::RunEnd { .. } => {}
+            | AgentEvent::RunEnd { .. }
+            | AgentEvent::UiPromptStart { .. }
+            | AgentEvent::UiPromptEnd { .. } => {}
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }

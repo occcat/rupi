@@ -309,6 +309,17 @@ pub enum AgentEvent {
     RunEnd {
         stop_reason: StopReason,
     },
+    /// 审批问询开始（对标上游 `ui_prompt_start`）：主循环即将阻塞等人工裁决。
+    /// 宿主集成借此区分“agent 干活”与“等用户拍板”（如停转圈、记等待耗时）。
+    UiPromptStart {
+        tool: String,
+        reason: String,
+    },
+    /// 审批问询结束（对标上游 `ui_prompt_end`）：人工已裁决，循环继续。
+    UiPromptEnd {
+        tool: String,
+        approved: bool,
+    },
     Error {
         message: String,
     },

@@ -418,9 +418,30 @@ impl AgentLoop {
                             "denied by policy: {reason}"
                         ))),
                         Decision::Ask(reason) => {
+                            // 审批问询前后广播 UiPrompt 事件（对标上游 ui_prompt_start/end），
+                            // 无审批器则不问直接拒绝，此时不发事件（没有等待发生）。
                             let ok = match &self.approver {
-                                Some(a) => a.approve(&name, &args, &reason),
                                 None => false,
+                                Some(a) => {
+                                    let start = AgentEvent::UiPromptStart {
+                                        tool: name.clone(),
+                                        reason: reason.clone(),
+                                    };
+                                    on_event(start.clone());
+                                    for e in extensions {
+                                        e.on_event(&start).await?;
+                                    }
+                                    let ok = a.approve(&name, &args, &reason);
+                                    let end = AgentEvent::UiPromptEnd {
+                                        tool: name.clone(),
+                                        approved: ok,
+                                    };
+                                    on_event(end.clone());
+                                    for e in extensions {
+                                        e.on_event(&end).await?;
+                                    }
+                                    ok
+                                }
                             };
                             if ok {
                                 None
@@ -834,6 +855,68 @@ mod tests {
             .as_ref()
             .expect("mid-run summary set")
             .contains("MID-SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_events_bracket_user_decision() {
+        use rupi_core::ContentBlock;
+        struct No;
+        impl Approver for No {
+            fn approve(&self, _t: &str, _a: &serde_json::Value, _r: &str) -> bool {
+                false
+            }
+        }
+        let script = vec![
+            ChatResponse {
+                message: Message {
+                    id: "a".into(),
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                    }],
+                    provider: None,
+                    created_at: chrono::Utc::now(),
+                },
+                stop_reason: "tool_calls".into(),
+            },
+            MockProvider::text_response("done"),
+        ];
+        let provider = MockProvider::new(script);
+        let agent = AgentLoop::new(5)
+            .with_policy(Arc::new(RulePolicy {
+                ask_tools: vec!["bash".into()],
+                ..Default::default()
+            }))
+            .with_approver(Arc::new(No));
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-prompt-ev");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let events = std::sync::Mutex::new(vec![]);
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|e| {
+                    events.lock().unwrap().push(format!("{e:?}"));
+                },
+            )
+            .await
+            .unwrap();
+        let ev = events.lock().unwrap().join("\n");
+        let s = ev.find("UiPromptStart").expect("prompt start emitted");
+        let e = ev.find("UiPromptEnd").expect("prompt end emitted");
+        assert!(s < e, "start brackets end");
+        assert!(ev.contains("approved: false"));
+        assert!(ev[s..].contains("bash"));
     }
 
     #[tokio::test]
