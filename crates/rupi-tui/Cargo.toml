@@ -1,25 +1,20 @@
 [package]
-name = "rupi-cli"
+name = "rupi-tui"
 version = "0.1.0"
 edition = "2021"
-
-[[bin]]
-name = "rupi"
-path = "src/main.rs"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }
 rupi-llm = { path = "../rupi-llm" }
 rupi-tools = { path = "../rupi-tools" }
 rupi-agent = { path = "../rupi-agent" }
-rupi-mcp = { path = "../rupi-mcp" }
 rupi-memory = { path = "../rupi-memory" }
 rupi-skills = { path = "../rupi-skills" }
-rupi-tui = { path = "../rupi-tui" }
+rupi-mcp = { path = "../rupi-mcp" }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

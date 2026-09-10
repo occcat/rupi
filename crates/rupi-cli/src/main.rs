@@ -70,6 +70,8 @@ struct Cli {
 enum Cmd {
     /// 交互式聊天（默认）
     Chat,
+    /// 全屏终端界面（ratatui）
+    Tui,
     /// 显示记忆快照
     MemoryShow,
     /// 写入记忆
@@ -183,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Chat) | None => {
             run_chat(&cli, &home).await?;
+        }
+        Some(Cmd::Tui) => {
+            run_tui(&cli, &home).await?;
         }
     }
     Ok(())
@@ -298,4 +303,79 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!();
     }
     Ok(())
+}
+
+async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
+    let provider = build_provider(&cli.model).await?;
+    let mut tools = ToolRegistry::with_builtins();
+    let _mcp = if let Some(path) = &cli.mcp_config {
+        let configs = rupi_mcp::load_configs(path)?;
+        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let names = manager.register_all(&mut tools, &configs).await;
+        eprintln!("[mcp] {} tools: {}", names.len(), names.join(", "));
+        Some(manager)
+    } else {
+        None
+    };
+    let store = MemoryStore::new(home.clone());
+    let frozen = store.frozen_snapshot();
+    let mem = MemoryManager::new(store);
+    let skills = SkillRegistry::discover(&skill_dirs(home));
+    let mut session = SessionTree::new();
+    let mut agent =
+        AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
+    let review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>> = if cli.review || cli.review_apply
+    {
+        Some(Arc::new(std::sync::Mutex::new(vec![])))
+    } else {
+        None
+    };
+    if let Some(buf) = review_lines.clone() {
+        let home_clone = home.clone();
+        let apply = cli.review_apply;
+        agent = agent.with_reviewer(
+            Arc::new(HeuristicReviewer::default()),
+            Arc::new(move |s: ReviewSuggestion| {
+                let mut lines = buf.lock().unwrap();
+                for m in &s.memory_ops {
+                    lines.push(format!("[review] memory add: {}", m.entry));
+                }
+                if let Some(d) = &s.skill_draft {
+                    lines.push(format!(
+                        "[review] skill draft: {} — {}",
+                        d.name, d.description
+                    ));
+                }
+                if apply {
+                    let store = MemoryStore::new(home_clone.clone());
+                    for m in &s.memory_ops {
+                        match store.apply_write("add", &m.entry) {
+                            Ok(_) => lines.push("[review] memory saved".into()),
+                            Err(e) => lines.push(format!("[review] memory save failed: {e:#}")),
+                        }
+                    }
+                    if let Some(d) = &s.skill_draft {
+                        let acc = SkillAccumulator::new(home_clone.join("skills"));
+                        match acc.propose(&d.name, &d.description, &d.steps) {
+                            Ok(dir) => {
+                                lines.push(format!("[review] skill drafted at {}", dir.display()))
+                            }
+                            Err(e) => lines.push(format!("[review] skill draft skipped: {e:#}")),
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    let ctx = rupi_tui::TuiContext {
+        provider: provider.as_ref(),
+        agent: &agent,
+        session: &mut session,
+        tools: &tools,
+        mem: &mem,
+        frozen: &frozen,
+        skills: &skills,
+        review_lines,
+    };
+    rupi_tui::launch(ctx).await
 }

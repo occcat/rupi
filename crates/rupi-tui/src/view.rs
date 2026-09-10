@@ -1,0 +1,163 @@
+//! 纯视图逻辑（可单测）：输入缓冲 + 事件折叠成渲染行。
+
+use rupi_core::AgentEvent;
+
+/// 单行渲染内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Line {
+    User(String),
+    AssistantText(String),
+    Tool(String),
+    System(String),
+}
+
+/// 输入框：字符缓冲 + 光标（字符级，支持中文）。
+#[derive(Debug, Default)]
+pub struct InputBuffer {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+impl InputBuffer {
+    pub fn push_char(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn take(&mut self) -> String {
+        let s: String = self.chars.iter().collect();
+        self.chars.clear();
+        self.cursor = 0;
+        s
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    /// 渲染为 (光标前文本, 光标后文本)，供精确放光标。
+    pub fn split_for_render(&self) -> (String, String) {
+        (
+            self.chars[..self.cursor].iter().collect(),
+            self.chars[self.cursor..].iter().collect(),
+        )
+    }
+}
+
+/// 聊天视图：把 `AgentEvent` 流折叠为行；连续 `TextDelta` 合并进同一行。
+#[derive(Debug, Default)]
+pub struct ChatView {
+    pub lines: Vec<Line>,
+}
+
+impl ChatView {
+    pub fn push_event(&mut self, e: &AgentEvent) {
+        match e {
+            AgentEvent::TextDelta { delta } => {
+                if let Some(Line::AssistantText(last)) = self.lines.last_mut() {
+                    last.push_str(delta);
+                } else {
+                    self.lines.push(Line::AssistantText(delta.clone()));
+                }
+            }
+            AgentEvent::ToolStart { name, .. } => {
+                self.lines.push(Line::Tool(format!("◌ {name} …")));
+            }
+            AgentEvent::ToolEnd {
+                name,
+                content,
+                is_error,
+                ..
+            } => {
+                let first = content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>();
+                let mark = if *is_error { "✗" } else { "✓" };
+                self.lines
+                    .push(Line::Tool(format!("{mark} {name}: {first}")));
+            }
+            AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
+            AgentEvent::Error { message } => {
+                self.lines.push(Line::System(format!("error: {message}")));
+            }
+        }
+    }
+
+    pub fn push_user(&mut self, text: String) {
+        self.lines.push(Line::User(text));
+    }
+
+    pub fn push_system(&mut self, text: String) {
+        self.lines.push(Line::System(text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_buffer_edits_around_cursor() {
+        let mut b = InputBuffer::default();
+        for c in "你好ab".chars() {
+            b.push_char(c);
+        }
+        b.move_left();
+        b.move_left();
+        b.backspace();
+        let (pre, post) = b.split_for_render();
+        assert_eq!(pre, "你");
+        assert_eq!(post, "ab");
+        assert_eq!(b.take(), "你ab");
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn text_deltas_coalesce_and_tools_render() {
+        let mut v = ChatView::default();
+        v.push_user("hi".into());
+        v.push_event(&AgentEvent::TextDelta {
+            delta: "hel".into(),
+        });
+        v.push_event(&AgentEvent::TextDelta { delta: "lo".into() });
+        v.push_event(&AgentEvent::ToolStart {
+            tool_call_id: "1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        });
+        v.push_event(&AgentEvent::ToolEnd {
+            tool_call_id: "1".into(),
+            name: "read".into(),
+            content: "file content here".into(),
+            is_error: false,
+        });
+        v.push_event(&AgentEvent::TextDelta {
+            delta: "done".into(),
+        });
+        assert_eq!(v.lines.len(), 5);
+        assert_eq!(v.lines[1], Line::AssistantText("hello".into()));
+        assert!(matches!(v.lines[3], Line::Tool(_)));
+        assert_eq!(v.lines[4], Line::AssistantText("done".into()));
+    }
+}
