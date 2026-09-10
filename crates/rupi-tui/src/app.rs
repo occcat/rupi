@@ -2,6 +2,7 @@
 //! 并发模型：空闲外循环收键；提交后进内循环，用 `select!` 同时驱动 agent future、
 //! 排空事件 channel、响应滚动/退出——流式 delta 到达即渲染。
 
+use crate::complete;
 use crate::view::{ChatView, InputBuffer, Line};
 use anyhow::Context;
 use crossterm::{
@@ -12,10 +13,10 @@ use crossterm::{
 use futures::StreamExt as _;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line as RLine, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
 };
 use rupi_agent::AgentLoop;
@@ -139,7 +140,13 @@ async fn run_loop(
     let mut reader = EventStream::new();
 
     loop {
-        draw(terminal, &view, &input, scroll, false)?;
+        // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）
+        let custom_names: Vec<String> = commands::list(&ctx.command_dirs)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let completion = complete::candidates(&input.text(), &custom_names);
+        draw(terminal, &view, &input, scroll, false, &completion)?;
         let Some(Ok(Event::Key(key))) = reader.next().await else {
             continue;
         };
@@ -147,6 +154,11 @@ async fn run_loop(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
             KeyCode::PageUp => scroll = scroll.saturating_add(5),
             KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+            KeyCode::Tab => {
+                if let Some(done) = complete::apply_tab(&input.text(), &custom_names) {
+                    input.set_text(&done);
+                }
+            }
             KeyCode::Left => input.move_left(),
             KeyCode::Right => input.move_right(),
             KeyCode::Backspace => input.backspace(),
@@ -276,7 +288,7 @@ async fn drive_turn(
                     view.push_system(line);
                 }
             }
-            draw(terminal, view, &InputBuffer::default(), scroll, true)?;
+            draw(terminal, view, &InputBuffer::default(), scroll, true, &[])?;
             tokio::select! {
                 res = &mut fut => {
                     while let Ok(e) = rx.try_recv() {
@@ -345,6 +357,7 @@ fn draw(
     input: &InputBuffer,
     scroll: u16,
     busy: bool,
+    completion: &[String],
 ) -> anyhow::Result<()> {
     terminal
         .draw(|f| {
@@ -373,6 +386,31 @@ fn draw(
             ]))
             .block(Block::default().borders(Borders::ALL));
             f.render_widget(prompt, chunks[1]);
+            // 补全弹窗：输入框上方浮层，多候选时展示（Tab 补全/公共前缀）
+            if !completion.is_empty() {
+                let shown: Vec<RLine> = completion
+                    .iter()
+                    .take(8)
+                    .map(|c| RLine::from(vec![Span::styled(format!("/{c}"), Style::default().fg(Color::Yellow))]))
+                    .collect();
+                let extra = completion.len().saturating_sub(8);
+                let mut items = shown;
+                if extra > 0 {
+                    items.push(RLine::from(format!("… +{extra} more")));
+                }
+                let height = (items.len() as u16 + 2).min(chunks[0].height.max(1));
+                let area = Rect {
+                    x: chunks[1].x,
+                    y: chunks[1].y.saturating_sub(height),
+                    width: chunks[1].width,
+                    height,
+                };
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Paragraph::new(items).block(Block::default().borders(Borders::ALL).title("Tab 补全")),
+                    area,
+                );
+            }
             f.render_widget(
                 Paragraph::new(if busy {
                     "… thinking (Ctrl-C 退出)"

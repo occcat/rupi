@@ -48,6 +48,17 @@ impl InputBuffer {
         s
     }
 
+    /// 当前全文（补全候选计算用，不消费）。
+    pub fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    /// 写回补全结果，光标置末尾。
+    pub fn set_text(&mut self, s: &str) {
+        self.chars = s.chars().collect();
+        self.cursor = self.chars.len();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty()
     }

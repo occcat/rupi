@@ -19,7 +19,7 @@
 | Extension 热重载（自写工具-重载-自测） | `rupi-ext`（manifest + 外部进程契约 stdin JSON→stdout，`ExtensionSet::refresh` mtime 增量重载，`--ext-dir`/`ext-list`，REPL `/reload` + 每轮自动检查） |
 | 权限门与计划模式 | `rupi-agent::policy`（`AllowAll`/`RulePolicy`/`ChainPolicy` + `Approver`，拒绝转 tool error；`--plan` + REPL `/plan` 只读侦察；bash 高危子串转人工审批 `[y(es)/a(ll session)/N]`，选 a 的（工具+原因）本会话免打扰；TUI 内同语义全屏暂停问询） |
 | 子任务分发 | `rupi-agent::subagent`（`run_subagents` 分叉会话并发扇出 + `subagent` 委托工具，深度 guard 断递归；`--subagents` 开启） |
-| coding-agent CLI + TUI | `rupi-cli`（`rupi` 二进制；`chat` REPL + `tui` ratatui 全屏界面：流式渲染/滚动/review 行） |
+| coding-agent CLI + TUI | `rupi-cli`（`rupi` 二进制；`chat` REPL + `tui` ratatui 全屏界面：流式渲染/滚动/review 行；TUI 内 `/` 开头 Tab 补全内建 + 自定义命令，弹窗展示候选） |
 
 ## 快速开始
 
