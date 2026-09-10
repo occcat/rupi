@@ -300,6 +300,16 @@ impl AgentLoop {
                     })
                     .await?;
                 }
+                // 终止屏障：整轮结束再广播一次，扩展收尾（落盘/通知）挂这里
+                on_event(AgentEvent::RunEnd {
+                    stop_reason: StopReason::Done,
+                });
+                for e in extensions {
+                    e.on_event(&AgentEvent::RunEnd {
+                        stop_reason: StopReason::Done,
+                    })
+                    .await?;
+                }
                 return Ok(StopReason::Done);
             }
 
@@ -438,6 +448,15 @@ impl AgentLoop {
                 turn,
                 stop_reason: StopReason::Done,
             });
+        }
+        on_event(AgentEvent::RunEnd {
+            stop_reason: StopReason::MaxTurns,
+        });
+        for e in extensions {
+            e.on_event(&AgentEvent::RunEnd {
+                stop_reason: StopReason::MaxTurns,
+            })
+            .await?;
         }
         Ok(StopReason::MaxTurns)
     }
@@ -1125,5 +1144,84 @@ mod tests {
             t.elapsed()
         );
         assert_eq!(tool_result_texts(&session).len(), 2);
+    }
+
+    struct RecExt {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Extension for RecExt {
+        fn name(&self) -> &str {
+            "rec"
+        }
+
+        async fn on_event(&self, e: &AgentEvent) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(format!("{e:?}"));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_end_fires_once_on_done_for_callback_and_extensions() {
+        let ext = Arc::new(RecExt {
+            events: std::sync::Mutex::new(vec![]),
+        });
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-run-end");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let seen = std::sync::Mutex::new(vec![]);
+        let reason = agent
+            .run(
+                &MockProvider::new(vec![MockProvider::text_response("hi")]),
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[ext.clone() as Arc<dyn Extension>],
+                &|e| seen.lock().unwrap().push(format!("{e:?}")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Done));
+        let seen = seen.lock().unwrap();
+        // RunEnd 整轮一次，且是最后一个事件
+        assert_eq!(seen.iter().filter(|s| s.contains("RunEnd")).count(), 1);
+        assert!(seen.last().unwrap().contains("RunEnd"));
+        assert!(seen.last().unwrap().contains("Done"));
+        let ext_seen = ext.events.lock().unwrap();
+        assert_eq!(ext_seen.iter().filter(|s| s.contains("RunEnd")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_end_fires_with_maxturns_when_turns_exhaust() {
+        let agent = AgentLoop::new(1);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-run-end-max");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let seen = std::sync::Mutex::new(vec![]);
+        let reason = agent
+            .run(
+                &MockProvider::new(vec![two_bash_calls("echo a", "echo b")]),
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|e| seen.lock().unwrap().push(format!("{e:?}")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::MaxTurns));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().filter(|s| s.contains("RunEnd")).count(), 1);
+        assert!(seen.last().unwrap().contains("MaxTurns"));
     }
 }

@@ -304,6 +304,11 @@ pub enum AgentEvent {
         turn: u32,
         stop_reason: StopReason,
     },
+    /// 整轮结束（对标上游 `agent_end`）：终止屏障，扩展订阅者被 await，可做落盘/通知等收尾。
+    /// TurnEnd 是每回合的；RunEnd 整轮只发一次（Done / MaxTurns 两出口）。
+    RunEnd {
+        stop_reason: StopReason,
+    },
     Error {
         message: String,
     },

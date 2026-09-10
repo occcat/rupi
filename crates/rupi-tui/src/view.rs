@@ -108,7 +108,9 @@ impl ChatView {
                 self.lines
                     .push(Line::Tool(format!("{mark} {name}: {first}")));
             }
-            AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
+            AgentEvent::TurnStart { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::RunEnd { .. } => {}
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }
