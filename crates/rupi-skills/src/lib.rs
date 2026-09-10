@@ -159,17 +159,21 @@ impl SkillRegistry {
     }
 
     /// 阶段 3：按需读资源文件（references/、assets/、templates/）。
+    /// 符号链接消解后仍须在 skill 目录内（与工作区沙箱同口径）：skill 可由复盘自动
+    /// 蒸馏，词法 `starts_with` 挡不住目录内指外的软链。
     pub fn read_resource(&self, name: &str, rel: &str) -> anyhow::Result<String> {
         let skills = self.skills.read().unwrap();
         let sk = skills
             .iter()
             .find(|s| s.meta.name == name)
             .ok_or_else(|| anyhow::anyhow!("unknown skill {name}"))?;
-        let p = sk.dir.join(rel);
-        if !p.starts_with(&sk.dir) {
+        let canonical_dir = sk.dir.canonicalize().unwrap_or_else(|_| sk.dir.clone());
+        // 只读存在文件：消解失败与读失败同为 Err（原 read_to_string 语义不变）
+        let canonical = sk.dir.join(rel).canonicalize()?;
+        if !canonical.starts_with(&canonical_dir) {
             anyhow::bail!("path escapes skill dir");
         }
-        Ok(std::fs::read_to_string(&p)?)
+        Ok(std::fs::read_to_string(&canonical)?)
     }
 
     fn len(&self) -> usize {
@@ -393,6 +397,40 @@ mod tests {
         assert_eq!(reg.refresh(&[base.clone()]), 1);
         assert!(reg.index_block().contains("fresh-skill"));
         assert!(reg.load_skill("fresh-skill").unwrap().contains("Go."));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_resource_rejects_symlink_escapes() {
+        // 目录内软链指外：词法检查放行，canonicalize 口径必须拦下；
+        // 指内的软链照常用（与工作区沙箱同语义）
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("rupi-skill-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("linked");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: link-skill\ndescription: has links\n---\n\n# Linked\nSee refs.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("references").join("deep.md"), "DEEP-KNOWLEDGE").unwrap();
+        std::fs::write(base.join("outside.txt"), "OUTSIDE-SECRET").unwrap();
+        symlink(base.join("outside.txt"), dir.join("references").join("evil")).unwrap();
+        symlink(
+            dir.join("references").join("deep.md"),
+            dir.join("references").join("ok"),
+        )
+        .unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        let err = reg
+            .read_resource("link-skill", "references/evil")
+            .unwrap_err();
+        assert!(!err.to_string().contains("OUTSIDE-SECRET"), "错误信息不得回显目标内容");
+        assert_eq!(
+            reg.read_resource("link-skill", "references/ok").unwrap(),
+            "DEEP-KNOWLEDGE"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
