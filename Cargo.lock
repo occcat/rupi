@@ -1588,6 +1588,7 @@ dependencies = [
  "ratatui",
  "rupi-agent",
  "rupi-core",
+ "rupi-ext",
  "rupi-llm",
  "rupi-mcp",
  "rupi-memory",

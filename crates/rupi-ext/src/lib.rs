@@ -328,6 +328,26 @@ pub fn register_all(registry: &mut rupi_tools::ToolRegistry, manifests: Vec<Exte
     }
 }
 
+/// 增量热重载：新增/修改重注册，删除注销。返回反馈行（空=无变化，
+/// 调用方按需展示：REPL 印 stderr，TUI 进视图）。
+pub fn refresh_extensions(
+    tools: &mut rupi_tools::ToolRegistry,
+    set: &mut ExtensionSet,
+) -> Vec<String> {
+    let (changed, removed) = set.refresh();
+    let mut lines = Vec::new();
+    for name in removed {
+        tools.unregister(&name);
+        lines.push(format!("[ext] removed {name}"));
+    }
+    if !changed.is_empty() {
+        let names: Vec<String> = changed.iter().map(|m| m.name.clone()).collect();
+        register_all(tools, changed);
+        lines.push(format!("[ext] reloaded: {}", names.join(", ")));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,8 @@ pub struct TuiContext<'a> {
     pub mcp_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// skill 发现目录：每轮发送前 `refresh`，会话内新蒸馏 skill 即时可见（与 REPL 同闭环）。
     pub skill_dirs: Vec<std::path::PathBuf>,
+    /// 扩展热重载器：`/reload` 显式触发（与 REPL 同语义）；`None`（单测/内嵌）则提示不可用。
+    pub ext_set: Option<&'a mut rupi_ext::ExtensionSet>,
     /// 自定义斜杠命令目录：发送前展开（与 REPL 同语义）。
     pub command_dirs: Vec<std::path::PathBuf>,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
@@ -167,6 +169,7 @@ enum Builtin {
     Pass,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_builtin(
     text: &str,
     agent: &mut AgentLoop,
@@ -175,6 +178,8 @@ fn dispatch_builtin(
     skills: &SkillRegistry,
     command_dirs: &[std::path::PathBuf],
     session_id: &str,
+    tools: &mut ToolRegistry,
+    ext_set: Option<&mut rupi_ext::ExtensionSet>,
 ) -> Builtin {
     let t = text.trim();
     if t == "/quit" {
@@ -257,10 +262,20 @@ fn dispatch_builtin(
         };
     }
     if t == "/reload" {
-        // 热重载要 ExtensionSet 所有权 + 可变工具表（REPL 专属路径），TUI 只读装配
-        return Builtin::Done(
-            "[reload] hot reload is REPL-only; restart TUI to pick up extension changes".into(),
-        );
+        // 热重载要 ExtensionSet 可变借用 + 可变工具表：内嵌/单测无 set 时回退提示。
+        return match ext_set {
+            Some(set) => {
+                let lines = rupi_ext::refresh_extensions(tools, set);
+                Builtin::Done(if lines.is_empty() {
+                    "[ext] no changes".into()
+                } else {
+                    lines.join("\n")
+                })
+            }
+            None => Builtin::Done(
+                "[reload] no extension dir attached; restart TUI to pick up changes".into(),
+            ),
+        };
     }
     if t == "/compact" {
         // 压实调模型是 async：这里只做标记，run_loop 内 await 执行（与 REPL /compact 同反馈文案）
@@ -340,6 +355,8 @@ async fn run_loop(
                         ctx.skills,
                         &ctx.command_dirs,
                         &ctx.session_id,
+                        &mut *ctx.tools,
+                        ctx.ext_set.as_deref_mut(),
                     ) {
                         Builtin::Quit => return Ok(()),
                         Builtin::Done(msg) => {
@@ -810,7 +827,9 @@ mod tests {
                 &mut provider,
                 &skills,
                 &[],
-                "t-sess"
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             ),
             Builtin::Quit
         ));
@@ -822,7 +841,9 @@ mod tests {
                 &mut provider,
                 &skills,
                 &[],
-                "t-sess"
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             ),
             Builtin::Pass
         ));
@@ -831,10 +852,12 @@ mod tests {
             "/goto",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(msg.contains("usage:"), "{msg}");
     }
@@ -847,10 +870,12 @@ mod tests {
                 "/plan",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[plan mode on]"
         );
@@ -860,10 +885,12 @@ mod tests {
                 "/plan",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[plan mode off]"
         );
@@ -878,10 +905,12 @@ mod tests {
                 "/thinking",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[thinking default (provider default)]"
         );
@@ -890,10 +919,12 @@ mod tests {
                 "/thinking high",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[thinking switched to High]"
         );
@@ -903,10 +934,12 @@ mod tests {
                 "/thinking",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[thinking High]"
         );
@@ -914,10 +947,12 @@ mod tests {
             "/thinking ultra",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(msg.contains("staying on current"), "{msg}");
         assert_eq!(agent.thinking, Some(rupi_llm::ThinkingLevel::High));
@@ -931,10 +966,12 @@ mod tests {
                 "/model",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[model mock]"
         );
@@ -950,10 +987,12 @@ mod tests {
             "/model gpt-4o-mini",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         for (k, v) in saved {
             if let Some(val) = v {
@@ -972,10 +1011,12 @@ mod tests {
                 "/rewind",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[rewind] nothing to undo"
         );
@@ -986,10 +1027,12 @@ mod tests {
                 "/rewind",
                 &mut agent,
                 &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                 "t-sess"
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             )),
             "[rewound]"
         );
@@ -1009,32 +1052,78 @@ mod tests {
                 &skills,
                 &[],
                 "t-sess",
+                &mut ToolRegistry::default(),
+                None,
             ),
             Builtin::Compact
         ));
     }
 
     #[test]
-    fn reload_is_explicitly_unsupported_and_goto_unknown() {
+    fn reload_hot_reloads_extensions_and_goto_unknown() {
+        // /reload 有 set 时真热重载（新增 manifest 即注册），无 set 回退提示。
         let (mut agent, mut session, mut provider, skills) = harness();
+        let dir = std::env::temp_dir().join(format!("rupi-tui-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tools = ToolRegistry::default();
+        let mut set = rupi_ext::ExtensionSet::new(dir.clone());
+        // 空目录：无变化反馈
         let msg = done_text(dispatch_builtin(
             "/reload",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut tools,
+            Some(&mut set),
         ));
-        assert!(msg.contains("REPL-only"), "{msg}");
+        assert!(msg.contains("no changes"), "{msg}");
+        // 新增 manifest：重载注册为工具
+        std::fs::write(
+            dir.join("echo.json"),
+            r#"{"name": "tui-echo", "description": "x", "input_schema": {}, "command": "sh"}"#,
+        )
+        .unwrap();
+        let msg = done_text(dispatch_builtin(
+            "/reload",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut tools,
+            Some(&mut set),
+        ));
+        assert!(msg.contains("tui-echo"), "{msg}");
+        assert!(tools.definitions().iter().any(|d| d.name == "tui-echo"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 无 set 回退提示
+        let msg = done_text(dispatch_builtin(
+            "/reload",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+        ));
+        assert!(msg.contains("no extension dir"), "{msg}");
         let msg = done_text(dispatch_builtin(
             "/goto zzz",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
@@ -1048,10 +1137,12 @@ mod tests {
             "/skills",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(msg.contains("no skills found"), "{msg}");
         // 空命令目录给指引
@@ -1059,10 +1150,12 @@ mod tests {
             "/commands",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
         // 空树也有视图（不空返回、不漏进模型）
@@ -1070,10 +1163,12 @@ mod tests {
             "/tree",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert!(!msg.is_empty(), "空树视图不应为空");
         session.push(Message::text(rupi_core::Role::User, "hi"));
@@ -1081,10 +1176,12 @@ mod tests {
             "/tree",
             &mut agent,
             &mut session,
-                 &mut provider,
-                 &skills,
-                 &[],
-                "t-sess",
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
         ));
         assert_ne!(msg, msg2, "有节点后视图应变化");
     }

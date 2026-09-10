@@ -358,22 +358,6 @@ fn load_extensions(tools: &mut ToolRegistry, dir: &PathBuf) -> rupi_ext::Extensi
     set
 }
 
-/// 增量热重载：新增/修改重注册，删除注销。返回是否有变化（显式 /reload 无变化时给反馈）。
-fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet) -> bool {
-    let (changed, removed) = set.refresh();
-    let dirty = !changed.is_empty() || !removed.is_empty();
-    for name in removed {
-        tools.unregister(&name);
-        eprintln!("[ext] removed {name}");
-    }
-    if !changed.is_empty() {
-        let names: Vec<String> = changed.iter().map(|m| m.name.clone()).collect();
-        rupi_ext::register_all(tools, changed);
-        eprintln!("[ext] reloaded: {}", names.join(", "));
-    }
-    dirty
-}
-
 async fn build_provider(
     model: &str,
     session_id: Option<&str>,
@@ -1046,8 +1030,13 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             continue;
         }
         if input == "/reload" {
-            if !refresh_extensions(&mut tools, &mut ext_set) {
+            let lines = rupi_ext::refresh_extensions(&mut tools, &mut ext_set);
+            if lines.is_empty() {
                 println!("[ext] no changes");
+            } else {
+                for l in lines {
+                    println!("{l}");
+                }
             }
             continue;
         }
@@ -1143,7 +1132,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         }
         // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）；
         // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
-        refresh_extensions(&mut tools, &mut ext_set);
+        for l in rupi_ext::refresh_extensions(&mut tools, &mut ext_set) {
+            eprintln!("{l}");
+        }
         // MCP 工具热刷新：server 发 notifications/tools/list_changed 即重列该 server 差量更新
         if let Some(m) = &mcp {
             while let Ok(srv) = mcp_rx.try_recv() {
@@ -1256,7 +1247,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     } else {
         None
     };
-    let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
+    let mut ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
     // 项目信任门（全屏启动前 stdin 问一次，与 REPL 同语义）
     let load_project = load_project_resources(home, cli);
     let mut store = memory_store(home, load_project);
@@ -1390,6 +1381,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         mcp: mcp.as_ref(),
         mcp_rx: Some(mcp_rx),
         skill_dirs: skill_dirs(home, load_project),
+        ext_set: Some(&mut ext_set),
         command_dirs: command_dirs_filtered(home, load_project),
         review_lines,
         session_id: sid.clone(),

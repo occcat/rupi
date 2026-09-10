@@ -10,6 +10,7 @@ rupi-tools = { path = "../rupi-tools" }
 rupi-agent = { path = "../rupi-agent" }
 rupi-memory = { path = "../rupi-memory" }
 rupi-skills = { path = "../rupi-skills" }
+rupi-ext = { path = "../rupi-ext" }
 rupi-mcp = { path = "../rupi-mcp" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
