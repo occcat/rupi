@@ -512,14 +512,14 @@ impl SessionStore {
         Ok(rows)
     }
 
-    /// 会话明细：按时间正序。
+    /// 会话明细：按时间正序（rowid 打平同秒并列）。
     pub fn session_messages(
         &self,
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?",
+            "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![session_id, limit as i64], |r| {

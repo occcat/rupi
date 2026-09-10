@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
-use rupi_core::SessionTree;
+use rupi_core::{Message, SessionTree};
 use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
 use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
@@ -75,6 +75,9 @@ struct Cli {
     /// 外部记忆 provider（jsonl：turns.jsonl 回放 + recall 工具）
     #[arg(long)]
     memory_provider: Option<String>,
+    /// 恢复历史会话继续聊（sessions 命令看 id）
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -300,6 +303,34 @@ async fn maybe_external_memory(
     Ok(())
 }
 
+/// 恢复历史会话：按序回填 user/assistant 文本继续聊。
+/// 工具中间态不落盘，恢复的是 transcript（对应行数可能少于原树节点数）。
+fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionTree, String)> {
+    if let Some(id) = &cli.resume {
+        let msgs = sess_db.session_messages(id, 500)?;
+        if msgs.is_empty() {
+            anyhow::bail!("unknown or empty session: {id} (see `rupi sessions`)");
+        }
+        let mut s = SessionTree::new();
+        for (role, content, _) in msgs {
+            match role.as_str() {
+                "assistant" => {
+                    s.push(Message::text(rupi_core::Role::Assistant, content));
+                }
+                _ => {
+                    s.push(Message::text(rupi_core::Role::User, content));
+                }
+            };
+        }
+        eprintln!("[resume {}] restored {} msgs", id, s.history().len());
+        Ok((s, id.clone()))
+    } else {
+        let sid = sess_db.create_session("default")?;
+        eprintln!("[session {sid}] turns persist to sessions.db");
+        Ok((SessionTree::new(), sid))
+    }
+}
+
 /// 回合落盘：user 原文 + 本轮最后一条助手答复。失败只 warning，不断聊天。
 fn persist_turn(store: &SessionStore, sid: &str, user: &str, session: &SessionTree) {
     if let Err(e) = store.add_message(sid, "user", user) {
@@ -373,7 +404,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
-    let mut session = SessionTree::new();
+    let sess_db = SessionStore::open(home)?;
+    let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     if cli.subagents {
         let sub = SubagentTool::new(
             provider.clone(),
@@ -389,9 +421,6 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
 
     println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
-    let sess_db = SessionStore::open(home)?;
-    let sid = sess_db.create_session("default")?;
-    eprintln!("[session {sid}] turns persist to sessions.db");
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -489,9 +518,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
     let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(home)?));
-    let sid = sess_db.lock().unwrap().create_session("default")?;
-    eprintln!("[session {sid}] turns persist to sessions.db");
-    let mut session = SessionTree::new();
+    let (mut session, sid) = {
+        let db = sess_db.lock().unwrap();
+        restore_or_new(cli, &db)?
+    };
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
     // TUI 内无 stdin 审批：Ask 一律拒绝；plan mode 同 REPL

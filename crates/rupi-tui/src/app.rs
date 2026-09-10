@@ -181,41 +181,41 @@ async fn drive_turn(
     let end: End = {
         tokio::pin!(fut);
         loop {
-        while let Ok(e) = rx.try_recv() {
-            view.push_event(&e);
-        }
-        if let Some(buf) = review_lines {
-            for line in buf.lock().unwrap().drain(..) {
-                view.push_system(line);
+            while let Ok(e) = rx.try_recv() {
+                view.push_event(&e);
             }
-        }
-        draw(terminal, view, &InputBuffer::default(), scroll, true)?;
-        tokio::select! {
-            res = &mut fut => {
-                while let Ok(e) = rx.try_recv() {
-                    view.push_event(&e);
+            if let Some(buf) = review_lines {
+                for line in buf.lock().unwrap().drain(..) {
+                    view.push_system(line);
                 }
-                if let Some(buf) = review_lines {
-                    for line in buf.lock().unwrap().drain(..) {
-                        view.push_system(line);
+            }
+            draw(terminal, view, &InputBuffer::default(), scroll, true)?;
+            tokio::select! {
+                res = &mut fut => {
+                    while let Ok(e) = rx.try_recv() {
+                        view.push_event(&e);
+                    }
+                    if let Some(buf) = review_lines {
+                        for line in buf.lock().unwrap().drain(..) {
+                            view.push_system(line);
+                        }
+                    }
+                    break End::Finished(res);
+                }
+                maybe_key = reader.next() => {
+                    match maybe_key {
+                        Some(Ok(Event::Key(key))) => match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                break End::Quit;
+                            }
+                            KeyCode::PageUp => scroll = scroll.saturating_add(5),
+                            KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+                            _ => {}
+                        },
+                        _ => {}
                     }
                 }
-                break End::Finished(res);
             }
-            maybe_key = reader.next() => {
-                match maybe_key {
-                    Some(Ok(Event::Key(key))) => match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break End::Quit;
-                        }
-                        KeyCode::PageUp => scroll = scroll.saturating_add(5),
-                        KeyCode::PageDown => scroll = scroll.saturating_sub(5),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-        }
         }
     };
     match end {
@@ -231,7 +231,10 @@ async fn drive_turn(
                         .map(|m| m.full_text())
                         .unwrap_or_default();
                     if let Some(cb) = on_turn {
-                        cb(TurnRecord { user: text.clone(), assistant });
+                        cb(TurnRecord {
+                            user: text.clone(),
+                            assistant,
+                        });
                     }
                 }
                 Err(e) => {
