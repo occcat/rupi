@@ -33,12 +33,23 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// 超时秒数，默认 30。
+    /// 显式 0 视为“未指定”回默认值：钳到 1s 会让冷启动的解释器（python 等）在负载下
+    /// 必现误杀，1s 墙钟对子进程 spawn 本就是竞态。
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
 }
 
 fn default_timeout() -> u64 {
     30
+}
+
+/// 生效超时：0 回默认值，其余至少 1s（防 `timeout(0)` 瞬杀）。
+fn effective_timeout_secs(manifest_secs: u64) -> u64 {
+    if manifest_secs == 0 {
+        default_timeout()
+    } else {
+        manifest_secs.max(1)
+    }
 }
 
 impl ExtensionManifest {
@@ -120,7 +131,7 @@ impl rupi_tools::Tool for ExternalTool {
                 return Ok(rupi_tools::ToolOutput::err("write stdin failed"));
             }
         }
-        let timeout_secs = m.timeout_secs.max(1);
+        let timeout_secs = effective_timeout_secs(m.timeout_secs);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             child.wait_with_output(),
@@ -365,6 +376,12 @@ mod tests {
         assert_eq!(changed[0].name, "shout");
         assert_eq!(removed, vec!["upper".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_means_default_not_one_second() {
+        assert_eq!(effective_timeout_secs(0), default_timeout());
+        assert_eq!(effective_timeout_secs(5), 5);
     }
 
     #[tokio::test]
