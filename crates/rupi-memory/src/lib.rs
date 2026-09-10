@@ -376,6 +376,26 @@ impl MemoryStore {
         }
     }
 
+    /// 会话搜索工具定义：跨会话全文检索（sessions.db FTS），回忆“聊过的”上下文；
+    /// 与 `memory_search`（“学到的”）互补。`--no-memory` 全关时随 memory 一并撤下。
+    pub fn session_search_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "session_search".into(),
+            description: "Search past conversation sessions (full-text): recall what was discussed/done in earlier sessions".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5}
+                },
+                "required": ["query"]
+            }),
+            prompt_snippet: Some(
+                "session_search(query): recall past conversations on demand".into(),
+            ),
+        }
+    }
+
     /// 记忆引导语（对标 Hermes “给模型何存何取的指导”）：静态文本，前缀缓存安全；
     /// 空库时更要出现（否则模型永远不调 memory 工具，存→冻→忆的环转不起来）。
     /// 双开关全关时返回空（Hermes `memory_enabled=false`：工具与指导块一并撤下，
@@ -384,7 +404,7 @@ impl MemoryStore {
         if !self.memory_enabled && !self.user_profile_enabled {
             return String::new();
         }
-        "\n<MemoryGuidance>\nLong-term memory persists across sessions: MEMORY.md keeps durable facts (project conventions, environment, lessons learned), USER.md keeps user preferences. Save via the `memory` tool (op=add) when you learn something reusable — a preference, a correction, a gotcha; scope=project for repo-specific facts. Do NOT store ephemeral task state or secrets. Writes take effect in the prompt from the next session; the tool response shows live state. Recall with `memory_search` before asking the user twice; past failures arrive as <FailureMemory> — do not repeat them.\n</MemoryGuidance>\n".to_string()
+        "\n<MemoryGuidance>\nLong-term memory persists across sessions: MEMORY.md keeps durable facts (project conventions, environment, lessons learned), USER.md keeps user preferences. Save via the `memory` tool (op=add) when you learn something reusable — a preference, a correction, a gotcha; scope=project for repo-specific facts. Do NOT store ephemeral task state or secrets. Writes take effect in the prompt from the next session; the tool response shows live state. Recall with `memory_search` before asking the user twice; use `session_search` to recall what was discussed in earlier conversations; past failures arrive as <FailureMemory> — do not repeat them.\n</MemoryGuidance>\n".to_string()
     }
 
     /// SQLite 镜像（best-effort）：成功写入的记忆同步一行到 sessions.db，
@@ -551,6 +571,7 @@ impl MemoryManager {
         if let Some(d) = self.store.memory_tool_definition() {
             out.push(d);
             out.push(MemoryStore::memory_search_tool_definition());
+            out.push(MemoryStore::session_search_tool_definition());
         }
         if let Some(e) = &self.external {
             out.extend(e.tool_schemas());
@@ -670,6 +691,25 @@ impl MemoryManager {
             let lines: Vec<String> = hits
                 .iter()
                 .map(|(target, snippet)| format!("[{target}] {snippet}"))
+                .collect();
+            return Ok(Some(lines.join("\n---\n")));
+        }
+        if name == "session_search" {
+            // 会话是“聊过的”：跨会话 FTS，按 session_id 分组展示，snippet 即上下文。
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .min(20) as usize;
+            let db = SessionStore::open(&self.store.home)?;
+            let hits = db.search(query, limit)?;
+            if hits.is_empty() {
+                return Ok(Some("no matching sessions".into()));
+            }
+            let lines: Vec<String> = hits
+                .iter()
+                .map(|(sid, snippet)| format!("[session {sid}] {snippet}"))
                 .collect();
             return Ok(Some(lines.join("\n---\n")));
         }
@@ -1265,6 +1305,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(hit.contains("oolong"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn manager_routes_session_search_tool() {
+        // session_search 对模型可见 + 经 manager 路由查 sessions.db FTS。
+        let home = std::env::temp_dir().join(format!("rupi-mem-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mgr = MemoryManager::new(MemoryStore::new(home.clone()));
+        assert!(mgr
+            .all_tool_definitions()
+            .iter()
+            .any(|d| d.name == "session_search"));
+        let db = SessionStore::open(&home).unwrap();
+        db.add_message("sess-old", "user", "purple elephant deployment notes")
+            .unwrap();
+        let hit = mgr
+            .handle_tool_call("session_search", serde_json::json!({"query": "elephant"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("sess-old"), "{hit}");
+        assert!(hit.contains("elephant"), "{hit}");
+        let miss = mgr
+            .handle_tool_call("session_search", serde_json::json!({"query": "zzz-no-match"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(miss, "no matching sessions");
         let _ = std::fs::remove_dir_all(&home);
     }
 
