@@ -864,7 +864,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -915,6 +915,25 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                         println!("[model switched to {model}]");
                     }
                     Err(e) => eprintln!("[model] switch failed ({e:#}); staying on {model}"),
+                }
+            }
+            continue;
+        }
+        // 思考强度会话内切换（对标上游 /thinking；只影响后续回合）
+        if input == "/thinking" || input.starts_with("/thinking ") {
+            let arg = input.strip_prefix("/thinking").unwrap().trim();
+            if arg.is_empty() {
+                match agent.thinking {
+                    Some(t) => println!("[thinking {t:?}]"),
+                    None => println!("[thinking default (provider default)]"),
+                }
+            } else {
+                match arg.parse::<rupi_llm::ThinkingLevel>() {
+                    Ok(t) => {
+                        agent.thinking = Some(t);
+                        println!("[thinking switched to {t:?}]");
+                    }
+                    Err(e) => eprintln!("[thinking] {e:#}; staying on current"),
                 }
             }
             continue;
