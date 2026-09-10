@@ -131,16 +131,24 @@ pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                             "type": "tool_use", "id": id, "name": name, "input": arguments,
                         })),
                         // 思考块按原序回放：thinking 必须排在同消息 tool_use 之前
-                        // （调用方 finish() 已保证顺序），signature 缺失即便如此也照发，
-                        // 丢签名的降级由服务端判，本地不静默吞块。
+                        // （调用方 finish() 已保证顺序）。有签名的原样回放；无签名
+                        // （网关直吐的 unsigned thinking，如 Fireworks/MiMo 系）的
+                        // thinking 块服务端 400（签名失配），降级为 text 保推理内容
+                        // 不丢——对标上游空签名转文本（默认行为；allowEmptySignature
+                        // 系网关白名单，本 port 无网关特判，一律转文本保成功）。
+                        // 空文本 + 无签名则无物可保，直接丢弃。
                         ContentBlock::Thinking { text, signature } => {
-                            let mut item = serde_json::json!({
-                                "type": "thinking", "thinking": text,
-                            });
-                            if let Some(sig) = signature {
-                                item["signature"] = sig.clone().into();
+                            if signature.as_deref().is_some_and(|s| !s.is_empty()) {
+                                let mut item = serde_json::json!({
+                                    "type": "thinking", "thinking": text,
+                                });
+                                item["signature"] = signature.clone().unwrap().into();
+                                items.push(item);
+                            } else if !text.is_empty() {
+                                items.push(serde_json::json!({
+                                    "type": "text", "text": text,
+                                }));
                             }
-                            items.push(item);
                         }
                         ContentBlock::RedactedThinking { data } => {
                             items.push(serde_json::json!({
@@ -799,6 +807,52 @@ mod tests {
         assert_eq!(content[1]["type"], "redacted_thinking");
         assert_eq!(content[1]["data"], "enc9");
         assert_eq!(content[2]["type"], "tool_use");
+    }
+
+    #[test]
+    fn unsigned_thinking_downgrades_to_text_on_replay() {
+        // 无签名 thinking 照发会 400（网关 unsigned 系）：降级 text 保内容，
+        // 有签名（含空文本）原样回放，空文本 + 无签名直接丢。对标上游空签名兼容。
+        let msgs = vec![Message {
+            id: "a".into(),
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Thinking {
+                    text: "gateway musing".into(),
+                    signature: None,
+                },
+                ContentBlock::Thinking {
+                    text: "".into(),
+                    signature: Some("".into()),
+                },
+                ContentBlock::Thinking {
+                    text: "".into(),
+                    signature: Some("sig9".into()),
+                },
+                ContentBlock::Thinking {
+                    text: "signed".into(),
+                    signature: Some("sig1".into()),
+                },
+                ContentBlock::ToolCall {
+                    id: "tu1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        }];
+        let out = to_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "gateway musing");
+        assert_eq!(content[1]["type"], "thinking");
+        assert_eq!(content[1]["signature"], "sig9");
+        assert_eq!(content[2]["type"], "thinking");
+        assert_eq!(content[2]["signature"], "sig1");
+        assert_eq!(content[3]["type"], "tool_use");
     }
 
     #[test]
