@@ -413,7 +413,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::SkillsList) => {
             let reg = SkillRegistry::discover(&skill_dirs(&home, true));
-            println!("{}", reg.index_block());
+            // 无技能时工具定义为空（渐进披露无入口），给提示而非光杆标题块
+            if reg.tool_definitions().is_empty() {
+                println!(
+                    "no skills found. distill one with `skill-distill <name> <desc> <steps...>`"
+                );
+            } else {
+                println!("{}", reg.index_block());
+            }
         }
         Some(Cmd::Commands) => {
             println!(
@@ -439,13 +446,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::SessionSearch { query }) => {
             let store = SessionStore::open(&home)?;
-            for (sid, snippet) in store.search(&query, 10)? {
+            let hits = store.search(&query, 10)?;
+            if hits.is_empty() {
+                println!("no matching sessions for `{query}`");
+            }
+            for (sid, snippet) in hits {
                 println!("[{sid}] {snippet}");
             }
         }
         Some(Cmd::MemorySearch { query }) => {
             let store = SessionStore::open(&home)?;
-            for (target, snippet) in store.memory_search(&query, 10)? {
+            let hits = store.memory_search(&query, 10)?;
+            if hits.is_empty() {
+                println!("no matching memories for `{query}`");
+            }
+            for (target, snippet) in hits {
                 println!("[{target}] {snippet}");
             }
         }
@@ -462,7 +477,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Sessions) => {
             let store = SessionStore::open(&home)?;
-            for (id, profile, created, count) in store.list_sessions(20)? {
+            let sessions = store.list_sessions(20)?;
+            if sessions.is_empty() {
+                println!("no sessions yet — chat or run to create one");
+            }
+            for (id, profile, created, count) in sessions {
                 println!("[{profile}] {id} {created} ({count} msgs)");
             }
         }

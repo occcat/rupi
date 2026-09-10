@@ -262,7 +262,17 @@ fn empty_states_exit_zero() {
     for sub in ["session-search", "memory-search"] {
         let o = rupi(&home, &[sub, "nothing-here"]).output().unwrap();
         assert!(o.status.success(), "{sub} 非零退出: {o:?}");
+        // 空结果给提示而非零输出（与 ext-list/commands 同先例）
+        let (out, _) = out_text(&o);
+        assert!(out.contains("no matching"), "{sub} 空结果零输出:\n{out}");
     }
+    // 空会话库给提示而非零输出
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(
+        out.contains("no sessions yet"),
+        "sessions 空库零输出:\n{out}"
+    );
     // 空扩展目录给提示而非零输出（审计项回归）
     let o = rupi(&home, &["ext-list"]).output().unwrap();
     let (out, _) = out_text(&o);
