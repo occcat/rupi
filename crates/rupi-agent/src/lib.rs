@@ -14,7 +14,10 @@ pub mod review;
 pub use review::{HeuristicReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
 pub mod policy;
 pub use policy::{Approver, ChainPolicy, Decision, Policy, RulePolicy};
+pub mod subagent;
+pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
 
+#[derive(Clone)]
 pub struct PromptBuilder {
     pub base: String,
 }
@@ -53,6 +56,7 @@ impl PromptBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct AgentLoop {
     pub max_turns: u32,
     pub builder: PromptBuilder,
@@ -133,7 +137,7 @@ impl AgentLoop {
         frozen: &FrozenMemory,
         skills: &SkillRegistry,
         extensions: &[Arc<dyn Extension>],
-        on_event: &dyn Fn(AgentEvent),
+        on_event: &(dyn Fn(AgentEvent) + Sync),
     ) -> anyhow::Result<StopReason> {
         session.push(Message::text(Role::User, user_input));
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）

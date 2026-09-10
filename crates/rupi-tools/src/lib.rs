@@ -32,7 +32,7 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput>;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }

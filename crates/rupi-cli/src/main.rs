@@ -1,7 +1,7 @@
 //! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
 
 use clap::{Parser, Subcommand};
-use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion};
+use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::SessionTree;
 use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
 use rupi_memory::{MemoryManager, MemoryStore, SessionStore};
@@ -69,6 +69,9 @@ struct Cli {
     /// 计划模式：只侦察不动手（禁 write/edit/bash）
     #[arg(long, default_value_t = false)]
     plan: bool,
+    /// 启用 subagent 委托工具（模型可把子任务派给子会话，深度 guard 防递归）
+    #[arg(long, default_value_t = false)]
+    subagents: bool,
 }
 
 #[derive(Subcommand)]
@@ -264,7 +267,7 @@ fn default_policy() -> rupi_agent::RulePolicy {
 }
 
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
-    let provider = build_provider(&cli.model).await?;
+    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
     let mut agent =
@@ -315,9 +318,22 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut ext_set = load_extensions(&mut tools, &ext_path);
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
-    let mem = MemoryManager::new(store);
-    let skills = SkillRegistry::discover(&skill_dirs(home));
+    let mem = Arc::new(MemoryManager::new(store));
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
     let mut session = SessionTree::new();
+    if cli.subagents {
+        let sub = SubagentTool::new(
+            provider.clone(),
+            Arc::new(tools.clone()),
+            mem.clone(),
+            frozen.clone(),
+            skills.clone(),
+            cli.max_turns,
+        )
+        .with_plan_mode(cli.plan);
+        tools.register(Arc::new(sub));
+        println!("[subagents] subagent tool enabled");
+    }
 
     println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
@@ -362,13 +378,13 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         refresh_extensions(&mut tools, &mut ext_set);
         agent
             .run(
-                provider.as_ref(),
+                &*provider,
                 &mut session,
                 &input,
                 &tools,
-                &mem,
+                &*mem,
                 &frozen,
-                &skills,
+                &*skills,
                 &[],
                 &|e| match e {
                     rupi_core::AgentEvent::TextDelta { delta } => print!("{delta}"),
@@ -397,7 +413,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 }
 
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
-    let provider = build_provider(&cli.model).await?;
+    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = ToolRegistry::with_builtins();
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
@@ -411,8 +427,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
-    let mem = MemoryManager::new(store);
-    let skills = SkillRegistry::discover(&skill_dirs(home));
+    let mem = Arc::new(MemoryManager::new(store));
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
     let mut session = SessionTree::new();
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
@@ -420,6 +436,19 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);
+    if cli.subagents {
+        let sub = SubagentTool::new(
+            provider.clone(),
+            Arc::new(tools.clone()),
+            mem.clone(),
+            frozen.clone(),
+            skills.clone(),
+            cli.max_turns,
+        )
+        .with_plan_mode(cli.plan);
+        tools.register(Arc::new(sub));
+        eprintln!("[subagents] subagent tool enabled");
+    }
     let review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>> = if cli.review || cli.review_apply
     {
         Some(Arc::new(std::sync::Mutex::new(vec![])))
@@ -464,13 +493,13 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         );
     }
     let ctx = rupi_tui::TuiContext {
-        provider: provider.as_ref(),
+        provider: &*provider,
         agent: &agent,
         session: &mut session,
         tools: &tools,
-        mem: &mem,
+        mem: &*mem,
         frozen: &frozen,
-        skills: &skills,
+        skills: &*skills,
         review_lines,
     };
     rupi_tui::launch(ctx).await
