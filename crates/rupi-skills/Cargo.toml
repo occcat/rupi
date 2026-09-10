@@ -1,0 +1,24 @@
+[package]
+name = "rupi-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AgentSkills discovery, progressive disclosure, skill_manage, and self-accumulation"
+
+[dependencies]
+rupi-ai = { path = "../rupi-ai" }
+rupi-agent-core = { path = "../rupi-agent-core" }
+rupi-memory = { path = "../rupi-memory" }
+async-trait.workspace = true
+ignore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

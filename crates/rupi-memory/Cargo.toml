@@ -1,0 +1,23 @@
+[package]
+name = "rupi-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hermes-style hierarchical memory: USER.md/MEMORY.md, core/extended tiering, SQLite FTS5"
+
+[dependencies]
+rupi-ai = { path = "../rupi-ai" }
+rupi-agent-core = { path = "../rupi-agent-core" }
+async-trait.workspace = true
+chrono.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

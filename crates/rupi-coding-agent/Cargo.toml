@@ -1,0 +1,34 @@
+[package]
+name = "rupi-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pi-compatible coding agent CLI with MCP, Hermes memory, and skill self-accumulation"
+
+[[bin]]
+name = "rupi"
+path = "src/main.rs"
+
+[dependencies]
+rupi-ai = { path = "../rupi-ai" }
+rupi-agent-core = { path = "../rupi-agent-core" }
+rupi-mcp = { path = "../rupi-mcp" }
+rupi-memory = { path = "../rupi-memory" }
+rupi-skills = { path = "../rupi-skills" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
