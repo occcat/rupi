@@ -16,7 +16,7 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
     if suggestions.is_empty() {
         return;
     }
-    let store = memory_store(home);
+    let store = memory_store(home, true);
     let acc = SkillAccumulator::new(home.join("skills"));
     for s in suggestions {
         for m in &s.memory_ops {
@@ -90,6 +90,9 @@ struct Cli {
     /// 工具并发执行（对标上游 toolExecution: parallel；默认串行，审批问询保序）
     #[arg(long, default_value_t = false)]
     parallel_tools: bool,
+    /// 本次直接信任项目资源（跳过信任提问，不记住）
+    #[arg(long, default_value_t = false)]
+    trust_project: bool,
 }
 
 #[derive(Subcommand)]
@@ -146,22 +149,96 @@ fn dirs_home() -> PathBuf {
 }
 
 /// 内建记忆 store：全局 `~/.rupi/memories` + 从 cwd 上溯 `.git` 的项目层（Hermes two-tier）。
-fn memory_store(home: &PathBuf) -> MemoryStore {
+/// `load_project` 为 false（项目信任被拒）时只挂全局层，项目 `MEMORY.md` 不读不写。
+fn memory_store(home: &PathBuf, load_project: bool) -> MemoryStore {
     let mut s = MemoryStore::new(home.clone());
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(root) = MemoryStore::discover_project(&cwd) {
-            s = s.with_project(root);
+    if load_project {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(root) = MemoryStore::discover_project(&cwd) {
+                s = s.with_project(root);
+            }
         }
     }
     s
 }
 
-fn skill_dirs(home: &PathBuf) -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("skills/builtin"),
-        home.join("skills"),
-        PathBuf::from(".rupi/skills"),
-    ]
+/// 项目信任门（对标上游 project_trust）：项目根有本地资源且未被记住时问一次。
+/// 返回是否加载项目资源。无项目根 / 无项目资源 / 已记住 → true 不打扰；
+/// 非交互（管道/EOF）默认跳过并提示。
+fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let root = match MemoryStore::discover_project(&cwd) {
+        Some(r) => r,
+        // 回退：无 .git 的普通目录自带 .rupi 资源也视为项目（否则永不设门）
+        None if PathBuf::from(".rupi/skills").exists()
+            || PathBuf::from(".rupi/commands").exists()
+            || PathBuf::from(".rupi")
+                .join(rupi_memory::MEMORY_FILE)
+                .exists() =>
+        {
+            cwd.clone()
+        }
+        None => return true,
+    };
+    // 现存的项目资源才值得问（发现语义与加载侧一致：cwd 相对路径）
+    let mut resources: Vec<String> = vec![];
+    let pm = root.join(".rupi").join(rupi_memory::MEMORY_FILE);
+    if pm.exists() {
+        resources.push(pm.display().to_string());
+    }
+    for rel in [".rupi/skills", ".rupi/commands"] {
+        if PathBuf::from(rel).exists() {
+            resources.push(rel.to_owned());
+        }
+    }
+    if resources.is_empty() {
+        return true;
+    }
+    let mut store = rupi_core::trust::TrustStore::open(home.join("trusted_projects"));
+    if store.contains(&root) {
+        return true;
+    }
+    if cli.trust_project {
+        println!(
+            "[trust] --trust-project: 本次加载项目资源 {}",
+            root.display()
+        );
+        return true;
+    }
+    match rupi_core::trust::ask_trust_stdin(&root, &resources) {
+        rupi_core::trust::TrustAnswer::Always => {
+            if let Err(e) = store.add(&root) {
+                eprintln!("[trust] 记住失败：{e:#}");
+            }
+            true
+        }
+        rupi_core::trust::TrustAnswer::Once => true,
+        rupi_core::trust::TrustAnswer::Skip => {
+            println!("[trust] 已跳过项目资源，只用全局记忆/skills/命令");
+            false
+        }
+    }
+}
+
+fn skill_dirs(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("skills/builtin"), home.join("skills")];
+    // 项目 skills 与项目记忆同门：信任被拒则不发现、不加载
+    if load_project {
+        dirs.push(PathBuf::from(".rupi/skills"));
+    }
+    dirs
+}
+
+/// 自定义命令目录：与 skills 同门，信任被拒只留全局 `~/commands`。
+fn command_dirs_filtered(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
+    if load_project {
+        rupi_core::commands::command_dirs(home)
+    } else {
+        vec![home.join("commands")]
+    }
 }
 
 /// 工作区沙箱根：启动时 cwd（canonicalize 消解符号链接），read/write/edit 约束其内。
@@ -239,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Some(Cmd::MemoryShow) => {
-            let store = memory_store(&home);
+            let store = memory_store(&home, true);
             let frozen = store.frozen_snapshot();
             println!(
                 "--- MEMORY.md ---\n{}\n--- USER.md ---\n{}\n--- failures.md ---\n{}",
@@ -247,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Cmd::MemoryWrite { op, entry, scope }) => {
-            let store = memory_store(&home);
+            let store = memory_store(&home, true);
             if op == "failure" {
                 store.record_failure(&entry)?;
                 println!("failure recorded.");
@@ -257,17 +334,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Cmd::SkillsList) => {
-            let reg = SkillRegistry::discover(&skill_dirs(&home));
+            let reg = SkillRegistry::discover(&skill_dirs(&home, true));
             println!("{}", reg.index_block());
         }
         Some(Cmd::Commands) => {
             println!(
                 "{}",
-                rupi_core::commands::index_block(&rupi_core::commands::command_dirs(&home))
+                rupi_core::commands::index_block(&command_dirs_filtered(&home, true))
             );
         }
         Some(Cmd::SkillLoad { name }) => {
-            let reg = SkillRegistry::discover(&skill_dirs(&home));
+            let reg = SkillRegistry::discover(&skill_dirs(&home, true));
             match reg.load_skill(&name) {
                 Some(body) => println!("{body}"),
                 None => eprintln!("unknown skill: {name}"),
@@ -522,12 +599,14 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
     let ext_path = ext_dir(home, cli);
     let mut ext_set = load_extensions(&mut tools, &ext_path);
-    let store = memory_store(home);
+    // 项目信任门：未信任则项目记忆/skills/命令全部不加载（只用全局）
+    let load_project = load_project_resources(home, cli);
+    let store = memory_store(home, load_project);
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
     let sess_db = SessionStore::open(home)?;
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     if cli.subagents {
@@ -570,7 +649,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         if input == "/commands" {
             println!(
                 "{}",
-                rupi_core::commands::index_block(&rupi_core::commands::command_dirs(home))
+                rupi_core::commands::index_block(&command_dirs_filtered(home, load_project))
             );
             continue;
         }
@@ -624,12 +703,12 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）；
         // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
         refresh_extensions(&mut tools, &mut ext_set);
-        skills.refresh(&skill_dirs(home));
+        skills.refresh(&skill_dirs(home, load_project));
         // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
         let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
         if let Some((name, args)) = slash.as_ref() {
             if let Some(expanded) =
-                rupi_core::commands::expand(&rupi_core::commands::command_dirs(home), name, args)
+                rupi_core::commands::expand(&command_dirs_filtered(home, load_project), name, args)
             {
                 println!("[command /{name}]");
                 input = expanded;
@@ -696,12 +775,14 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         None
     };
     let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
-    let store = memory_store(home);
+    // 项目信任门（全屏启动前 stdin 问一次，与 REPL 同语义）
+    let load_project = load_project_resources(home, cli);
+    let store = memory_store(home, load_project);
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
     let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(home)?));
     let (mut session, sid) = {
         let db = sess_db.lock().unwrap();
@@ -762,7 +843,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                     ));
                 }
                 if apply {
-                    let store = memory_store(&home_clone);
+                    let store = memory_store(&home_clone, true);
                     for m in &s.memory_ops {
                         match store.apply_write("add", &m.entry) {
                             Ok(_) => lines.push("[review] memory saved".into()),
@@ -799,8 +880,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         mem: &*mem,
         frozen: &frozen,
         skills: &*skills,
-        skill_dirs: skill_dirs(home),
-        command_dirs: rupi_core::commands::command_dirs(home),
+        skill_dirs: skill_dirs(home, load_project),
+        command_dirs: command_dirs_filtered(home, load_project),
         review_lines,
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
