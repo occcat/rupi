@@ -11,10 +11,10 @@
 | `pi-ai`（统一 LLM API，多 provider） | `rupi-llm`（`LlmProvider` trait + `OpenAiCompatProvider` + `AnthropicProvider`（`claude-*` 自动路由，system 独立参数/tool_result/user 交替合并/真 SSE）+ `GeminiProvider`（`gemini-*` 自动路由，user/model 角色/functionCall-Response/真流）+ `MockProvider`，`complete_streaming` 真 SSE；`--model` 启动指定，REPL `/model [名]` 会话内切换；回包兼容数组 content 与对象式 arguments；429/5xx + Retry-After 指数退避重试；Anthropic prompt caching（system/末工具断点）；`ThinkingLevel` 四档映射 reasoning_effort/thinkingLevel/thinking+budget（含签名回放：有签原样、无签降文本防 400，400 仍命中则去思考块重试一次），`--thinking` + REPL/TUI `/thinking` 会话内切换） |
 | 默认七工具 Read/Write/Edit/Bash/Glob/Grep/Think | `rupi-tools`（`ToolRegistry::with_builtins`；`read` 分页 offset/limit + 大文件截断标注，`bash` 支持 `timeout_secs` + 输出首尾保留中部折叠，上限 12k 字符，上下文有界；REPL/TUI 用 `with_sandboxed_builtins` 把 read/write/edit 约束在启动 cwd 内——`..`/绝对路径/符号链接逃逸拒绝并改写为绝对路径执行，subagent 克隆继承） |
 | sessions are trees（branch/rewind/summary） | `SessionTree::branch_from` / `rewind_to` / `prompt_history` 压缩窗口 + `AgentLoop::maybe_compress`（`--compress-threshold/--compress-keep` 全局，`RUPI_COMPRESSION_OVERRIDES` 按 `provider/model` 覆盖，对标上游 `compaction.modelOverrides`；溢出报错强制压实 + 同 turn 重发（`MAX_OVERFLOW_RECOVERIES=2` 封顶），对标上游 overflow recovery） |
-| 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + `sanitize_params` + `mcp_tool_to_definition` + server→client 请求应答 roots/ping + `McpManager` 配对注册） |
-| Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill` 工具） |
-| Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + provider/manager + `SessionStore` 触发器同步 FTS + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
-| Skill 自积累（后台 review 沉淀） | `SkillAccumulator::propose` + `rupi skill-distill` |
+| 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + StreamableHTTP（`url` 配置，POST 单 JSON/SSE 回包，`mcp-session-id` 保持）+ `sanitize_params` + `mcp_tool_to_definition` + server→client 请求应答 roots/ping（stdio 侧）+ `resources/list→read`（每 server `{server}_read_resource`）+ `prompts/list→get`（每 server `{server}_get_prompt`）+ `McpManager` 配对注册与失败隔离；`mcp-list` 三区段探活，`--url` 直探 HTTP） |
+| Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill`/`read_resource` 工具 + 每轮 `refresh` 热加载（蒸馏即对模型可见，REPL/TUI 同闭环）+ `SkillAccumulator::propose` 落盘校验（名/描述/steps，非 ascii 回合 hash 兜底命名）；内建 `skills/builtin` 走 exe 锚定发现，cwd 无关） |
+| Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + `<MemoryGuidance>` 指导块 + `--no-memory` 总开关 + provider/manager + `SessionStore` 触发器同步 FTS（trigram 中英文子串召回 + bm25 排名，老库自动迁移）+ 全局/项目 two-tier + 密钥拒写 + failures.md + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
+| Skill 自积累（后台 review 沉淀） | 启发式复盘默认开（`--no-review` 关，`--review-llm` 切模型版）：记忆/纠正失败/多工具草稿建议只打印，`--review-apply` 才落盘（MEMORY.md/failures.md/skills/）+ `rupi skill-distill` 手工蒸馏 |
 | 会话持久化 | 每轮落盘 `sessions.db`，`sessions` / `session-show` / `session-search`，`--resume <id>` 断点续聊（REPL + TUI 通用）；`/tree` 全分支视图 + `/goto <短id>` 跨分支时间旅行（节点 id 即库行 id，跨进程稳定） |
 | Extension 热重载（自写工具-重载-自测） | `rupi-ext`（manifest + 外部进程契约 stdin JSON→stdout，`ExtensionSet::refresh` mtime 增量重载，`--ext-dir`/`ext-list`，REPL `/reload` + 每轮自动检查；子进程 stdout 与内置 bash 同口径 12k 折叠，超时 `kill_on_drop` 无僵尸） |
 | 权限门与计划模式 | `rupi-agent::policy`（`AllowAll`/`RulePolicy`/`ChainPolicy` + `Approver`，拒绝转 tool error；`--plan` + REPL/TUI `/plan` 只读侦察；bash 高危子串转人工审批 `[y(es)/a(ll session)/N]`，选 a 的（工具+原因）本会话免打扰；TUI 内同语义全屏暂停问询；问询前后派发 `UiPromptStart/End` 事件供宿主区分等待耗时） |
@@ -54,7 +54,7 @@ export RUPI_GEMINI_KEY=... # 或 GEMINI_API_KEY / GOOGLE_API_KEY；网关 RUPI_G
 ./target/debug/rupi mcp-list python3 crates/rupi-mcp/tests/fake_mcp_server.py
 echo '[{"name":"fake","command":"python3","args":["crates/rupi-mcp/tests/fake_mcp_server.py"],"env":{}}]' > /tmp/mcp.json
 echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
-# → [mcp] 3 tools: mcp_echo, mcp_fail, mcp_roots_probe
+# → [mcp] 5 tools: fake_echo, fake_fail, fake_roots_probe, fake_read_resource, fake_get_prompt
 ```
 
 语义与 `pi-directx` 一致：stdio 上换行分隔 JSON-RPC 2.0，

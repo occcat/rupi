@@ -79,6 +79,23 @@ fn memory_write_show_search_roundtrip() {
 }
 
 #[test]
+fn builtin_skills_visible_regardless_of_cwd() {
+    // 内建技能走 exe 锚定发现：cwd 是隔离 temp 目录（无 skills/builtin）也必须可见，
+    // 否则换个目录跑就静默丢失 commit-helper 这类内建技能。
+    let home = fresh_home();
+    let o = rupi(&home, &["skills-list"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "skills-list 非零退出: {o:?}");
+    assert!(out.contains("commit-helper"), "cwd 外内建技能丢失:\n{out}");
+    let o = rupi(&home, &["skill-load", "commit-helper"])
+        .output()
+        .unwrap();
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "skill-load 非零退出: {o:?}");
+    assert!(!out.trim().is_empty(), "skill-load 空输出:\n{o:?}");
+}
+
+#[test]
 fn skill_distill_then_load() {
     let home = fresh_home();
     let o = rupi(

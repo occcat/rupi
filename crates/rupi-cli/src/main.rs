@@ -269,12 +269,34 @@ fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
 }
 
 fn skill_dirs(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("skills/builtin"), home.join("skills")];
+    let mut dirs = vec![builtin_skills_dir(), home.join("skills")];
     // 项目 skills 与项目记忆同门：信任被拒则不发现、不加载
     if load_project {
         dirs.push(PathBuf::from(".rupi/skills"));
     }
     dirs
+}
+
+/// 内建 skills 目录：从 exe 所在位置向上找 `skills/builtin`
+///（`cargo run` 与安装后都对）；找不到回退 cwd 相对路径（仓库根跑二进制的老行为）。
+///此前纯 `skills/builtin` 相对路径：换个 cwd 跑就静默丢失内建技能。
+fn builtin_skills_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..5 {
+            match dir {
+                Some(d) => {
+                    let cand = d.join("skills/builtin");
+                    if cand.is_dir() {
+                        return cand;
+                    }
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+                None => break,
+            }
+        }
+    }
+    PathBuf::from("skills/builtin")
 }
 
 /// 自定义命令目录：与 skills 同门，信任被拒只留全局 `~/commands`。
