@@ -183,7 +183,9 @@ impl AgentLoop {
                         Some(rupi_llm::StreamEvent::TextDelta(delta)) => {
                             on_event(AgentEvent::TextDelta { delta });
                         }
-                        None => continue,
+                        // 发送端已关闭（provider 收尾中）：直接等完成，
+                        // 否则关闭后的 recv 永远就绪空转，空烧 CPU。
+                        None => break fut.await?,
                     },
                 }
             };
@@ -304,10 +306,18 @@ impl AgentLoop {
                         }
                         Err(e) => rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}")),
                     }
-                } else if let Some(routed) = mem.handle_tool_call(&name, args.clone()).await? {
-                    rupi_tools::ToolOutput::ok(routed)
                 } else {
-                    tools.execute(&name, args.clone()).await?
+                    // 工具执行错误一律转 tool error 回模型，主循环不中断
+                    // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
+                    match mem.handle_tool_call(&name, args.clone()).await {
+                        Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
+                        Ok(None) => tools.execute(&name, args.clone()).await.unwrap_or_else(|e| {
+                            rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
+                        }),
+                        Err(e) => rupi_tools::ToolOutput::err(format!(
+                            "memory tool {name} failed: {e:#}"
+                        )),
+                    }
                 };
                 on_event(AgentEvent::ToolEnd {
                     tool_call_id: id.clone(),
