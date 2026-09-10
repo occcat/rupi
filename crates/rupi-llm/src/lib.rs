@@ -195,7 +195,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let mut buf = String::new();
         let mut acc = SseAccumulator::default();
         let mut stop_reason = "stop".to_string();
-        while let Some(chunk) = stream.next().await {
+        'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
@@ -207,8 +207,10 @@ impl LlmProvider for OpenAiCompatProvider {
                 let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                     continue;
                 };
+                // [DONE] 是流终结符：必须跳出外层字节循环，否则
+                // 连接复用的网关会让 next() 永远等待，整轮卡死。
                 if data == "[DONE]" {
-                    break;
+                    break 'stream;
                 }
                 let v: serde_json::Value = serde_json::from_str(data)?;
                 acc.apply_chunk(&v, &tx).await;
