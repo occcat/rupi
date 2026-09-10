@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
 pub use anthropic::AnthropicProvider;
+pub mod gemini;
+pub use gemini::GeminiProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
