@@ -273,6 +273,14 @@ fn empty_states_exit_zero() {
         out.contains("no sessions yet"),
         "sessions 空库零输出:\n{out}"
     );
+    // 未知会话 id 给提示（与“存在但空”区分）
+    let o = rupi(&home, &["session-show", "deadbeef"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "session-show 非零退出: {o:?}");
+    assert!(
+        out.contains("unknown session"),
+        "session-show 未知 id 零输出:\n{out}"
+    );
     // 空扩展目录给提示而非零输出（审计项回归）
     let o = rupi(&home, &["ext-list"]).output().unwrap();
     let (out, _) = out_text(&o);

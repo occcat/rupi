@@ -781,6 +781,15 @@ impl SessionStore {
         Ok(())
     }
 
+    /// 会话是否存在（`session-show` 未知 id 给提示，不与空会话混淆）。
+    pub fn has_session(&self, session_id: &str) -> anyhow::Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?",
+            rusqlite::params![session_id],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
+    }
+
     /// 读回压缩摘要（resume 时可预热窗口；当前 CLI 只展示）。
     pub fn get_summary(&self, session_id: &str) -> anyhow::Result<String> {
         Ok(self.conn.query_row(

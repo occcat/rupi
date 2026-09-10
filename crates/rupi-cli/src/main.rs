@@ -487,6 +487,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::SessionShow { id }) => {
             let store = SessionStore::open(&home)?;
+            if !store.has_session(&id)? {
+                println!("unknown session: {id} (see `sessions`)");
+                return Ok(());
+            }
             let summary = store.get_summary(&id).unwrap_or_default();
             if !summary.is_empty() {
                 println!("== summary ==\n{summary}");
