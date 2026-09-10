@@ -120,15 +120,20 @@ impl rupi_tools::Tool for ExternalTool {
                 return Ok(rupi_tools::ToolOutput::err("write stdin failed"));
             }
         }
+        let timeout_secs = m.timeout_secs.max(1);
         let out = tokio::time::timeout(
-            std::time::Duration::from_secs(m.timeout_secs.max(1)),
+            std::time::Duration::from_secs(timeout_secs),
             child.wait_with_output(),
         )
         .await;
         // 超时：timeout 会丢弃 wait future，连带 kill_on_drop(true) 干掉子进程，无僵尸
         match out {
             Ok(Ok(out)) => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // 外部进程输出同样有界：与内置 bash 同口径折叠，保上下文窗口
+                let text =
+                    rupi_tools::truncate_middle(&String::from_utf8_lossy(&out.stdout), rupi_tools::MAX_TOOL_OUTPUT)
+                        .trim()
+                        .to_string();
                 if out.status.success() {
                     Ok(rupi_tools::ToolOutput::ok(text))
                 } else {
@@ -141,8 +146,7 @@ impl rupi_tools::Tool for ExternalTool {
             }
             Ok(Err(e)) => Ok(rupi_tools::ToolOutput::err(format!("wait failed: {e}"))),
             Err(_) => Ok(rupi_tools::ToolOutput::err(format!(
-                "extension timed out after {}s",
-                m.timeout_secs
+                "extension timed out after {timeout_secs}s"
             ))),
         }
     }
