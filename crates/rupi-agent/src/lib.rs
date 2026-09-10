@@ -75,6 +75,11 @@ pub enum ToolExecution {
     Parallel,
 }
 
+/// 溢出恢复上限：上下文溢出后强制压实 + 重发本轮最多 2 次；仍爆则把原错
+/// 返回给调用方（可能是模型窗口真装不下 keep 窗，需人工调参）。
+/// 对标上游 overflow recovery 的有界重试（`maxRetries` 系）。
+pub const MAX_OVERFLOW_RECOVERIES: u32 = 2;
+
 /// 第一阶段产物：门已过完（或已拒绝），等第二阶段真实执行。
 struct PendingCall {
     id: String,
@@ -364,7 +369,12 @@ impl AgentLoop {
         let recalled = mem.prefetch_all().await;
 
         let mut tool_names: Vec<String> = vec![];
-        for turn in 1..=self.max_turns {
+        // 溢出恢复不占 turn 配额：强制压实后重发同一 turn（`turn -= 1; continue` 回绕，
+        // 对标上游 overflow recovery 的独立 attempt 计数；`MAX_OVERFLOW_RECOVERIES` 封顶）。
+        let mut turn: u32 = 0;
+        let mut overflow_recoveries: u32 = 0;
+        while turn < self.max_turns {
+            turn += 1;
             on_event(AgentEvent::TurnStart { turn });
             // 本轮可见工具：关闭发现 = 全量（历史行为）；开启 = 常驻 + 已发现 + search_tools。
             // 系统提示同步分区，否则 AvailableTools 段会泄漏未发现工具的存在。
@@ -403,17 +413,37 @@ impl AgentLoop {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<rupi_llm::StreamEvent>(64);
             let fut = provider.complete_streaming(req, tx);
             tokio::pin!(fut);
-            let resp = loop {
+            let stream_result: anyhow::Result<rupi_llm::ChatResponse> = loop {
                 tokio::select! {
-                    r = &mut fut => break r?,
+                    r = &mut fut => break r,
                     msg = rx.recv() => match msg {
                         Some(rupi_llm::StreamEvent::TextDelta(delta)) => {
                             on_event(AgentEvent::TextDelta { delta });
                         }
                         // 发送端已关闭（provider 收尾中）：直接等完成，
                         // 否则关闭后的 recv 永远就绪空转，空烧 CPU。
-                        None => break fut.await?,
+                        None => break fut.await,
                     },
+                }
+            };
+            let resp = match stream_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // 上下文溢出：阈值压实没拦住的一步撑爆，强制压实后重发本轮
+                    //（此前 `?` 直接 abort 整轮，会话假死只能手动 /compact）。
+                    let msg = format!("{e:#}");
+                    if overflow_recoveries < MAX_OVERFLOW_RECOVERIES
+                        && rupi_llm::is_overflow_error(&msg)
+                    {
+                        overflow_recoveries += 1;
+                        tracing::warn!(
+                            "上下文溢出：强制压实后重发第 {turn} 轮（第 {overflow_recoveries} 次恢复）: {msg}"
+                        );
+                        self.force_compress(provider, session, mem).await;
+                        turn -= 1;
+                        continue;
+                    }
+                    return Err(e);
                 }
             };
             // select 竞速可能提前 break，排空残留 delta 保顺序完整
@@ -649,24 +679,47 @@ impl AgentLoop {
         session: &mut SessionTree,
         mem: &MemoryManager,
     ) {
+        self.compress_inner(provider, session, mem, false).await;
+    }
+
+    /// 强制压实（溢出恢复用）：跳过阈值与“新增不足一窗”检查，只要条数够切就摘要。
+    /// 条数都不够切（`total <= keep`）时无能为力，直接返回，调用方按重试上限收敛。
+    pub async fn force_compress(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+    ) {
+        self.compress_inner(provider, session, mem, true).await;
+    }
+
+    async fn compress_inner(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+        force: bool,
+    ) {
         // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的阈值。
         let (threshold_chars, keep_last) = self.compression_for(provider);
-        if session.history_chars() <= threshold_chars {
-            return;
-        }
-        // 已压缩过且新增不足一窗：跳过，避免每轮重复烧模型
-        // tail = 上次压缩点之后未压缩的消息数；首轮压缩后 tail == keep，
-        // 新增 new_count 条后 tail == keep + new_count；new_count <= keep 时跳过。
-        if let Some(through) = &session.summary_through {
-            if session.summary.is_some() {
-                let pos = session
-                    .current_path
-                    .iter()
-                    .position(|id| id == through)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                if session.current_path.len().saturating_sub(pos) <= keep_last * 2 {
-                    return;
+        if !force {
+            if session.history_chars() <= threshold_chars {
+                return;
+            }
+            // 已压缩过且新增不足一窗：跳过，避免每轮重复烧模型
+            // tail = 上次压缩点之后未压缩的消息数；首轮压缩后 tail == keep，
+            // 新增 new_count 条后 tail == keep + new_count；new_count <= keep 时跳过。
+            if let Some(through) = &session.summary_through {
+                if session.summary.is_some() {
+                    let pos = session
+                        .current_path
+                        .iter()
+                        .position(|id| id == through)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    if session.current_path.len().saturating_sub(pos) <= keep_last * 2 {
+                        return;
+                    }
                 }
             }
         }
@@ -1015,6 +1068,137 @@ mod tests {
         // 顶层非对象/坏 JSON → 空表
         assert!(parse_compression_overrides("[1,2]").is_empty());
         assert!(parse_compression_overrides("{oops").is_empty());
+    }
+
+    /// 溢出恢复替身：聊天首 `fail_times` 次报溢出（之后正常），摘要请求永远正常。
+    /// 摘要与聊天的区分走 system 前缀（与 `maybe_compress` 的摘要 prompt 对齐）。
+    struct FlakyOverflow {
+        fail_times: u32,
+        calls: std::sync::Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyOverflow {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(&self, req: rupi_llm::ChatRequest) -> anyhow::Result<ChatResponse> {
+            if req.system.starts_with("Summarize this conversation") {
+                return Ok(MockProvider::text_response("FORCED-SUMMARY"));
+            }
+            let mut g = self.calls.lock().unwrap();
+            *g += 1;
+            if *g <= self.fail_times {
+                anyhow::bail!("prompt is too long: 213462 tokens > 200000 maximum");
+            }
+            Ok(MockProvider::text_response("recovered!"))
+        }
+    }
+
+    async fn run_with(
+        tag: &str,
+        agent: &AgentLoop,
+        provider: &FlakyOverflow,
+        session: &mut SessionTree,
+    ) -> anyhow::Result<StopReason> {
+        let tools = ToolRegistry::with_builtins();
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-overflow-{tag}-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                provider,
+                session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+    }
+
+    fn long_session(n: usize) -> SessionTree {
+        let mut s = SessionTree::new();
+        for i in 0..n {
+            s.push(Message::text(Role::User, format!("m{i}")));
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn overflow_forces_compress_and_retries_turn() {
+        // 默认阈值 60k：短消息不触发普通压实；首轮聊天报溢出 → 强制压实 → 重发成功。
+        // 25 条 > keep 20，force 切得动（cut=5/6）。
+        let agent = AgentLoop::new(3);
+        let provider = FlakyOverflow {
+            fail_times: 1,
+            calls: std::sync::Mutex::new(0),
+        };
+        let mut session = long_session(25);
+        let reason = run_with("recover", &agent, &provider, &mut session)
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Done));
+        assert!(session.summary.as_ref().unwrap().contains("FORCED-SUMMARY"));
+        assert!(session
+            .history()
+            .iter()
+            .any(|m| m.full_text().contains("recovered!")));
+    }
+
+    #[tokio::test]
+    async fn non_overflow_error_still_aborts() {
+        struct AuthFail;
+        #[async_trait::async_trait]
+        impl LlmProvider for AuthFail {
+            fn name(&self) -> &str {
+                "authfail"
+            }
+            async fn complete(&self, _req: rupi_llm::ChatRequest) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("anthropic 401: invalid x-api-key")
+            }
+        }
+        let agent = AgentLoop::new(3);
+        let mut session = long_session(25);
+        let tools = ToolRegistry::with_builtins();
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-nooverflow-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let err = agent
+            .run(
+                &AuthFail,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid x-api-key"));
+        // 非溢出不触发强制压实
+        assert!(session.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn overflow_gives_up_after_bounded_recoveries() {
+        let agent = AgentLoop::new(3);
+        let provider = FlakyOverflow {
+            fail_times: 99,
+            calls: std::sync::Mutex::new(0),
+        };
+        let mut session = long_session(25);
+        let err = run_with("giveup", &agent, &provider, &mut session)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("prompt is too long"));
+        // 两次恢复都压过（第二次是无新内容重复压，有界收敛不打转）
+        assert!(*provider.calls.lock().unwrap() == 1 + MAX_OVERFLOW_RECOVERIES);
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ pub mod anthropic;
 pub use anthropic::AnthropicProvider;
 pub mod gemini;
 pub use gemini::GeminiProvider;
+pub mod overflow;
+pub use overflow::is_overflow_error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {

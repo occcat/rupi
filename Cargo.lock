@@ -1437,6 +1437,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "regex",
  "reqwest",
  "rupi-core",
  "serde",
