@@ -95,6 +95,75 @@ pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
     vec![home.join("commands"), PathBuf::from(".rupi/commands")]
 }
 
+/// 列出命令：按名称排序的 (name, description)。
+/// description 取 frontmatter `description:`，无则取正文首个非空行（压单行、截 80 字符）。
+pub fn list(dirs: &[PathBuf]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = discover(dirs)
+        .iter()
+        .map(|(name, path)| (name.clone(), describe_file(path)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// 渲染 `/commands` 列表块：无命令时给一句提示（含目录指引）。
+pub fn index_block(dirs: &[PathBuf]) -> String {
+    let items = list(dirs);
+    if items.is_empty() {
+        return "no custom commands. drop `<name>.md` into one of:\n".to_owned()
+            + &dirs
+                .iter()
+                .map(|d| format!("  - {}", d.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+    }
+    let mut s = String::from("custom commands:");
+    for (name, desc) in items {
+        s.push_str(&format!("\n  /{name}  {desc}"));
+    }
+    s
+}
+
+fn describe_file(path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    if let Some(d) = frontmatter_description(&raw) {
+        return one_line(&d, 80);
+    }
+    let body = strip_frontmatter(&raw);
+    let first = body.lines().map(str::trim).find(|l| !l.is_empty());
+    one_line(first.unwrap_or(""), 80)
+}
+
+/// 从可选 YAML frontmatter 取 `description:` 值（单行 `key: value` 解析，不引入 YAML 依赖）。
+fn frontmatter_description(raw: &str) -> Option<String> {
+    let t = raw.trim_start();
+    let rest = t.strip_prefix("---")?;
+    let end = rest.find("---")?;
+    rest[..end].lines().find_map(|l| {
+        let l = l.trim();
+        let v = l.strip_prefix("description")?.trim_start();
+        let v = v.strip_prefix(':')?.trim();
+        let v = v.trim_matches(|c| c == '"' || c == '\'');
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_owned())
+        }
+    })
+}
+
+fn one_line(s: &str, limit: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= limit {
+        flat
+    } else {
+        let cut: String = flat.chars().take(limit - 1).collect();
+        format!("{cut}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +209,35 @@ mod tests {
         write(&base, "Bad Name.md", "x");
         assert!(!discover(&dirs).contains_key("bad name"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_prefers_frontmatter_description_and_sorts() {
+        let base = std::env::temp_dir().join(format!("rupi-cmd-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        write(
+            &base,
+            "zebra.md",
+            "---\ndescription: \"strip quotes\"\n---\n\nZebra body.\n",
+        );
+        write(&base, "apple.md", "\n\nFirst line here.\nSecond.\n");
+        let dirs = vec![base.clone()];
+        let items = list(&dirs);
+        assert_eq!(
+            items,
+            vec![
+                ("apple".to_owned(), "First line here.".to_owned()),
+                ("zebra".to_owned(), "strip quotes".to_owned()),
+            ]
+        );
+        let block = index_block(&dirs);
+        assert!(block.contains("/apple") && block.contains("/zebra"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn index_block_empty_dirs_hints_paths() {
+        let block = index_block(&[PathBuf::from("/nonexistent-rupi-cmd")]);
+        assert!(block.contains("no custom commands"));
     }
 }

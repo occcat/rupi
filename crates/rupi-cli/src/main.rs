@@ -106,6 +106,8 @@ enum Cmd {
     },
     /// 列出 skills
     SkillsList,
+    /// 列出自定义斜杠命令（commands/*.md）
+    Commands,
     /// 加载 skill 全文
     SkillLoad { name: String },
     /// 从步骤提炼新 skill（自积累）
@@ -239,6 +241,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::SkillsList) => {
             let reg = SkillRegistry::discover(&skill_dirs(&home));
             println!("{}", reg.index_block());
+        }
+        Some(Cmd::Commands) => {
+            println!(
+                "{}",
+                rupi_core::commands::index_block(&rupi_core::commands::command_dirs(&home))
+            );
         }
         Some(Cmd::SkillLoad { name }) => {
             let reg = SkillRegistry::discover(&skill_dirs(&home));
@@ -509,7 +517,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -530,6 +538,13 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         }
         if input == "/skills" {
             println!("{}", skills.index_block());
+            continue;
+        }
+        if input == "/commands" {
+            println!(
+                "{}",
+                rupi_core::commands::index_block(&rupi_core::commands::command_dirs(home))
+            );
             continue;
         }
         if input == "/reload" {

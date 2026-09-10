@@ -88,3 +88,5 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 可选 YAML frontmatter（`description` 等）只做元信息，解析时剥离；空文件不展开。
 - 内建命令（`/quit`、`/tree`、`/goto` 等）优先；未知 `/foo` 先查自定义命令，
   命中则展开后发送（REPL 打印 `[command /foo]`，TUI 插一行同名系统提示），查不到才当普通消息。
+- 发现：`rupi commands` 子命令与 REPL/TUI 内 `/commands` 列出全部自定义命令
+ （description 取自 frontmatter，无则取正文首行）。

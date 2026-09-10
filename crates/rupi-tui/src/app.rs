@@ -133,7 +133,7 @@ async fn run_loop(
     ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/skills 看技能，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -161,6 +161,10 @@ async fn run_loop(
                 }
                 if text.trim() == "/skills" {
                     view.push_system(ctx.skills.index_block());
+                    continue;
+                }
+                if text.trim() == "/commands" {
+                    view.push_system(commands::index_block(&ctx.command_dirs));
                     continue;
                 }
                 if text.trim() == "/tree" {
