@@ -327,6 +327,15 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
             };
         }
         eprintln!("[resume {}] restored {} msgs", id, s.history().len());
+        // 压缩摘要预热：prompt 窗口直接带上旧摘要 + 近期，避免超长恢复历史全文送模型。
+        // through 取首条，保证 guard 把它视为“已压缩过”，新增不足一窗时跳过重复压缩。
+        let stored = sess_db.get_summary(id).unwrap_or_default();
+        if !stored.is_empty() {
+            if let Some(first) = s.current_path.first().cloned() {
+                s.summary = Some(stored);
+                s.summary_through = Some(first);
+            }
+        }
         Ok((s, id.clone()))
     } else {
         let sid = sess_db.create_session("default")?;
@@ -426,7 +435,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 
     println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
-    let mut saved_summary = String::new();
+    let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
     loop {
         line.clear();
@@ -599,7 +608,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }),
         );
     }
-    let saved = Arc::new(std::sync::Mutex::new(String::new()));
+    let saved = Arc::new(std::sync::Mutex::new(
+        session.summary.clone().unwrap_or_default(),
+    ));
     let ctx = rupi_tui::TuiContext {
         provider: &*provider,
         agent: &agent,
