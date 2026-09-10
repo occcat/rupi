@@ -143,9 +143,13 @@ impl HeuristicReviewer {
             .take(4)
             .collect::<Vec<_>>()
             .join("-");
-        if slug.is_empty() {
-            return None;
-        }
+        // 非 ascii 输入（如纯中文）提不出词：退回输入的稳定 hash，保证中文回合也有草稿
+        //（FNV-1a 手写：不给 review 引新依赖，且跨进程确定可复现）。
+        let slug = if slug.is_empty() {
+            format!("{:08x}", fnv1a32(&t.user))
+        } else {
+            slug
+        };
         let name = format!("auto-{}", &slug[..slug.len().min(50)]);
         Some(SkillDraftSuggestion {
             description: format!(
@@ -159,6 +163,15 @@ impl HeuristicReviewer {
             name,
         })
     }
+}
+
+fn fnv1a32(s: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 #[async_trait::async_trait]
@@ -414,6 +427,39 @@ mod tests {
         assert!(d.name.starts_with("auto-"));
         assert!(d.name.len() <= 64);
         assert!(d.steps.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn chinese_only_turn_still_yields_valid_skill_draft() {
+        // 纯中文提不出 ascii 词：hash 兜底保证草稿不断，且名字过 Accumulator 校验
+        //（小写 ascii + 连字符，见 rupi-skills validate_name）。
+        let r = HeuristicReviewer::default();
+        let t = TurnTranscript {
+            user: "读配置并搜索日志".into(),
+            assistant: "done".into(),
+            tool_names: vec!["read".into(), "bash".into()],
+        };
+        let s = r.review_turn(&t).await.unwrap();
+        let d = s.skill_draft.expect("中文回合也应有草稿");
+        assert!(d.name.starts_with("auto-"), "{}", d.name);
+        assert!(
+            d.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{}",
+            d.name
+        );
+        let again = r.review_turn(&t).await.unwrap().skill_draft.expect("draft");
+        assert_eq!(d.name, again.name, "hash 兜底必须跨次稳定");
+        // 真过 Accumulator 落盘校验（规则不止字符集，还有长度与前后连字符）
+        let base = std::env::temp_dir().join(format!("rupi-review-cjk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let acc = rupi_skills::SkillAccumulator::new(base.clone());
+        let dir = acc
+            .propose(&d.name, &d.description, &d.steps)
+            .expect("hash 名应过落盘校验");
+        assert!(dir.join("SKILL.md").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
