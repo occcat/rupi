@@ -58,6 +58,31 @@ pub fn contains_secret(text: &str) -> bool {
     false
 }
 
+/// 无语义信号的输入（对标 Hermes `is_trivial_prompt` + `TRIVIAL_PROMPT_RE`）：
+/// 空输入、斜杠命令、纯招呼/确认（`hi!`/`thanks :)`/`done???`），命中则跳过本轮外部
+/// recall——省一次后端往返，且陈旧上下文不会带偏单字回复。`k8s`/`yolo`/`note` 这类
+/// 词内命中不算（词后只许跟标点），大小写不敏感；实现与原正则逐项等价（先 trim，
+/// 再“词表词 + 纯标点尾”全匹配），不另引 regex 依赖。
+pub fn is_trivial_prompt(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() || stripped.starts_with('/') {
+        return true;
+    }
+    let lower = stripped.to_lowercase();
+    let word = lower.trim_end_matches([
+        ' ', '\t', '\n', '\r', '!', '?', '.', ':', ';', ',', '"', '\'', '~', '\u{2018}',
+        '\u{2019}', '\u{201c}', '\u{201d}', '\u{2014}', '\u{2013}', '\u{2026}', '(', ')', '[',
+        ']', '{', '}', '<', '>', '*', '&', '^', '%', '$', '#', '@', '+', '=', '`', '\u{a0}',
+    ]);
+    matches!(
+        word,
+        "yes" | "no" | "ok" | "okay" | "sure" | "thanks" | "thank you" | "y" | "n"
+            | "yep" | "nope" | "yeah" | "nah" | "hi" | "hey" | "hello" | "yo" | "sup"
+            | "continue" | "go ahead" | "do it" | "proceed" | "got it" | "cool" | "nice"
+            | "great" | "done" | "next" | "lgtm" | "k"
+    )
+}
+
 /// 内建记忆文件：受 char limit 保护（默认 ~800 tokens / ~500 tokens），超限截断保尾部。
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
@@ -493,7 +518,13 @@ impl MemoryManager {
         s
     }
 
-    pub async fn prefetch_all(&self) -> String {
+    pub async fn prefetch_all(&self, query: &str) -> String {
+        // 寒暄/应答/斜杠命令跳过外部 recall（对标 Hermes prefetch 门）：
+        // 省后端往返，且陈旧上下文不带偏单字回复；显式 recall/memory_search 工具不受影响。
+        if is_trivial_prompt(query) {
+            tracing::debug!("memory prefetch skipped for trivial prompt");
+            return String::new();
+        }
         match &self.external {
             Some(e) => {
                 match tokio::time::timeout(std::time::Duration::from_secs(3), e.prefetch()).await {
@@ -964,9 +995,75 @@ mod tests {
         assert!(m.register_external("b".into(), Box::new(Q)).is_err());
     }
 
+    #[test]
+    fn trivial_prompt_gate_matches_hermes_contract() {
+        // 命中：空/空白、斜杠命令、纯招呼与确认（含标点尾与大小写）
+        for t in [
+            "",
+            "   ",
+            "/tree",
+            "/model gpt",
+            "hi",
+            "hi!",
+            "Hi :)",
+            "thanks",
+            "Thank you",
+            "thank you!",
+            "done???",
+            "OK",
+            "ok.",
+            "y",
+            "k",
+            "lgtm",
+            "go ahead.",
+            "do it!",
+            "proceed",
+            "got it",
+            "yeah...",
+            "  nope  ",
+        ] {
+            assert!(is_trivial_prompt(t), "应判寒暄：{t:?}");
+        }
+        // 不命中：词内前缀（k8s/yolo/note）、带实义尾巴、正常提问
+        for t in [
+            "k8s",
+            "yolo",
+            "note",
+            "hi there",
+            "hello world",
+            "superman",
+            "ok then",
+            "notes on auth?",
+            "how are you?",
+            "thanks for the fish recipe",
+            "done with the migration?",
+            "next step is what",
+            "continue from line 42",
+        ] {
+            assert!(!is_trivial_prompt(t), "误判寒暄：{t:?}");
+        }
+    }
+
     #[tokio::test]
-    async fn jsonl_provider_prefetch_sync_recall() {
-        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
+    async fn manager_prefetch_skips_trivial_prompts() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut mgr = MemoryManager::new(MemoryStore::new(home.clone()));
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        mgr.register_external("jsonl".into(), Box::new(p)).unwrap();
+        mgr.sync_all("buy oolong tea", "noted").await;
+        // 实义 query 走外部 recall，非空
+        assert!(!mgr.prefetch_all("what tea did I buy?").await.is_empty());
+        // 寒暄/斜杠直接短路，纵使缓存有货也不打扰
+        assert_eq!(mgr.prefetch_all("hi").await, "");
+        assert_eq!(mgr.prefetch_all("thanks!").await, "");
+        assert_eq!(mgr.prefetch_all("/tree").await, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn jsonl_provider_prefetch_sync_recall() {        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let mut p = JsonlProvider::new(10);
         p.initialize(&home).await.unwrap();

@@ -365,8 +365,8 @@ impl AgentLoop {
         let mut all_tools = tools.definitions();
         all_tools.extend(mem.all_tool_definitions());
         all_tools.extend(skills.tool_definitions());
-        // 记忆 prefetch：注入到本轮（不污染冻结快照）
-        let recalled = mem.prefetch_all().await;
+        // 记忆 prefetch：注入到本轮（不污染冻结快照）；寒暄门在 manager 内
+        let recalled = mem.prefetch_all(user_input).await;
 
         let mut tool_names: Vec<String> = vec![];
         // 溢出恢复不占 turn 配额：强制压实后重发同一 turn（`turn -= 1; continue` 回绕，
