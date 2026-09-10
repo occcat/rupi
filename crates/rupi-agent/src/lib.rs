@@ -953,6 +953,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_compress_compacts_without_threshold() {
+        // /compact 直调 force：阈值检查跳过，条数够切即压；短历史无操作不烧模型。
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let mut session = SessionTree::new();
+        for i in 0..6 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let home = std::env::temp_dir().join(format!("rupi-agent-force-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .maybe_compress(
+                &MockProvider::new(vec![MockProvider::text_response("UNUSED")]),
+                &mut session,
+                &mem,
+            )
+            .await;
+        assert!(session.summary.is_none(), "阈值 MAX 时 maybe 应跳过");
+        agent
+            .force_compress(
+                &MockProvider::new(vec![MockProvider::text_response("FORCED-SUMMARY")]),
+                &mut session,
+                &mem,
+            )
+            .await;
+        assert!(
+            session.summary.as_ref().unwrap().contains("FORCED-SUMMARY"),
+            "force 应跳过阈值直接压实"
+        );
+        let mut tiny = SessionTree::new();
+        tiny.push(Message::text(Role::User, "hi"));
+        agent
+            .force_compress(
+                &MockProvider::new(vec![MockProvider::text_response("UNUSED")]),
+                &mut tiny,
+                &mem,
+            )
+            .await;
+        assert!(tiny.summary.is_none(), "条数不够切时 force 应无操作");
+    }
+
+    #[tokio::test]
     async fn compress_summarizes_prefix_and_shrinks_window() {
         // 剧本：首个 complete 是压缩摘要，第二个是正常回合答复
         let provider = MockProvider::new(vec![

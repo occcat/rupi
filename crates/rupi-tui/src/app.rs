@@ -129,10 +129,12 @@ pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
 }
 
 /// 内建斜杠派发结果：Quit 退出主循环；Done 顯示一行系统消息并等下一输入；
-/// Pass 非内建，调用方走自定义展开/发送。纯逻辑（无终端依赖），可单测。
+/// Compact 手动压实（async，调用方执行后推行反馈）；Pass 非内建，调用方走自定义展开/发送。
+/// 纯逻辑（无终端依赖），可单测。
 enum Builtin {
     Quit,
     Done(String),
+    Compact,
     Pass,
 }
 
@@ -231,6 +233,10 @@ fn dispatch_builtin(
             "[reload] hot reload is REPL-only; restart TUI to pick up extension changes".into(),
         );
     }
+    if t == "/compact" {
+        // 压实调模型是 async：这里只做标记，run_loop 内 await 执行（与 REPL /compact 同反馈文案）
+        return Builtin::Compact;
+    }
     Builtin::Pass
 }
 
@@ -244,7 +250,7 @@ async fn run_loop(
     ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -290,6 +296,18 @@ async fn run_loop(
                     Builtin::Quit => break,
                     Builtin::Done(msg) => {
                         view.push_system(msg);
+                        continue;
+                    }
+                    Builtin::Compact => {
+                        let before = ctx.session.summary.clone();
+                        ctx.agent
+                            .force_compress(&**ctx.provider, ctx.session, ctx.mem)
+                            .await;
+                        if ctx.session.summary != before && ctx.session.summary.is_some() {
+                            view.push_system("[compacted]".into());
+                        } else {
+                            view.push_system("[compact] nothing to compress".into());
+                        }
                         continue;
                     }
                     Builtin::Pass => {}
@@ -805,6 +823,24 @@ mod tests {
             "[rewound]"
         );
         assert!(session.current_path.len() < 3);
+    }
+
+    #[test]
+    fn compact_maps_to_marker_not_model() {
+        // /compact 只做标记（async 压实由 run_loop 执行），绝不漏进模型
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert!(matches!(
+            dispatch_builtin(
+                "/compact",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+            ),
+            Builtin::Compact
+        ));
     }
 
     #[test]

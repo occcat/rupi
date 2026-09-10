@@ -987,7 +987,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -1076,6 +1076,17 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         }
         if input == "/tree" {
             print!("{}", session.tree_view());
+            continue;
+        }
+        // 手动压实（对标上游 /compact）：阈值外的主动压缩，短历史给反馈不烧模型
+        if input == "/compact" {
+            let before = session.summary.clone();
+            agent.force_compress(&*provider, &mut session, &mem).await;
+            if session.summary != before && session.summary.is_some() {
+                println!("[compacted]");
+            } else {
+                println!("[compact] nothing to compress");
+            }
             continue;
         }
         // 裸 `/goto`（无参数）必须拦截给用法提示：此前漏进自定义命令查找，
