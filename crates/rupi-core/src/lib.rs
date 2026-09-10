@@ -1,6 +1,8 @@
 //! rupi-core: Pi Agent 核心类型 —— 消息、会话树、事件、工具定义、扩展点。
 //! 对标 `pi-agent-core` 的最小运行时无关层：只放类型与 trait，不依赖任何 LLM 或 IO。
 
+pub mod commands;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

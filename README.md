@@ -80,3 +80,11 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 后台 review：`chat --review` 每轮后安静复盘并打印记忆/Skill 建议（默认离线启发式，`--review-llm`
   用模型做 JSON 复盘，提炼质量更高），
   `--review-apply` 直接落盘（`MEMORY.md` add + skill 草稿；已存在 skill 跳过不覆盖）。
+
+## 自定义斜杠命令
+
+- 文件即命令：`~/.rupi/commands/<name>.md`（或项目级 `.rupi/commands/<name>.md`）
+  即 `/name args`，正文为提示模板，`$ARGUMENTS` 替换为用户参数，无占位符则追加到末尾。
+- 可选 YAML frontmatter（`description` 等）只做元信息，解析时剥离；空文件不展开。
+- 内建命令（`/quit`、`/tree`、`/goto` 等）优先；未知 `/foo` 先查自定义命令，
+  命中则展开后发送（REPL 打印 `[command /foo]`，TUI 插一行同名系统提示），查不到才当普通消息。

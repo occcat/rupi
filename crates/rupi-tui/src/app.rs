@@ -19,7 +19,7 @@ use ratatui::{
     Terminal,
 };
 use rupi_agent::AgentLoop;
-use rupi_core::{AgentEvent, SessionTree};
+use rupi_core::{commands, AgentEvent, SessionTree};
 use rupi_llm::LlmProvider;
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
@@ -38,6 +38,8 @@ pub struct TuiContext<'a> {
     pub skills: &'a SkillRegistry,
     /// skill 发现目录：每轮发送前 `refresh`，会话内新蒸馏 skill 即时可见（与 REPL 同闭环）。
     pub skill_dirs: Vec<std::path::PathBuf>,
+    /// 自定义斜杠命令目录：发送前展开（与 REPL 同语义）。
+    pub command_dirs: Vec<std::path::PathBuf>,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
@@ -128,7 +130,7 @@ enum Control {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    mut ctx: TuiContext<'_>,
+    ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
     view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/skills 看技能，PgUp/PgDn 滚动".into());
@@ -177,7 +179,18 @@ async fn run_loop(
                     }
                     continue;
                 }
-                view.push_user(text.clone());
+                // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
+                let slash =
+                    commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
+                let mut send_text = text.clone();
+                if let Some((name, args)) = slash.as_ref() {
+                    if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args)
+                    {
+                        view.push_system(format!("[command /{name}]"));
+                        send_text = expanded;
+                    }
+                }
+                view.push_user(send_text.clone());
                 scroll = 0;
                 // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
                 ctx.skills.refresh(&ctx.skill_dirs);
@@ -194,7 +207,7 @@ async fn run_loop(
                     &ctx.on_turn,
                     &mut reader,
                     &mut view,
-                    text,
+                    send_text,
                 )
                 .await?
                 {

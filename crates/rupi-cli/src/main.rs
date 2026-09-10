@@ -521,7 +521,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         if stdin.read_line(&mut line)? == 0 {
             break;
         }
-        let input = line.trim().to_string();
+        let mut input = line.trim().to_string();
         if input.is_empty() {
             continue;
         }
@@ -583,6 +583,19 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
         refresh_extensions(&mut tools, &mut ext_set);
         skills.refresh(&skill_dirs(home));
+        // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
+        let slash = rupi_core::commands::split(&input)
+            .map(|(n, a)| (n.to_owned(), a.to_owned()));
+        if let Some((name, args)) = slash.as_ref() {
+            if let Some(expanded) = rupi_core::commands::expand(
+                &rupi_core::commands::command_dirs(home),
+                name,
+                args,
+            ) {
+                println!("[command /{name}]");
+                input = expanded;
+            }
+        }
         let before_len = session.current_path.len();
         agent
             .run(
@@ -744,6 +757,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         frozen: &frozen,
         skills: &*skills,
         skill_dirs: skill_dirs(home),
+        command_dirs: rupi_core::commands::command_dirs(home),
         review_lines,
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
