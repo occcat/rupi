@@ -372,6 +372,20 @@ fn run_resume_empty_session_starts_fresh() {
 }
 
 #[test]
+fn memory_write_refuses_secrets() {
+    // 密钥落盘即拒绝（Hermes secret scanning）：非零退出 + 文件不被污染
+    let home = fresh_home();
+    let o = rupi(&home, &["memory-write", "add", "api key sk-abc123"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "密钥写入应被拒绝: {o:?}");
+    let (_, err) = out_text(&o);
+    assert!(err.contains("secret"), "拒绝提示不对:\n{err}");
+    let mem = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap_or_default();
+    assert!(!mem.contains("sk-abc123"), "密钥泄漏进记忆文件:\n{mem}");
+}
+
+#[test]
 fn trust_gate_skip_remember_and_silence() {
     // 项目信任门三态：n 跳过进聊天、y 记住、下次同目录免扰（cwd 即 home，项目资源自带）。
     let home = fresh_home();
