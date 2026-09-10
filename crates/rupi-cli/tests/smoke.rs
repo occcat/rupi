@@ -521,3 +521,115 @@ fn mcp_list_probes_fake_server() {
     assert!(out.contains("== prompts =="), "缺模板区段:\n{out}");
     assert!(out.contains("greet"), "未探到 fake 模板:\n{out}");
 }
+
+#[test]
+fn run_sends_session_id_affinity_header() {
+    // 本地 OpenAI 桩：记下每请求 x-session-id，回固定文本（无 key 也测真 HTTP 路径）。
+    use std::io::{BufRead, Read, Write};
+    use std::sync::{Arc, Mutex};
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_clone = seen.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().take(8) {
+            let Ok(mut sock) = sock else { break };
+            let seen = seen_clone.clone();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut content_len = 0usize;
+                let mut sid = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let t = line.trim();
+                    if t.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = t.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("x-session-id") {
+                            sid = v.trim().to_string();
+                        }
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                if content_len > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                seen.lock().unwrap().push(sid);
+                // run 走流式：stream:true 回 SSE（delta 增量 + [DONE]），否则回单 JSON
+                let streaming = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                    .unwrap_or(false);
+                let (ctype, payload) = if streaming {
+                    (
+                        "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"stub-hi\"}}]}\n\ndata: [DONE]\n\n"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "application/json",
+                        r#"{"choices":[{"message":{"content":"stub-hi"},"finish_reason":"stop"}]}"#
+                            .to_string(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(payload.as_bytes());
+            });
+        }
+    });
+
+    let stub_env = |cmd: &mut Command| {
+        cmd.env("RUPI_API_KEY", "fake-test-key")
+            .env("RUPI_BASE_URL", format!("http://{addr}/v1"))
+            .env("RUPI_SESSION_AFFINITY", "1");
+    };
+    let home = fresh_home();
+    let mut cmd = rupi(&home, &["--no-approve", "run", "hello affinity"]);
+    stub_env(&mut cmd);
+    let o = cmd.output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "run 失败:\nstdout={out}\nstderr={err}");
+    assert!(out.contains("stub-hi"), "桩回包未进正文:\n{out}");
+    let sid = err
+        .lines()
+        .find_map(|l| l.strip_prefix("[session "))
+        .and_then(|s| s.split(']').next())
+        .map(str::to_string)
+        .expect("stderr 应有 [session id]");
+    let got = seen.lock().unwrap();
+    assert!(!got.is_empty(), "桩没收到任何请求");
+    assert!(
+        got.iter().all(|h| h == &sid),
+        "亲和头应全等于会话 id {sid}：{got:?}"
+    );
+    drop(got);
+
+    // --resume 同会话：亲和头保持同 id（对标上游 sessionId 跨续聊粘滞，
+    // 实例级随机 id 只保同进程，续聊即换域）
+    let mut cmd2 = rupi(&home, &["--no-approve", "--resume", &sid, "run", "again"]);
+    stub_env(&mut cmd2);
+    let o2 = cmd2.output().unwrap();
+    let (out2, err2) = out_text(&o2);
+    assert!(
+        o2.status.success(),
+        "resume run 失败:\nstdout={out2}\nstderr={err2}"
+    );
+    assert!(out2.contains("stub-hi"), "续聊桩回包未进正文:\n{out2}");
+    let got2 = seen.lock().unwrap();
+    assert!(
+        got2.iter().all(|h| h == &sid),
+        "续聊后亲和头仍应等于同会话 id {sid}：{got2:?}"
+    );
+}

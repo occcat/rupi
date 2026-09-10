@@ -45,6 +45,8 @@ pub struct TuiContext<'a> {
     pub command_dirs: Vec<std::path::PathBuf>,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// sessions.db 会话 id：`/model` 切换后重建 provider 时回填亲和头（与 REPL 同语义）。
+    pub session_id: String,
     /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
     pub on_turn: Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
 }
@@ -141,6 +143,7 @@ fn dispatch_builtin(
     provider: &mut Arc<dyn LlmProvider>,
     skills: &SkillRegistry,
     command_dirs: &[std::path::PathBuf],
+    session_id: &str,
 ) -> Builtin {
     let t = text.trim();
     if t == "/quit" {
@@ -213,7 +216,9 @@ fn dispatch_builtin(
             return Builtin::Done(format!("[model {}]", provider.name()));
         }
         return match rupi_llm::provider_for_model(arg) {
-            Ok(p) => {
+            Ok(mut p) => {
+                // 切换后回填亲和头：同会话 id 即同一下游（与 REPL /model 同语义）
+                rupi_llm::apply_session_settings(&mut *p, Some(session_id));
                 *provider = p.into();
                 Builtin::Done(format!("[model switched to {arg}]"))
             }
@@ -280,6 +285,7 @@ async fn run_loop(
                     ctx.provider,
                     ctx.skills,
                     &ctx.command_dirs,
+                    &ctx.session_id,
                 ) {
                     Builtin::Quit => break,
                     Builtin::Done(msg) => {
@@ -614,7 +620,8 @@ mod tests {
                 &mut session,
                 &mut provider,
                 &skills,
-                &[]
+                &[],
+                "t-sess"
             ),
             Builtin::Quit
         ));
@@ -625,7 +632,8 @@ mod tests {
                 &mut session,
                 &mut provider,
                 &skills,
-                &[]
+                &[],
+                "t-sess"
             ),
             Builtin::Pass
         ));
@@ -634,9 +642,10 @@ mod tests {
             "/goto",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("usage:"), "{msg}");
     }
@@ -649,9 +658,10 @@ mod tests {
                 "/plan",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[plan mode on]"
         );
@@ -661,9 +671,10 @@ mod tests {
                 "/plan",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[plan mode off]"
         );
@@ -678,9 +689,10 @@ mod tests {
                 "/thinking",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[thinking default (provider default)]"
         );
@@ -689,9 +701,10 @@ mod tests {
                 "/thinking high",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[thinking switched to High]"
         );
@@ -701,9 +714,10 @@ mod tests {
                 "/thinking",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[thinking High]"
         );
@@ -711,9 +725,10 @@ mod tests {
             "/thinking ultra",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("staying on current"), "{msg}");
         assert_eq!(agent.thinking, Some(rupi_llm::ThinkingLevel::High));
@@ -727,9 +742,10 @@ mod tests {
                 "/model",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[model mock]"
         );
@@ -745,9 +761,10 @@ mod tests {
             "/model gpt-4o-mini",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         for (k, v) in saved {
             if let Some(val) = v {
@@ -766,9 +783,10 @@ mod tests {
                 "/rewind",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[rewind] nothing to undo"
         );
@@ -779,9 +797,10 @@ mod tests {
                 "/rewind",
                 &mut agent,
                 &mut session,
-                &mut provider,
-                &skills,
-                &[]
+                 &mut provider,
+                 &skills,
+                 &[],
+                 "t-sess"
             )),
             "[rewound]"
         );
@@ -795,18 +814,20 @@ mod tests {
             "/reload",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("REPL-only"), "{msg}");
         let msg = done_text(dispatch_builtin(
             "/goto zzz",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
@@ -820,9 +841,10 @@ mod tests {
             "/skills",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("no skills found"), "{msg}");
         // 空命令目录给指引
@@ -830,9 +852,10 @@ mod tests {
             "/commands",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
         // 空树也有视图（不空返回、不漏进模型）
@@ -840,9 +863,10 @@ mod tests {
             "/tree",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert!(!msg.is_empty(), "空树视图不应为空");
         session.push(Message::text(rupi_core::Role::User, "hi"));
@@ -850,9 +874,10 @@ mod tests {
             "/tree",
             &mut agent,
             &mut session,
-            &mut provider,
-            &skills,
-            &[],
+                 &mut provider,
+                 &skills,
+                 &[],
+                "t-sess",
         ));
         assert_ne!(msg, msg2, "有节点后视图应变化");
     }

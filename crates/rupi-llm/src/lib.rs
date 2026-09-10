@@ -106,6 +106,13 @@ pub trait LlmProvider: Send + Sync {
     fn model_id(&self) -> Option<&str> {
         None
     }
+    /// 会话亲和 id（OpenRouter `x-session-id` 荷载）：默认空实现（Mock 等无 HTTP
+    /// 身份的不感知）。CLI 在 Box 唯一所有权阶段写入 sessions.db 的会话 id，
+    /// `--resume` 同 id 即同一下游（对标上游 `sessionId`）；缺省为实例级随机 id，
+    /// 同进程同轮请求照样粘滞，跨进程续聊则换域。
+    fn set_session_id(&mut self, _id: String) {}
+    /// 会话亲和显式开关（对标上游 compat opt-out）：默认空实现。
+    fn set_session_affinity(&mut self, _on: bool) {}
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse>;
 
     /// 流式补全：边收边推 `TextDelta`，最终仍返回完整 `ChatResponse`。
@@ -218,6 +225,32 @@ pub fn is_openrouter_base_url(url: &str) -> bool {
     url.contains("openrouter.ai")
 }
 
+/// `RUPI_SESSION_AFFINITY` 显式开关（`1`/`true` 强开，`0`/`false` 强关；
+/// 未设或非法走 URL 自动判定）：对标上游 compat 显式 opt-out，CLI 构造与
+/// TUI `/model` 切换共用此口径，避免两端漂移。
+pub fn session_affinity_from_env() -> Option<bool> {
+    match std::env::var("RUPI_SESSION_AFFINITY")
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("yes") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
+/// 会话装配收敛点：sid（sessions.db 会话 id）+ 环境显式开关一次性打到 provider。
+/// 在 Box 唯一所有权阶段调用（进 Arc 分享前），无需 `Arc::get_mut` 抢可变借用。
+pub fn apply_session_settings(p: &mut dyn LlmProvider, session_id: Option<&str>) {
+    if let Some(sid) = session_id {
+        p.set_session_id(sid.to_string());
+    }
+    if let Some(on) = session_affinity_from_env() {
+        p.set_session_affinity(on);
+    }
+}
+
 /// 按模型名前缀选原生 provider（`claude-*`→Anthropic，`gemini-*`→Gemini，
 /// 其余→OpenAI-compatible）：缺 key 即 Err，由调用方决定回 mock 还是报错。
 /// CLI 与 TUI 的 `/model` 共用此路由，避免两端漂移。
@@ -302,6 +335,14 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn model_id(&self) -> Option<&str> {
         Some(&self.model)
+    }
+
+    fn set_session_id(&mut self, id: String) {
+        self.session_id = id;
+    }
+
+    fn set_session_affinity(&mut self, on: bool) {
+        self.session_affinity = Some(on);
     }
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -1002,6 +1043,46 @@ mod tests {
         assert!(!is_openrouter_base_url("http://127.0.0.1:8080/v1"));
     }
 
+    #[test]
+    fn dyn_setters_match_builder_semantics() {
+        let mut p =
+            OpenAiCompatProvider::new("https://api.openai.com/v1".into(), "k".into(), "m".into());
+        // 经 dyn 分发写入（CLI build_provider 即此路径，非具体类型调用）
+        let d: &mut dyn LlmProvider = &mut p;
+        d.set_session_id("dyn-sess".into());
+        d.set_session_affinity(true);
+        assert_eq!(p.session_header(), Some(("x-session-id", "dyn-sess")));
+        // Mock 走默认空实现：不断言行为，只验不断链
+        let mut m: Box<dyn LlmProvider> =
+            Box::new(MockProvider::new(vec![MockProvider::text_response("hi")]));
+        m.set_session_id("x".into());
+        m.set_session_affinity(true);
+    }
+
+    #[test]
+    fn session_affinity_env_parses_and_applies() {
+        let saved = std::env::var("RUPI_SESSION_AFFINITY").ok();
+        unsafe { std::env::set_var("RUPI_SESSION_AFFINITY", "0") };
+        assert_eq!(session_affinity_from_env(), Some(false));
+        // 强关压过 URL 自动判定，sid 照写
+        let mut q = OpenAiCompatProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        );
+        apply_session_settings(&mut q, Some("s1"));
+        assert_eq!(q.session_id, "s1");
+        assert!(q.session_header().is_none());
+        unsafe { std::env::set_var("RUPI_SESSION_AFFINITY", "yes") };
+        assert_eq!(session_affinity_from_env(), Some(true));
+        unsafe { std::env::set_var("RUPI_SESSION_AFFINITY", "whatever") };
+        assert_eq!(session_affinity_from_env(), None);
+        unsafe { std::env::remove_var("RUPI_SESSION_AFFINITY") };
+        assert_eq!(session_affinity_from_env(), None);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("RUPI_SESSION_AFFINITY", v) };
+        }
+    }
     #[test]
     fn session_header_auto_by_url_with_explicit_override() {
         let auto = OpenAiCompatProvider::new(

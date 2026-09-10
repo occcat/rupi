@@ -360,11 +360,15 @@ fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet
     dirty
 }
 
-async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
+async fn build_provider(
+    model: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<Box<dyn LlmProvider>> {
     // 路由收敛到 rupi_llm::provider_for_model（与 TUI /model 同源）；缺 key 回 mock，
     // 各家提示沿用此前的文案（claude-/gemini- 带原错误，其余走固定缺 key 行）。
-    match rupi_llm::provider_for_model(model) {
-        Ok(p) => Ok(p),
+    // 会话装配收敛到 apply_session_settings：sid（无则沿用实例级随机 id）+ 环境显式开关。
+    let mut p = match rupi_llm::provider_for_model(model) {
+        Ok(p) => p,
         Err(e) => {
             let demo = if model.starts_with("claude-") {
                 eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
@@ -378,11 +382,13 @@ async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
                 );
                 "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。"
             };
-            Ok(Box::new(MockProvider::new(vec![
+            Box::new(MockProvider::new(vec![
                 MockProvider::text_response(demo),
-            ])))
+            ])) as Box<dyn LlmProvider>
         }
-    }
+    };
+    rupi_llm::apply_session_settings(&mut *p, session_id);
+    Ok(p)
 }
 
 #[tokio::main]
@@ -735,7 +741,6 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     // 审批档位 + thinking 档位先验（错配直接 bail，不建会话不落盘）
     let approver = approver_for(cli, None)?;
     let thinking = thinking_for(cli)?;
-    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
@@ -774,6 +779,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
     let sess_db = SessionStore::open(home)?;
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
+    // provider 在会话 id 落定后构造：亲和头荷载即 sessions.db 会话 id，
+    // --resume 同 id 即同一下游（实例级随机 id 只保同进程粘滞）。
+    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid)).await?.into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
@@ -870,7 +878,6 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
 
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut model = cli.model.clone();
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&model).await?.into();
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
     let mut agent = AgentLoop::new(cli.max_turns)
@@ -899,6 +906,36 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[thinking] level: {t:?}");
         agent = agent.with_thinking(t);
     }
+    let mut tools = sandboxed_tools();
+    // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
+    let _mcp = if let Some(path) = &cli.mcp_config {
+        let configs = rupi_mcp::load_configs(path)?;
+        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let names = manager.register_all(&mut tools).await;
+        println!("[mcp] {} tools: {}", names.len(), names.join(", "));
+        Some(manager)
+    } else {
+        None
+    };
+    // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
+    let ext_path = ext_dir(home, cli);
+    let mut ext_set = load_extensions(&mut tools, &ext_path);
+    // 项目信任门：未信任则项目记忆/skills/命令全部不加载（只用全局）
+    let load_project = load_project_resources(home, cli);
+    let mut store = memory_store(home, load_project);
+    if cli.no_memory {
+        store.memory_enabled = false;
+        store.user_profile_enabled = false;
+    }
+    let frozen = store.frozen_snapshot();
+    let mut mem_mgr = MemoryManager::new(store);
+    maybe_external_memory(cli, home, &mut mem_mgr).await?;
+    let mem = Arc::new(mem_mgr);
+    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
+    let sess_db = SessionStore::open(home)?;
+    let (mut session, sid) = restore_or_new(cli, &sess_db)?;
+    // provider 与 reviewer 在会话 id 落定后装配：亲和头荷载即 sessions.db 会话 id
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&model, Some(&sid)).await?.into();
     if cli.review_enabled() {
         let pending_clone = pending.clone();
         // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
@@ -932,34 +969,6 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }),
         );
     }
-    let mut tools = sandboxed_tools();
-    // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
-    let _mcp = if let Some(path) = &cli.mcp_config {
-        let configs = rupi_mcp::load_configs(path)?;
-        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
-        let names = manager.register_all(&mut tools).await;
-        println!("[mcp] {} tools: {}", names.len(), names.join(", "));
-        Some(manager)
-    } else {
-        None
-    };
-    // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
-    let ext_path = ext_dir(home, cli);
-    let mut ext_set = load_extensions(&mut tools, &ext_path);
-    // 项目信任门：未信任则项目记忆/skills/命令全部不加载（只用全局）
-    let load_project = load_project_resources(home, cli);
-    let mut store = memory_store(home, load_project);
-    if cli.no_memory {
-        store.memory_enabled = false;
-        store.user_profile_enabled = false;
-    }
-    let frozen = store.frozen_snapshot();
-    let mut mem_mgr = MemoryManager::new(store);
-    maybe_external_memory(cli, home, &mut mem_mgr).await?;
-    let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home, load_project)));
-    let sess_db = SessionStore::open(home)?;
-    let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     if cli.subagents {
         let sub = SubagentTool::new(
             provider.clone(),
@@ -1021,7 +1030,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             if arg.is_empty() {
                 println!("[model {model}]");
             } else {
-                match build_provider(arg).await {
+                match build_provider(arg, Some(&sid)).await {
                     Ok(p) => {
                         provider = p.into();
                         model = arg.to_string();
@@ -1147,7 +1156,6 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // thinking 档位先验：非法值在建会话前 bail，不污染会话库
     let thinking = thinking_for(cli)?;
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
@@ -1176,6 +1184,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         let db = sess_db.lock().unwrap();
         restore_or_new(cli, &db)?
     };
+    // provider 在会话 id 落定后构造（与 run/chat 同序，亲和头荷载即本会话 id）
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid)).await?.into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
@@ -1284,6 +1294,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         skill_dirs: skill_dirs(home, load_project),
         command_dirs: command_dirs_filtered(home, load_project),
         review_lines,
+        session_id: sid.clone(),
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
             let persist = |node: &Option<String>, role: &str, content: &str| {

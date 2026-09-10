@@ -521,6 +521,14 @@ impl super::LlmProvider for AnthropicProvider {
         Some(&self.model)
     }
 
+    fn set_session_id(&mut self, id: String) {
+        self.session_id = id;
+    }
+
+    fn set_session_affinity(&mut self, on: bool) {
+        self.session_affinity = Some(on);
+    }
+
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = self.body(&req, false);
@@ -1136,6 +1144,18 @@ mod tests {
         assert_eq!(stripped.messages[0].blocks.len(), 1);
         // 原请求不动（重试是纯构造，不污染主历史）
         assert_eq!(req.messages[0].blocks.len(), 3);
+    }
+
+    #[test]
+    fn anthropic_dyn_setter_updates_header() {
+        let mut p = AnthropicProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        );
+        let d: &mut dyn super::super::LlmProvider = &mut p;
+        d.set_session_id("a-sess".into());
+        assert_eq!(p.session_header(), Some(("x-session-id", "a-sess")));
     }
 
     #[test]
