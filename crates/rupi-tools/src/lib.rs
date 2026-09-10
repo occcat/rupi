@@ -312,7 +312,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Execute a shell command (bounded output; default 30s timeout)".into(),
+            description: "Execute a shell command (bounded output; default 30s timeout; $RUPI_SESSION_ID holds the current session id)".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -364,6 +364,15 @@ impl Tool for BashTool {
 
 /// 工具回包有界：超限保留首尾、中部折叠并标注截掉字符数，保上下文窗口不被大输出撑爆。
 pub const MAX_TOOL_OUTPUT: usize = 12_000;
+
+/// 会话环境变量名：对标上游 `PI_SESSION_ID`。bash 子进程自动继承父进程环境，
+/// 前端（REPL/TUI）在会话建立后调用 [`export_session_id`] 导出一次，脚本里 `$RUPI_SESSION_ID` 即用。
+pub const SESSION_ENV_VAR: &str = "RUPI_SESSION_ID";
+
+/// 导出当前会话 id 到进程环境（子进程继承；resume 沿用 db 会话 id，跨进程稳定）。
+pub fn export_session_id(id: &str) {
+    std::env::set_var(SESSION_ENV_VAR, id);
+}
 
 pub fn truncate_middle(s: &str, limit: usize) -> String {
     if s.len() <= limit {
@@ -530,5 +539,22 @@ mod tests {
         assert!(!fresh.is_error, "{}", fresh.content);
         assert!(!std::path::Path::new("/tmp/rupi-sbx-outside.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn bash_sees_exported_session_id() {
+        export_session_id("sess-hook-test");
+        assert_eq!(std::env::var(SESSION_ENV_VAR).unwrap(), "sess-hook-test");
+        // 子进程继承父进程环境：脚本直接可用
+        let r = ToolRegistry::with_builtins();
+        let out = r
+            .execute(
+                "bash",
+                serde_json::json!({"command": "printf %s \"$RUPI_SESSION_ID\""}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "sess-hook-test");
     }
 }

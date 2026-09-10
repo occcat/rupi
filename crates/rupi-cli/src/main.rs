@@ -403,6 +403,7 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
             s.push_with_id(id, msg);
         }
         eprintln!("[resume {}] restored {} msgs", id, s.history().len());
+        rupi_tools::export_session_id(id);
         // 压缩摘要预热：prompt 窗口直接带上旧摘要 + 近期，避免超长恢复历史全文送模型。
         // through 取首条，保证 guard 把它视为“已压缩过”，新增不足一窗时跳过重复压缩。
         let stored = sess_db.get_summary(id).unwrap_or_default();
@@ -416,6 +417,7 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
     } else {
         let sid = sess_db.create_session("default")?;
         eprintln!("[session {sid}] turns persist to sessions.db");
+        rupi_tools::export_session_id(&sid);
         Ok((SessionTree::new(), sid))
     }
 }
