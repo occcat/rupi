@@ -341,13 +341,19 @@ impl super::LlmProvider for GeminiProvider {
     }
 
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
-        let resp = self
-            .client
-            .post(self.url(false))
-            .header("x-goog-api-key", &self.api_key)
-            .json(&self.body(&req))
-            .send()
-            .await?;
+        let body = self.body(&req);
+        let url = self.url(false);
+        let api_key = self.api_key.clone();
+        let resp = super::post_json_with_retry(
+            || {
+                self.client
+                    .post(url.clone())
+                    .header("x-goog-api-key", &api_key)
+            },
+            &body,
+            3,
+        )
+        .await?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().await?;
         if !status.is_success() {
@@ -365,13 +371,18 @@ impl super::LlmProvider for GeminiProvider {
     ) -> anyhow::Result<super::ChatResponse> {
         use futures::StreamExt as _;
         let url = format!("{}?alt=sse", self.url(true));
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&self.body(&req))
-            .send()
-            .await?;
+        let body = self.body(&req);
+        let api_key = self.api_key.clone();
+        let resp = super::post_json_with_retry(
+            || {
+                self.client
+                    .post(url.clone())
+                    .header("x-goog-api-key", &api_key)
+            },
+            &body,
+            3,
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));

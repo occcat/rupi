@@ -161,14 +161,12 @@ impl LlmProvider for OpenAiCompatProvider {
             "tools": to_openai_tools(&req.tools),
             "temperature": req.temperature.unwrap_or(0.2),
         });
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let resp =
+            post_json_with_retry(|| client.post(url.clone()).bearer_auth(&api_key), &body, 3)
+                .await?
+                .error_for_status()?;
         let v: serde_json::Value = resp.json().await?;
         parse_openai_response(v)
     }
@@ -188,14 +186,12 @@ impl LlmProvider for OpenAiCompatProvider {
             "temperature": req.temperature.unwrap_or(0.2),
             "stream": true,
         });
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let resp =
+            post_json_with_retry(|| client.post(url.clone()).bearer_auth(&api_key), &body, 3)
+                .await?
+                .error_for_status()?;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut acc = SseAccumulator::default();
@@ -413,6 +409,53 @@ fn parse_openai_response(v: serde_json::Value) -> anyhow::Result<ChatResponse> {
     })
 }
 
+/// 可重试状态码：429 限流与 5xx 服务端故障（对标 Pi 指数退避重试）。
+pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// 第 `attempt` 次（0 起）重试前等待毫秒数：500·2^attempt，上限 8000。
+pub fn backoff_ms(attempt: u32) -> u64 {
+    500u64.saturating_mul(1 << attempt.min(4)).min(8_000)
+}
+
+/// 解析 `Retry-After` 秒数（HTTP-date 形状交由指数退避兜底）。
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    v.trim().parse::<u64>().ok().map(|s| s.saturating_mul(1000))
+}
+
+/// 带重试的 JSON POST：传输错误与 429/5xx 按 `Retry-After`（无则指数退避）
+/// 重试 `max_retries` 次；非重试状态直接返回 Response 由调用方解析错误回包。
+pub async fn post_json_with_retry(
+    make: impl Fn() -> reqwest::RequestBuilder,
+    body: &serde_json::Value,
+    max_retries: u32,
+) -> anyhow::Result<reqwest::Response> {
+    let mut attempt = 0u32;
+    loop {
+        match make().json(body).send().await {
+            Err(e) if attempt < max_retries => {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms(attempt))).await;
+                attempt += 1;
+                let _ = e;
+            }
+            Err(e) => return Err(e.into()),
+            Ok(resp) => {
+                if is_retryable_status(resp.status()) && attempt < max_retries {
+                    let wait =
+                        parse_retry_after(resp.headers()).unwrap_or_else(|| backoff_ms(attempt));
+                    // 消费 body 释放连接后等待重试
+                    let _ = resp.bytes().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Ok(resp);
+            }
+        }
+    }
+}
 /// Mock provider：单测 / 无 Key 演示用，按预设剧本返回。
 pub struct MockProvider {
     pub script: std::sync::Mutex<Vec<ChatResponse>>,
@@ -474,6 +517,36 @@ impl LlmProvider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_status_covers_429_and_5xx() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::OK));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(backoff_ms(0), 500);
+        assert_eq!(backoff_ms(1), 1000);
+        assert_eq!(backoff_ms(2), 2000);
+        assert_eq!(backoff_ms(10), 8_000);
+    }
+
+    #[test]
+    fn retry_after_seconds_parsed_to_ms() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        assert_eq!(parse_retry_after(&h), Some(2000));
+    }
 
     #[test]
     fn openai_message_mapping_keeps_tool_calls() {

@@ -42,15 +42,30 @@ impl AnthropicProvider {
     }
 
     fn body(&self, req: &super::ChatRequest, stream: bool) -> serde_json::Value {
-        serde_json::json!({
-            "model": self.model,
-            "max_tokens": req.max_tokens.unwrap_or(4096),
-            "system": req.system,
-            "messages": to_anthropic_messages(&req.messages),
-            "tools": to_anthropic_tools(&req.tools),
-            "temperature": req.temperature.unwrap_or(0.2),
-            "stream": stream,
-        })
+        // prompt caching：system 与末工具挂 ephemeral 断点（Anthropic 按前缀缓存计费），
+        // 无工具时省略 tools 字段（空数组会 400）。
+        let mut tools = to_anthropic_tools(&req.tools);
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+        let mut m = serde_json::Map::new();
+        m.insert("model".into(), self.model.clone().into());
+        m.insert("max_tokens".into(), req.max_tokens.unwrap_or(4096).into());
+        m.insert(
+            "system".into(),
+            serde_json::json!([{"type": "text", "text": req.system,
+                "cache_control": {"type": "ephemeral"}}]),
+        );
+        m.insert(
+            "messages".into(),
+            serde_json::Value::Array(to_anthropic_messages(&req.messages)),
+        );
+        if !tools.is_empty() {
+            m.insert("tools".into(), serde_json::Value::Array(tools));
+        }
+        m.insert("temperature".into(), req.temperature.unwrap_or(0.2).into());
+        m.insert("stream".into(), stream.into());
+        serde_json::Value::Object(m)
     }
 }
 
@@ -338,11 +353,9 @@ impl super::LlmProvider for AnthropicProvider {
 
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .headers(self.client.post(&url))
-            .json(&self.body(&req, false))
-            .send()
-            .await?;
+        let body = self.body(&req, false);
+        let resp =
+            super::post_json_with_retry(|| self.headers(self.client.post(&url)), &body, 3).await?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().await?;
         if !status.is_success() {
@@ -360,11 +373,9 @@ impl super::LlmProvider for AnthropicProvider {
     ) -> anyhow::Result<super::ChatResponse> {
         use futures::StreamExt as _;
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .headers(self.client.post(&url))
-            .json(&self.body(&req, true))
-            .send()
-            .await?;
+        let body = self.body(&req, true);
+        let resp =
+            super::post_json_with_retry(|| self.headers(self.client.post(&url)), &body, 3).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
@@ -427,6 +438,44 @@ mod tests {
             provider: None,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn body_sets_cache_breakpoints_and_omits_empty_tools() {
+        use rupi_core::ToolDefinition;
+        let p = AnthropicProvider::new("https://x".into(), "k".into(), "m".into());
+        let tool = |n: &str| ToolDefinition {
+            name: n.into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            prompt_snippet: None,
+        };
+        let req = super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![tool("a"), tool("b")],
+            max_tokens: None,
+            temperature: None,
+        };
+        let b = p.body(&req, false);
+        // system 数组挂 ephemeral
+        assert_eq!(
+            b.pointer("/system/0/cache_control/type"),
+            Some(&serde_json::json!("ephemeral"))
+        );
+        assert_eq!(b.pointer("/system/0/text"), Some(&serde_json::json!("sys")));
+        // 仅末工具挂断点
+        assert_eq!(
+            b.pointer("/tools/1/cache_control/type"),
+            Some(&serde_json::json!("ephemeral"))
+        );
+        assert!(b.pointer("/tools/0/cache_control").is_none());
+        // 无工具时省略字段（空数组会 400）
+        let empty = super::super::ChatRequest {
+            tools: vec![],
+            ..req
+        };
+        assert!(p.body(&empty, false).get("tools").is_none());
     }
 
     #[test]
