@@ -42,6 +42,26 @@ fn core_tier_snapshot() {
     assert!(!block.contains("extended only"));
     assert!(block.contains("core tier"));
     assert!(block.contains("USER PROFILE"));
+    assert!(block.contains("PROJECT"));
+    assert!(block.contains("SESSION SEARCH"));
+}
+
+#[test]
+fn project_layer_persists_beside_home() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::open_layered(home.path(), proj.path()).unwrap();
+    store.add(StoreKind::Memory, "agent note").unwrap();
+    store.add(StoreKind::Project, "this crate is named rupi").unwrap();
+    assert!(home.path().join("MEMORY.md").exists());
+    assert!(proj.path().join("PROJECT.md").exists());
+    assert!(!home.path().join("PROJECT.md").exists());
+    let snap = MemorySnapshot::capture(&store);
+    assert_eq!(snap.project.len(), 1);
+    let block = render_memory_block(&snap);
+    assert!(block.contains("this crate is named rupi"));
+    let reopened = MemoryStore::open_layered(home.path(), proj.path()).unwrap();
+    assert_eq!(reopened.entries(StoreKind::Project).len(), 1);
 }
 
 #[test]

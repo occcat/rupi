@@ -17,6 +17,6 @@ pub use session_search::{SessionSearchHit, SessionSearchIndex};
 pub use snapshot::{render_memory_block, MemorySnapshot};
 pub use store::{
     MemoryEntry, MemoryLimits, MemoryStore, StoreKind, CORE_PREFIX, ENTRY_DELIM, MEMORY_CHAR_LIMIT,
-    USER_CHAR_LIMIT,
+    PROJECT_CHAR_LIMIT, USER_CHAR_LIMIT,
 };
 pub use tool::{memory_tool_definition, MemoryAction, MemoryTool};

@@ -71,7 +71,17 @@ impl PermissionGate {
             allow_read: true,
             allow_write: true,
             allow_bash: true,
-            bash_ask_destructive: false,
+            bash_ask_destructive: true,
+            path_guard: PathGuard::new(cwd),
+        }
+    }
+
+    pub fn sandboxed(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            allow_read: true,
+            allow_write: true,
+            allow_bash: true,
+            bash_ask_destructive: true,
             path_guard: PathGuard::new(cwd),
         }
     }

@@ -9,6 +9,7 @@ pub struct ConfigPaths {
     pub agent_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub memories_dir: PathBuf,
+    pub project_memories_dir: PathBuf,
     pub skills_dir: PathBuf,
 }
 
@@ -24,6 +25,7 @@ impl ConfigPaths {
             agent_dir: home.join("agent"),
             sessions_dir: home.join("sessions"),
             memories_dir: home.join("memories"),
+            project_memories_dir: cwd.join(".rupi").join("memories"),
             skills_dir: home.join("skills"),
             home,
             cwd,

@@ -1,13 +1,16 @@
 use crate::store::{MemoryEntry, MemoryStore, StoreKind};
 
 /// Frozen snapshot captured once at session start (Hermes prefix-cache pattern).
+/// Layers: agent MEMORY (core/extended), USER profile (all-in), PROJECT (all-in).
 #[derive(Debug, Clone)]
 pub struct MemorySnapshot {
     pub memory_core: Vec<MemoryEntry>,
     pub memory_extended: Vec<MemoryEntry>,
     pub user: Vec<MemoryEntry>,
+    pub project: Vec<MemoryEntry>,
     pub memory_usage: usize,
     pub user_usage: usize,
+    pub project_usage: usize,
     pub captured_at: i64,
 }
 
@@ -27,8 +30,10 @@ impl MemorySnapshot {
             memory_core,
             memory_extended,
             user: store.entries(StoreKind::User).to_vec(),
+            project: store.entries(StoreKind::Project).to_vec(),
             memory_usage: store.usage_chars(StoreKind::Memory),
             user_usage: store.usage_chars(StoreKind::User),
+            project_usage: store.usage_chars(StoreKind::Project),
             captured_at: chrono::Utc::now().timestamp_millis(),
         }
     }
@@ -51,6 +56,19 @@ pub fn render_memory_block(snapshot: &MemorySnapshot) -> String {
         snapshot.user_usage,
         0,
     ));
+    out.push('\n');
+    out.push_str(&render_store(
+        "PROJECT",
+        StoreKind::Project,
+        &snapshot.project,
+        snapshot.project_usage,
+        0,
+    ));
+    out.push('\n');
+    out.push_str(
+        "SESSION SEARCH: unbounded past transcripts live in SQLite FTS5. \
+         Use `session_search` (query / scroll) — they are not in this frozen prompt.",
+    );
     out
 }
 

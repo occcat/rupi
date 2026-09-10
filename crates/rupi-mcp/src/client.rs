@@ -129,6 +129,10 @@ impl McpClient {
         let result = take_result(resp)?;
         serde_json::from_value(result).map_err(|e| McpError::Protocol(e.to_string()))
     }
+
+    pub async fn close(&mut self) -> McpResult<()> {
+        self.transport.close().await
+    }
 }
 
 fn take_result(resp: JsonRpcResponse) -> McpResult<Value> {
@@ -282,7 +286,7 @@ fn parse_server(name: &str, spec: &Value) -> Option<ServerConfig> {
             transport: TransportKind::Stdio,
             command: Some(cmd.into()),
             args,
-            env: Default::default(),
+            env: parse_env(spec),
             url: None,
             headers: Default::default(),
             lazy: spec["lazy"].as_bool().unwrap_or(false),
@@ -299,11 +303,35 @@ fn parse_server(name: &str, spec: &Value) -> Option<ServerConfig> {
             transport: kind,
             command: None,
             args: vec![],
-            env: Default::default(),
+            env: parse_env(spec),
             url: Some(url.into()),
-            headers: Default::default(),
+            headers: parse_headers(spec),
             lazy: spec["lazy"].as_bool().unwrap_or(false),
         });
     }
     None
+}
+
+fn parse_env(spec: &Value) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(obj) = spec["env"].as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                env.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    env
+}
+
+fn parse_headers(spec: &Value) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(obj) = spec["headers"].as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                headers.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    headers
 }

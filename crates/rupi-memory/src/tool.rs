@@ -42,7 +42,7 @@ impl MemoryTool {
     pub fn apply(&self, args: &Value) -> Result<String, String> {
         let action = args["action"].as_str().unwrap_or("");
         let target = StoreKind::parse(args["target"].as_str().unwrap_or("memory"))
-            .ok_or_else(|| "target must be `memory` or `user`".to_string())?;
+            .ok_or_else(|| "target must be `memory`, `user`, or `project`".to_string())?;
         let mut store = self.store.lock().map_err(|e| e.to_string())?;
         match action {
             "add" => {
@@ -91,15 +91,17 @@ impl MemoryTool {
 pub fn memory_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "memory".into(),
-        description: "Manage durable MEMORY.md / USER.md notes. Actions: add, replace, remove, search. \
+        description: "Manage durable MEMORY.md / USER.md / PROJECT.md notes. Actions: add, replace, remove, search. \
              Frozen snapshot is in the system prompt; tool responses show live state. \
-             Prefix an entry with [core] to always inject it; other entries are extended and retrieved via search."
+             target=memory (agent notes), user (profile), project (this repo). \
+             Prefix an entry with [core] to always inject it; other MEMORY entries are extended and retrieved via search. \
+             Past sessions are searched with session_search, not this tool."
             .into(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["add", "replace", "remove", "search"]},
-                "target": {"type": "string", "enum": ["memory", "user"], "default": "memory"},
+                "target": {"type": "string", "enum": ["memory", "user", "project"], "default": "memory"},
                 "content": {"type": "string"},
                 "old_text": {"type": "string"},
                 "query": {"type": "string"}
@@ -116,7 +118,7 @@ impl AgentTool for MemoryTool {
         "memory"
     }
     fn description(&self) -> &str {
-        "Manage durable MEMORY.md / USER.md notes (Hermes-style)."
+        "Manage durable MEMORY.md / USER.md / PROJECT.md notes (Hermes-style)."
     }
     fn parameters(&self) -> Value {
         memory_tool_definition().parameters

@@ -4,17 +4,24 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 pub const PROTOCOL_FALLBACK: &str = "2024-11-05";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(untagged)]
 pub enum JsonRpcId {
     Number(i64),
     String(String),
+    #[default]
     Null,
+}
+
+fn jsonrpc_id_is_null(id: &JsonRpcId) -> bool {
+    matches!(id, JsonRpcId::Null)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    /// Notifications omit `id` (JSON-RPC 2.0 / MCP).
+    #[serde(default, skip_serializing_if = "jsonrpc_id_is_null")]
     pub id: JsonRpcId,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -40,3 +40,34 @@ fn layered_mcp_config_project_overrides() {
     assert_eq!(a.command.as_deref(), Some("uvx"));
     assert!(cfgs.iter().any(|c| c.name == "b"));
 }
+
+#[test]
+fn parse_env_and_headers() {
+    let raw = r#"{
+        "mcpServers": {
+            "docs": {
+                "url": "http://127.0.0.1:9/mcp",
+                "headers": {"Authorization": "Bearer x"},
+                "env": {"FOO": "bar"}
+            },
+            "cli": {
+                "command": "npx",
+                "args": ["-y", "x"],
+                "env": {"TOKEN": "t"}
+            }
+        }
+    }"#;
+    let cfgs = rupi_mcp::load_mcp_configs(Some(raw), None);
+    let docs = cfgs.iter().find(|c| c.name == "docs").unwrap();
+    assert_eq!(docs.headers.get("Authorization").map(String::as_str), Some("Bearer x"));
+    let cli = cfgs.iter().find(|c| c.name == "cli").unwrap();
+    assert_eq!(cli.env.get("TOKEN").map(String::as_str), Some("t"));
+}
+
+#[test]
+fn notification_omits_id() {
+    let req = rupi_mcp::JsonRpcRequest::notification("notifications/initialized", None);
+    let v = serde_json::to_value(&req).unwrap();
+    assert!(v.get("id").is_none());
+    assert_eq!(v["method"], "notifications/initialized");
+}

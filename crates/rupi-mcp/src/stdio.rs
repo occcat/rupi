@@ -39,6 +39,12 @@ impl StdioTransport {
     }
 }
 
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for StdioTransport {
     async fn request(&mut self, req: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
@@ -66,6 +72,10 @@ impl Transport for StdioTransport {
         line.push('\n');
         self.stdin
             .write_all(line.as_bytes())
+            .await
+            .map_err(|e| McpError::Transport(e.to_string()))?;
+        self.stdin
+            .flush()
             .await
             .map_err(|e| McpError::Transport(e.to_string()))?;
         Ok(())

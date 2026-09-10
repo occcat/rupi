@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
         options.model = resolve_model("faux/faux");
     }
 
-    let mut harness = Harness::bootstrap(options)?;
+    let mut harness = Harness::bootstrap(options).await?;
 
     if let Some(prompt) = cli.print {
         let out = harness.print(&prompt).await?;

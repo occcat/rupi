@@ -4,6 +4,8 @@ mod find;
 mod grep;
 mod ls;
 mod read;
+mod session_search;
+mod subagent;
 mod write;
 
 use std::path::PathBuf;
@@ -17,6 +19,8 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
+pub use session_search::SessionSearchTool;
+pub use subagent::SubagentTool;
 pub use write::WriteTool;
 
 pub fn builtin_tool_names() -> &'static [&'static str] {
@@ -73,4 +77,12 @@ pub fn create_coding_tools(cwd: PathBuf, names: &[String], sandbox: bool) -> Too
         }));
     }
     set
+}
+
+pub fn create_read_only_tools(cwd: PathBuf, sandbox: bool) -> ToolSet {
+    create_coding_tools(
+        cwd,
+        &["read".into(), "grep".into(), "find".into(), "ls".into()],
+        sandbox,
+    )
 }

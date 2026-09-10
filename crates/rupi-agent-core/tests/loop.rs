@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use rupi_agent_core::{
     agent_loop, compact_messages, estimate_context_tokens, find_cut_point, format_skills_for_system_prompt,
-    should_compact, Agent, AgentContext, AgentLoopConfig, CompactionSettings, SessionStore,
-    SkillPromptEntry, ToolSet,
+    should_compact, Agent, AgentContext, AgentLoopConfig, CompactionSettings, PermissionDecision,
+    PermissionGate, SessionStore, SkillPromptEntry, ToolSet,
 };
 use rupi_ai::{FauxProvider, FauxScript, Message, ModelCatalog};
 
@@ -163,4 +163,13 @@ async fn permission_block_emits_error_result() {
         m,
         Message::ToolResult { is_error: true, .. }
     )));
+}
+
+#[test]
+fn sandbox_gate_asks_destructive_bash() {
+    let g = PermissionGate::sandboxed("/tmp");
+    assert_eq!(g.decide("bash", "rm -rf /"), PermissionDecision::Ask);
+    assert_eq!(g.decide("bash", "ls -la"), PermissionDecision::Allow);
+    assert_eq!(g.decide("read", "README.md"), PermissionDecision::Allow);
+    assert_eq!(g.decide("session_search", "q"), PermissionDecision::Allow);
 }

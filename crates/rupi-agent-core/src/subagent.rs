@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rupi_ai::{FauxProvider, Message, Model};
+use rupi_ai::{Message, Model, ProviderClient};
 
 use crate::agent::Agent;
 use crate::tools::ToolSet;
@@ -24,12 +24,12 @@ pub struct SubagentResult {
 /// share the parent transcript; they only return a summary.
 pub async fn run_subagent(
     model: Model,
-    provider: Arc<FauxProvider>,
+    provider: Arc<dyn ProviderClient>,
     tools: ToolSet,
     task: &str,
     config: SubagentConfig,
 ) -> AgentResult<SubagentResult> {
-    let mut agent = Agent::new(config.system_prompt, model).with_faux(provider);
+    let mut agent = Agent::new(config.system_prompt, model).with_provider(provider);
     agent.set_tools(tools);
     let new_msgs = agent.prompt(task).await?;
     let final_text = new_msgs
