@@ -708,6 +708,13 @@ mod teststub {
     }
 
     pub async fn start(payload: serde_json::Value) -> (String, Arc<Seen>) {
+        start_with_status(payload, 200).await
+    }
+
+    pub async fn start_with_status(
+        payload: serde_json::Value,
+        status: u16,
+    ) -> (String, Arc<Seen>) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let seen = Arc::new(Seen::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -720,7 +727,16 @@ mod teststub {
                 };
                 let seen = seen_clone.clone();
                 let payload = payload.clone();
+                let status = status;
                 tokio::spawn(async move {
+                    let status_line = match status {
+                        200 => "200 OK",
+                        400 => "400 Bad Request",
+                        401 => "401 Unauthorized",
+                        429 => "429 Too Many Requests",
+                        500 => "500 Internal Server Error",
+                        _ => "200 OK",
+                    };
                     let (rh, mut wh) = sock.into_split();
                     let mut reader = tokio::io::BufReader::new(rh);
                     let mut request_line = String::new();
@@ -761,7 +777,7 @@ mod teststub {
                     *seen.count.lock().unwrap() += 1;
                     let body = payload.to_string().into_bytes();
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = wh.write_all(head.as_bytes()).await;

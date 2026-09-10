@@ -629,4 +629,72 @@ mod tests {
             _ => panic!("expected tool call"),
         }
     }
+
+    #[tokio::test]
+    async fn gemini_complete_posts_generate_content_shape() {
+        use super::super::LlmProvider;
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "g-hi"}], "role": "model"},
+                "finishReason": "STOP",
+            }],
+        });
+        let (base, seen) = crate::teststub::start(payload).await;
+        let p = GeminiProvider::new(base, "gk".into(), "gemini-x".into());
+        let req = super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: Some(super::super::ThinkingLevel::High),
+        };
+        let resp = p.complete(req).await.unwrap();
+        assert_eq!(resp.message.full_text(), "g-hi");
+        assert_eq!(resp.stop_reason, "STOP");
+        assert_eq!(
+            *seen.path.lock().unwrap(),
+            "/v1beta/models/gemini-x:generateContent"
+        );
+        let headers = seen.headers.lock().unwrap();
+        assert_eq!(
+            headers.get("x-goog-api-key").map(String::as_str),
+            Some("gk")
+        );
+        let body = seen.body.lock().unwrap();
+        assert_eq!(
+            body.pointer("/system_instruction/parts/0/text"),
+            Some(&serde_json::json!("sys"))
+        );
+        assert!(body.pointer("/tools/0/functionDeclarations").is_some());
+        // temperature 是 f32 口径（0.2 存成 0.2000000029…），epsilon 比对
+        let temp = body
+            .pointer("/generationConfig/temperature")
+            .and_then(|t| t.as_f64())
+            .expect("temperature 应为数字");
+        assert!((temp - 0.2).abs() < 1e-6, "默认温度 0.2，实得 {temp}");
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&serde_json::json!("HIGH"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_complete_surfaces_error_payload() {
+        use super::super::LlmProvider;
+        let payload = serde_json::json!({"error": {"code": 400, "message": "bad key"}});
+        let (base, seen) = crate::teststub::start_with_status(payload, 400).await;
+        let p = GeminiProvider::new(base, "gk".into(), "gemini-x".into());
+        let req = super::super::ChatRequest {
+            system: "s".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        };
+        let err = p.complete(req).await.expect_err("400 应报错");
+        assert!(err.to_string().contains("bad key"), "错误透出原文：{err:#}");
+        assert_eq!(*seen.count.lock().unwrap(), 1);
+    }
 }
