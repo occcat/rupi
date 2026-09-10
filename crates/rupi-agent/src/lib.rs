@@ -8,6 +8,7 @@ use rupi_llm::{ChatRequest, LlmProvider};
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
 use rupi_tools::{Tool, ToolRegistry};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub mod review;
@@ -18,7 +19,9 @@ pub use policy::{
 };
 pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
+pub mod discovery;
 pub mod hooks;
+pub use discovery::{default_always, DiscoveryConfig, ScoredHit};
 pub use hooks::{
     DenyToolsHook, HookDecision, RecordedCall, RecordingHook, RedirectCommandHook, ToolHook,
 };
@@ -100,6 +103,10 @@ pub struct AgentLoop {
     pub hooks: Vec<Arc<dyn ToolHook>>,
     /// 工具执行策略，默认串行。
     pub tool_execution: ToolExecution,
+    /// 渐进式工具发现（默认关闭，全量可见）；开启后可发现工具按需注入 schema。
+    pub discovery: Option<DiscoveryConfig>,
+    /// 跨轮持久的已发现工具名（同 agent 多轮对话共享；clone 共享底表）。
+    pub discovered: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl AgentLoop {
@@ -118,6 +125,8 @@ impl AgentLoop {
             plan_mode: false,
             hooks: vec![],
             tool_execution: ToolExecution::Sequential,
+            discovery: None,
+            discovered: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -162,15 +171,48 @@ impl AgentLoop {
         self
     }
 
-    /// 第二阶段：真实执行一个放行的工具调用（memory 路由 + skill 内建 + 注册表）。
+    pub fn with_discovery(mut self, discovery: DiscoveryConfig) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// 第二阶段：真实执行一个放行的工具调用（memory 路由 + skill 内建 + 注册表 + 发现路由）。
     /// 串行/并行共用；denied 短路由调用方处理，这里只管执行，错误一律转 tool error。
     async fn execute_allowed(
+        &self,
         tools: &ToolRegistry,
         mem: &MemoryManager,
         skills: &SkillRegistry,
+        search_space: &[ToolDefinition],
         name: &str,
         args: serde_json::Value,
     ) -> rupi_tools::ToolOutput {
+        if name == "search_tools" {
+            let Some(cfg) = &self.discovery else {
+                return rupi_tools::ToolOutput::err("tool discovery is disabled");
+            };
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cfg.limit as u64) as usize;
+            let hits = discovery::search_definitions(search_space, &cfg.always, query, limit);
+            if hits.is_empty() {
+                return rupi_tools::ToolOutput::ok("no matching tools");
+            }
+            self.discovered
+                .lock()
+                .unwrap()
+                .extend(hits.iter().map(|h| h.name.clone()));
+            let mut s = format!(
+                "matched {} tool(s), now visible for the rest of the session:\n",
+                hits.len()
+            );
+            for h in hits {
+                s.push_str(&format!("- {}: {}\n", h.name, h.description));
+            }
+            return rupi_tools::ToolOutput::ok(s);
+        }
         if name == "load_skill" {
             let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             match skills.load_skill(sk) {
@@ -235,24 +277,39 @@ impl AgentLoop {
         all_tools.extend(skills.tool_definitions());
         // 记忆 prefetch：注入到本轮（不污染冻结快照）
         let recalled = mem.prefetch_all().await;
-        let mut system = self
-            .builder
-            .build(frozen, mem, skills, &all_tools, extensions);
-        if !recalled.is_empty() {
-            system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
-        }
-        if self.plan_mode {
-            system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
-        }
 
         let mut tool_names: Vec<String> = vec![];
         for turn in 1..=self.max_turns {
             on_event(AgentEvent::TurnStart { turn });
+            // 本轮可见工具：关闭发现 = 全量（历史行为）；开启 = 常驻 + 已发现 + search_tools。
+            // 系统提示同步分区，否则 AvailableTools 段会泄漏未发现工具的存在。
+            let req_tools: Vec<ToolDefinition> = match &self.discovery {
+                None => all_tools.clone(),
+                Some(cfg) => {
+                    let seen = self.discovered.lock().unwrap();
+                    let mut v: Vec<ToolDefinition> = all_tools
+                        .iter()
+                        .filter(|t| cfg.always.contains(&t.name) || seen.contains(&t.name))
+                        .cloned()
+                        .collect();
+                    v.push(discovery::search_tools_definition());
+                    v
+                }
+            };
+            let mut system = self
+                .builder
+                .build(frozen, mem, skills, &req_tools, extensions);
+            if !recalled.is_empty() {
+                system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
+            }
+            if self.plan_mode {
+                system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
+            }
             let history: Vec<Message> = session.prompt_history(self.compress_keep_last);
             let req = ChatRequest {
-                system: system.clone(),
+                system,
                 messages: history,
-                tools: all_tools.clone(),
+                tools: req_tools,
                 max_tokens: None,
                 temperature: Some(0.2),
             };
@@ -399,8 +456,15 @@ impl AgentLoop {
                         outs.push(match &p.denied {
                             Some(o) => o.clone(),
                             None => {
-                                Self::execute_allowed(tools, mem, skills, &p.name, p.args.clone())
-                                    .await
+                                self.execute_allowed(
+                                    tools,
+                                    mem,
+                                    skills,
+                                    &all_tools,
+                                    &p.name,
+                                    p.args.clone(),
+                                )
+                                .await
                             }
                         });
                     }
@@ -411,8 +475,15 @@ impl AgentLoop {
                         match &p.denied {
                             Some(o) => o.clone(),
                             None => {
-                                Self::execute_allowed(tools, mem, skills, &p.name, p.args.clone())
-                                    .await
+                                self.execute_allowed(
+                                    tools,
+                                    mem,
+                                    skills,
+                                    &all_tools,
+                                    &p.name,
+                                    p.args.clone(),
+                                )
+                                .await
                             }
                         }
                     }))
@@ -1223,5 +1294,64 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.iter().filter(|s| s.contains("RunEnd")).count(), 1);
         assert!(seen.last().unwrap().contains("MaxTurns"));
+    }
+
+    fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> ChatResponse {
+        ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments,
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_gates_then_reveals_tools() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("c1", "search_tools", serde_json::json!({"query": "memory"})),
+            tool_call_response(
+                "c2",
+                "memory_search",
+                serde_json::json!({"query": "x", "limit": 1}),
+            ),
+            MockProvider::text_response("d"),
+        ]);
+        let agent = AgentLoop::new(5).with_discovery(DiscoveryConfig::default());
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-discovery");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        // 首轮只见常驻 + search_tools，发现后可见变多并保持
+        let counts = provider.seen_tools.lock().unwrap();
+        assert_eq!(counts.len(), 3);
+        assert!(counts[0] < counts[1], "counts: {counts:?}");
+        assert_eq!(counts[1], counts[2]);
+        // 搜索结果列出记忆工具，第二轮 memory_search 真实执行
+        let texts = tool_result_texts(&session);
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("- memory_search:"), "{}", texts[0]);
+        assert!(texts[0].contains("- memory:"), "{}", texts[0]);
     }
 }

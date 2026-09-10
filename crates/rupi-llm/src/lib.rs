@@ -411,12 +411,15 @@ fn parse_openai_response(v: serde_json::Value) -> anyhow::Result<ChatResponse> {
 /// Mock provider：单测 / 无 Key 演示用，按预设剧本返回。
 pub struct MockProvider {
     pub script: std::sync::Mutex<Vec<ChatResponse>>,
+    /// 每轮请求携带的工具数（断言工具可见性变化用，如渐进式发现）。
+    pub seen_tools: std::sync::Mutex<Vec<usize>>,
 }
 
 impl MockProvider {
     pub fn new(script: Vec<ChatResponse>) -> Self {
         Self {
             script: std::sync::Mutex::new(script),
+            seen_tools: std::sync::Mutex::new(vec![]),
         }
     }
 
@@ -433,7 +436,8 @@ impl LlmProvider for MockProvider {
     fn name(&self) -> &str {
         "mock"
     }
-    async fn complete(&self, _req: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.seen_tools.lock().unwrap().push(req.tools.len());
         let mut g = self.script.lock().unwrap();
         if g.is_empty() {
             Ok(Self::text_response("done"))
