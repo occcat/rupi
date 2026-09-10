@@ -1,7 +1,7 @@
 //! Agent ↔ 外部扩展联调：剧本让模型调用热加载的工具，主循环执行并回填结果。
 
 use rupi_agent::AgentLoop;
-use rupi_core::{ContentBlock, Message, Role, SessionTree, StopReason};
+use rupi_core::{CancelFlag, ContentBlock, Message, Role, SessionTree, StopReason};
 use rupi_llm::{ChatResponse, MockProvider};
 use rupi_memory::{FrozenMemory, MemoryManager, MemoryStore};
 use rupi_skills::SkillRegistry;
@@ -60,6 +60,7 @@ async fn agent_executes_hot_loaded_extension_tool() {
             &SkillRegistry::default(),
             &[],
             &|_| {},
+            &CancelFlag::new(),
         )
         .await
         .unwrap();

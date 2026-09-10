@@ -375,6 +375,52 @@ pub enum StopReason {
     ProviderError(String),
 }
 
+/// 协作式取消旗标（对标上游 effect-gate 的取消源）：TUI `Esc` / CLI `Ctrl-C` 置位，
+/// 主循环在 turn 边界、流式补全 `select!`、串行工具间隙检查，中止后发
+/// `TurnEnd{Aborted}`（轮中）+ `RunEnd{Aborted}` 收尾。
+/// `clone` 共享同一状态（一次置位处处可见）；语义是协作式的——in-flight 的工具调用
+/// 跑完当前项，并行批跑完当前批，审批问询（同步阻塞）与子 agent 运行不受影响。
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag {
+    inner: std::sync::Arc<CancelInner>,
+}
+
+#[derive(Debug, Default)]
+struct CancelInner {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 置位并唤醒所有 `cancelled()` 等待者；重复调用无害。
+    pub fn cancel(&self) {
+        self.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 置位即返回。`notify_waiters` 无等待者时留一个 permit，先检查后等待的写法无竞态。
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.inner.notify.notified().await;
+        }
+    }
+}
+
 /// 工具定义：JSON Schema 描述参数；`prompt_snippet` 为必填——Pi 若缺了它就不会把工具列入系统提示。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {

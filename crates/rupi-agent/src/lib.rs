@@ -2,7 +2,8 @@
 //! 系统提示 = base + 记忆冻结块 + Skill 索引 + MCP promptSnippet 清单 + 扩展片段。
 
 use rupi_core::{
-    AgentEvent, ContentBlock, Extension, Message, Role, SessionTree, StopReason, ToolDefinition,
+    AgentEvent, CancelFlag, ContentBlock, Extension, Message, Role, SessionTree, StopReason,
+    ToolDefinition,
 };
 use rupi_llm::{ChatRequest, LlmProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager};
@@ -344,6 +345,10 @@ impl AgentLoop {
     }
 
     /// 运行一轮用户请求直到 `done` / 无工具调用 / max_turns。每步推 `AgentEvent`。
+    /// 协作取消（`cancel`，对标上游 effect-gate 取消源）：turn 边界、流式补全中、
+    /// 串行工具间隙检查；中止发 `TurnEnd{Aborted}`（轮中）+ `RunEnd{Aborted}` 并回
+    /// `Ok(Aborted)`。in-flight 工具跑完当前项、并行批跑完当前批；子 agent 运行不继承
+    /// （`Tool::execute` 无取消通道，子循环传的是 fresh flag）。
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -356,6 +361,7 @@ impl AgentLoop {
         skills: &SkillRegistry,
         extensions: &[Arc<dyn Extension>],
         on_event: &(dyn Fn(AgentEvent) + Sync),
+        cancel: &CancelFlag,
     ) -> anyhow::Result<StopReason> {
         session.push(Message::text(Role::User, user_input));
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
@@ -383,6 +389,11 @@ impl AgentLoop {
         let mut turn: u32 = 0;
         let mut overflow_recoveries: u32 = 0;
         while turn < self.max_turns {
+            // 协作取消点（turn 边界）：首轮前取消只发 RunEnd（尚无 TurnStart），
+            // 轮中取消由 finish_aborted 补 TurnEnd{Aborted}。
+            if cancel.is_cancelled() {
+                return Self::finish_aborted(turn, on_event, extensions).await;
+            }
             turn += 1;
             on_event(AgentEvent::TurnStart { turn });
             // 本轮可见工具：关闭发现 = 全量（历史行为）；开启 = 常驻 + 已发现 + search_tools。
@@ -418,24 +429,43 @@ impl AgentLoop {
                 temperature: Some(0.2),
                 thinking: self.thinking,
             };
-            // 流式补全：delta 到达即推 TextDelta（TUI 逐字渲染），最终仍得完整响应
+            // 流式补全：delta 到达即推 TextDelta（TUI 逐字渲染），最终仍得完整响应。
+            // 取消分支与 provider 竞速：reqwest future drop 即断连，天然安全。
             let (tx, mut rx) = tokio::sync::mpsc::channel::<rupi_llm::StreamEvent>(64);
             let fut = provider.complete_streaming(req, tx);
             tokio::pin!(fut);
-            let stream_result: anyhow::Result<rupi_llm::ChatResponse> = loop {
+            let mut partial = String::new();
+            enum StreamEnd {
+                Done(anyhow::Result<rupi_llm::ChatResponse>),
+                Cancelled,
+            }
+            let stream_end = loop {
                 tokio::select! {
-                    r = &mut fut => break r,
+                    r = &mut fut => break StreamEnd::Done(r),
                     msg = rx.recv() => match msg {
                         Some(rupi_llm::StreamEvent::TextDelta(delta)) => {
+                            partial.push_str(&delta);
                             on_event(AgentEvent::TextDelta { delta });
                         }
                         // 发送端已关闭（provider 收尾中）：直接等完成，
                         // 否则关闭后的 recv 永远就绪空转，空烧 CPU。
-                        None => break fut.await,
+                        None => break StreamEnd::Done(fut.await),
                     },
+                    _ = cancel.cancelled() => break StreamEnd::Cancelled,
                 }
             };
-            let resp = match stream_result {
+            let resp = match stream_end {
+                // 流中取消：已渲染的 delta 落盘为残缺助手消息（显示/历史一致，
+                // 对标上游 progress 通道提交 partial frame），再走中止收尾。
+                StreamEnd::Cancelled => {
+                    if !partial.trim().is_empty() {
+                        session.push(Message::text(Role::Assistant, partial));
+                    }
+                    return Self::finish_aborted(turn, on_event, extensions).await;
+                }
+                StreamEnd::Done(r) => r,
+            };
+            let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
                     // 上下文溢出：阈值压实没拦住的一步撑爆，强制压实后重发本轮
@@ -607,6 +637,11 @@ impl AgentLoop {
                     for p in &pending {
                         outs.push(match &p.denied {
                             Some(o) => o.clone(),
+                            // 协作取消点（串行工具间隙）：剩余调用合成取消错误，保证每个
+                            // ToolCall 都有结果（不断 transcript 不变量），由轮末统一收尾。
+                            None if cancel.is_cancelled() => {
+                                rupi_tools::ToolOutput::err("cancelled by user")
+                            }
                             None => {
                                 self.execute_allowed(
                                     tools,
@@ -623,23 +658,35 @@ impl AgentLoop {
                     outs
                 }
                 ToolExecution::Parallel => {
-                    futures::future::join_all(pending.iter().map(|p| async {
-                        match &p.denied {
-                            Some(o) => o.clone(),
-                            None => {
-                                self.execute_allowed(
-                                    tools,
-                                    mem,
-                                    skills,
-                                    &all_tools,
-                                    &p.name,
-                                    p.args.clone(),
-                                )
-                                .await
+                    // 协作取消点（并行批边界）：in-flight 批不可抢占，置位则整批转取消
+                    // 错误，不再下发执行（对标 effect-gate 关闭后不再接新 effect）。
+                    if cancel.is_cancelled() {
+                        pending
+                            .iter()
+                            .map(|p| match &p.denied {
+                                Some(o) => o.clone(),
+                                None => rupi_tools::ToolOutput::err("cancelled by user"),
+                            })
+                            .collect()
+                    } else {
+                        futures::future::join_all(pending.iter().map(|p| async {
+                            match &p.denied {
+                                Some(o) => o.clone(),
+                                None => {
+                                    self.execute_allowed(
+                                        tools,
+                                        mem,
+                                        skills,
+                                        &all_tools,
+                                        &p.name,
+                                        p.args.clone(),
+                                    )
+                                    .await
+                                }
                             }
-                        }
-                    }))
-                    .await
+                        }))
+                        .await
+                    }
                 }
             };
             // 第三阶段（顺序）：after 钩子 → ToolEnd → 结果入历史，保持原序
@@ -667,6 +714,11 @@ impl AgentLoop {
                 provider: None,
                 created_at: chrono::Utc::now(),
             });
+            // 轮中取消（工具间隙置位）：结果已落盘保不变量，跳过压实（省一次模型调用），
+            // 本轮记 Aborted 而非 Done。
+            if cancel.is_cancelled() {
+                return Self::finish_aborted(turn, on_event, extensions).await;
+            }
             // 轮中压实：大工具结果可能一步冲破阈值，必须在下一轮送模型前摘要，
             // 否则超窗历史先发出去才壓缩（上游 #6879 同修）。
             self.maybe_compress_with_event(provider, session, mem, on_event)
@@ -686,6 +738,33 @@ impl AgentLoop {
             .await?;
         }
         Ok(StopReason::MaxTurns)
+    }
+
+    /// 中止收尾：补 `TurnEnd{Aborted}`（`turn > 0` 才有对应的 `TurnStart`）+
+    /// `RunEnd{Aborted}`，扩展同播。调用方在各取消点直接 `return`。
+    async fn finish_aborted(
+        turn: u32,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+        extensions: &[Arc<dyn Extension>],
+    ) -> anyhow::Result<StopReason> {
+        if turn > 0 {
+            let end = AgentEvent::TurnEnd {
+                turn,
+                stop_reason: StopReason::Aborted,
+            };
+            on_event(end.clone());
+            for e in extensions {
+                e.on_event(&end).await?;
+            }
+        }
+        let rend = AgentEvent::RunEnd {
+            stop_reason: StopReason::Aborted,
+        };
+        on_event(rend.clone());
+        for e in extensions {
+            e.on_event(&rend).await?;
+        }
+        Ok(StopReason::Aborted)
     }
 
     /// 会话压缩：历史超阈值时，用 provider 把最旧部分摘要掉；失败则启发式兜底。永不抛错。
@@ -1025,11 +1104,190 @@ mod tests {
                 &|e| {
                     events.lock().unwrap().push(format!("{e:?}"));
                 },
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
         assert!(matches!(reason, StopReason::Done));
         assert!(session.history().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_start_aborts_without_provider_call() {
+        // 首轮前置位：连 provider 都不碰，只发 RunEnd{Aborted}（尚无 TurnStart，不补 TurnEnd）。
+        let provider = MockProvider::new(vec![MockProvider::text_response("unused")]);
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-cancel0-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let events = std::sync::Mutex::new(vec![]);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let reason = agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|e| {
+                    events.lock().unwrap().push(format!("{e:?}"));
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Aborted));
+        assert!(
+            provider.seen_tools.lock().unwrap().is_empty(),
+            "置位后不得调模型"
+        );
+        let ev = events.lock().unwrap().join("\n");
+        assert!(!ev.contains("TurnStart"), "首轮前取消不应有 TurnStart：\n{ev}");
+        assert!(ev.contains("RunEnd") && ev.contains("Aborted"), "{ev}");
+    }
+
+    /// 流中阻塞的测试替身：先推一个 delta 再睡 60s（取消后 future 被 drop，实测只等 50ms）。
+    struct BlockingStreamer;
+    #[async_trait::async_trait]
+    impl LlmProvider for BlockingStreamer {
+        fn name(&self) -> &str {
+            "blocking-streamer"
+        }
+        async fn complete(&self, _req: rupi_llm::ChatRequest) -> anyhow::Result<ChatResponse> {
+            Ok(MockProvider::text_response("unreached"))
+        }
+        async fn complete_streaming(
+            &self,
+            _req: rupi_llm::ChatRequest,
+            tx: tokio::sync::mpsc::Sender<rupi_llm::StreamEvent>,
+        ) -> anyhow::Result<ChatResponse> {
+            let _ = tx
+                .send(rupi_llm::StreamEvent::TextDelta("partial-".into()))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(MockProvider::text_response("unreached"))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_aborts_and_keeps_partial() {
+        // 流中取消：残缺输出落盘（显示/历史一致），TurnEnd{Aborted} + RunEnd{Aborted} 收尾。
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-cancel1-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let events = std::sync::Mutex::new(vec![]);
+        let cancel = CancelFlag::new();
+        let killer = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            killer.cancel();
+        });
+        let reason = agent
+            .run(
+                &BlockingStreamer,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|e| {
+                    events.lock().unwrap().push(format!("{e:?}"));
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Aborted));
+        assert!(
+            session
+                .history()
+                .iter()
+                .any(|m| m.full_text().contains("partial-")),
+            "残缺输出应落盘"
+        );
+        let ev = events.lock().unwrap().join("\n");
+        assert_eq!(ev.matches("TurnStart").count(), 1, "{ev}");
+        assert!(ev.contains("TurnEnd") && ev.contains("Aborted"), "{ev}");
+        assert!(ev.contains("RunEnd"), "{ev}");
+    }
+
+    /// 回包前置位的测试替身：complete 里先取消再给两个工具调用，确定性演练“执行前取消”。
+    struct CancelThenTools {
+        flag: CancelFlag,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for CancelThenTools {
+        fn name(&self) -> &str {
+            "cancel-then-tools"
+        }
+        async fn complete(&self, _req: rupi_llm::ChatRequest) -> anyhow::Result<ChatResponse> {
+            self.flag.cancel();
+            Ok(two_bash_calls("echo a", "echo b"))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_before_tool_batch_synthesizes_cancelled_errors() {
+        use rupi_core::ContentBlock;
+        // 串行/并行同语义：未执行的调用合成取消错误，保证每个 ToolCall 都有结果。
+        for mode in [ToolExecution::Sequential, ToolExecution::Parallel] {
+            let flag = CancelFlag::new();
+            let provider = CancelThenTools { flag: flag.clone() };
+            let agent = AgentLoop::new(3).with_tool_execution(mode);
+            let mut session = SessionTree::new();
+            let tools = ToolRegistry::with_builtins();
+            let home = std::env::temp_dir().join(format!(
+                "rupi-agent-cancel2-{}-{mode:?}",
+                std::process::id()
+            ));
+            let mem = MemoryManager::new(MemoryStore::new(home));
+            let events = std::sync::Mutex::new(vec![]);
+            let reason = agent
+                .run(
+                    &provider,
+                    &mut session,
+                    "go",
+                    &tools,
+                    &mem,
+                    &FrozenMemory::default(),
+                    &SkillRegistry::default(),
+                    &[],
+                    &|e| {
+                        events.lock().unwrap().push(format!("{e:?}"));
+                    },
+                    &flag,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(reason, StopReason::Aborted), "{mode:?}");
+            let tool_texts: Vec<String> = session
+                .history()
+                .iter()
+                .flat_map(|m| m.blocks.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tool_texts.len(), 2, "{mode:?}");
+            assert!(
+                tool_texts.iter().all(|c| c.contains("cancelled by user")),
+                "{mode:?}: {tool_texts:?}"
+            );
+            let ev = events.lock().unwrap().join("\n");
+            assert!(ev.contains("TurnEnd") && ev.contains("Aborted"), "{mode:?}: {ev}");
+        }
     }
 
     async fn mem_with_jsonl_history(
@@ -1075,6 +1333,7 @@ mod tests {
                         *seen.lock().unwrap() = detail;
                     }
                 },
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1108,6 +1367,7 @@ mod tests {
                         hit.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 },
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1359,6 +1619,7 @@ mod tests {
                 &skills,
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1588,6 +1849,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
     }
@@ -1650,6 +1912,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap_err();
@@ -1699,6 +1962,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap_err();
@@ -1744,6 +2008,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1806,6 +2071,7 @@ mod tests {
                 &|e| {
                     events.lock().unwrap().push(format!("{e:?}"));
                 },
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1854,6 +2120,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1930,6 +2197,7 @@ mod tests {
                 &skills,
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -1988,6 +2256,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2014,6 +2283,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2061,6 +2331,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2133,6 +2404,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2210,6 +2482,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2238,6 +2511,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2288,6 +2562,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[ext.clone() as Arc<dyn Extension>],
                 &|e| seen.lock().unwrap().push(format!("{e:?}")),
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2320,6 +2595,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|e| seen.lock().unwrap().push(format!("{e:?}")),
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2413,6 +2689,7 @@ mod tests {
                 &skills,
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();
@@ -2464,6 +2741,7 @@ mod tests {
                 &SkillRegistry::default(),
                 &[],
                 &|_| {},
+                &CancelFlag::new(),
             )
             .await
             .unwrap();

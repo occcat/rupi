@@ -879,6 +879,8 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
                 }
                 _ => {}
             },
+            // 非交互 run：Ctrl-C 直接杀进程（现状），不做优雅中止
+            &rupi_core::CancelFlag::new(),
         )
         .await?;
     println!();
@@ -999,7 +1001,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
+    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -1152,43 +1154,61 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
         }
         let before_len = session.current_path.len();
-        agent
-            .run(
-                &*provider,
-                &mut session,
-                &input,
-                &tools,
-                &*mem,
-                &frozen,
-                &*skills,
-                &[],
-                &|e| match e {
-                    rupi_core::AgentEvent::TextDelta { delta } => print!("{delta}"),
-                    rupi_core::AgentEvent::ToolStart { name, .. } => println!("\n[tool {name}]…"),
-                    rupi_core::AgentEvent::ToolEnd {
-                        name,
-                        content,
-                        is_error,
-                        ..
-                    } => {
-                        println!(
-                            "\n[{name} {}]\n{content}",
-                            if is_error { "error" } else { "ok" }
-                        )
-                    }
-                    rupi_core::AgentEvent::MemoryRecall { detail } => {
-                        println!("{detail}")
-                    }
-                    rupi_core::AgentEvent::CompactionStart => {
-                        println!("\n[compacting]…")
-                    }
-                    rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
-                        println!("\n[compacted: summarized {summarized}, kept {kept}]")
-                    }
-                    _ => {}
-                },
-            )
-            .await?;
+        // 协作取消：Ctrl-C 只在 run 期间捕获（select 存活时），置位后循环在检查点
+        // 优雅中止；空闲输入时无监听器，按默认行为杀进程（与现状一致）。
+        let cancel = rupi_core::CancelFlag::new();
+        // Box 拥有式持有：取消后仍需 await 到底，结束后显式 drop 释放 &mut session 借用。
+        let mut fut = Box::pin(agent.run(
+            &*provider,
+            &mut session,
+            &input,
+            &tools,
+            &*mem,
+            &frozen,
+            &*skills,
+            &[],
+            &|e| match e {
+                rupi_core::AgentEvent::TextDelta { delta } => print!("{delta}"),
+                rupi_core::AgentEvent::ToolStart { name, .. } => println!("\n[tool {name}]…"),
+                rupi_core::AgentEvent::ToolEnd {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    println!(
+                        "\n[{name} {}]\n{content}",
+                        if is_error { "error" } else { "ok" }
+                    )
+                }
+                rupi_core::AgentEvent::MemoryRecall { detail } => {
+                    println!("{detail}")
+                }
+                rupi_core::AgentEvent::CompactionStart => {
+                    println!("\n[compacting]…")
+                }
+                rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                    println!("\n[compacted: summarized {summarized}, kept {kept}]")
+                }
+                rupi_core::AgentEvent::RunEnd {
+                    stop_reason: rupi_core::StopReason::Aborted,
+                } => {
+                    println!("\n[aborted]")
+                }
+                _ => {}
+            },
+            &cancel,
+        ));
+        let res = tokio::select! {
+            r = &mut fut => r,
+            _ = tokio::signal::ctrl_c() => {
+                cancel.cancel();
+                eprintln!("\n[abort requested — finishing current step…]");
+                (&mut fut).await
+            }
+        };
+        drop(fut); // future（含 &mut session 借用）在此释放，后续落盘再借
+        res?;
         persist_turn(&sess_db, &sid, &input, &session, before_len);
         // 压缩摘要落盘（变化才写）
         if let Some(sum) = &session.summary {

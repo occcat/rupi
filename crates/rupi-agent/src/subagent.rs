@@ -6,7 +6,7 @@
 //! - [`SubagentTool`]：模型可调用的 `subagent` 工具（单任务委托）；深度 guard 防无限递归。
 
 use crate::AgentLoop;
-use rupi_core::{AgentEvent, SessionTree, StopReason};
+use rupi_core::{AgentEvent, CancelFlag, SessionTree, StopReason};
 use rupi_llm::LlmProvider;
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
@@ -31,6 +31,7 @@ pub struct SubagentResult {
 
 /// 并发扇出：每个任务 fork 主会话游标（空会话则全新），跑完汇总。
 /// 共享的 provider/tools/mem/skills 只读借用；各任务会话相互隔离。
+/// `cancel` 透传给各子循环（父循环中止可打断扇出中的子任务）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_subagents(
     agent: &AgentLoop,
@@ -43,6 +44,7 @@ pub async fn run_subagents(
     skills: &SkillRegistry,
     extensions: &[Arc<dyn crate::Extension>],
     on_event: &(dyn Fn(AgentEvent) + Sync),
+    cancel: &CancelFlag,
 ) -> Vec<SubagentResult> {
     let tip = base.current_path.last().cloned();
     let futs = tasks.into_iter().map(|t| {
@@ -67,6 +69,7 @@ pub async fn run_subagents(
                     skills,
                     extensions,
                     on_event,
+                    cancel,
                 )
                 .await
                 .unwrap_or(StopReason::Aborted);
@@ -91,6 +94,8 @@ pub async fn run_subagents(
 
 /// 模型可调用的委托工具：自包含子任务（无父会话上下文），跑完只回摘要。
 /// 非交互：无审批器，Ask 一律拒绝；递归深度达 `max_depth` 时子会话不再配 `subagent` 工具。
+/// 父循环的取消不继承：`Tool::execute` 无取消通道，子循环用 fresh flag 跑到头
+/// （`max_turns` 封顶），in-flight 子任务不受 Esc/Ctrl-C 打断。
 pub struct SubagentTool {
     provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
@@ -212,6 +217,7 @@ impl rupi_tools::Tool for SubagentTool {
                 self.skills.as_ref(),
                 &[],
                 &noop,
+                &CancelFlag::new(),
             )
             .await?;
         let summary = session
@@ -357,6 +363,7 @@ mod tests {
             s.as_ref(),
             &[],
             &|_| {},
+            &CancelFlag::new(),
         )
         .await;
         assert_eq!(results.len(), 2);

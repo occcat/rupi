@@ -256,7 +256,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -406,6 +406,8 @@ async fn drive_turn(
     };
     // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
     let before = session.current_path.len();
+    // 协作取消：内循环 Esc 置位，主循环在检查点优雅中止（TurnEnd/RunEnd{Aborted} 照常走事件通道）。
+    let cancel = rupi_core::CancelFlag::new();
     let fut = agent.run(
         provider,
         session,
@@ -416,6 +418,7 @@ async fn drive_turn(
         skills,
         &[],
         &on_event,
+        &cancel,
     );
     let mut scroll: u16 = 0;
     // 内循环只负责驱动 + 渲染；pin 守卫连同 fut 一起终结于块内，之后才能再读 session
@@ -453,6 +456,11 @@ async fn drive_turn(
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 break End::Quit;
                             }
+                            // 中止本轮：只置位不 drop future，会话停在一致点，
+                            // TurnEnd/RunEnd{Aborted} 照常进视图。
+                            KeyCode::Esc => {
+                                cancel.cancel();
+                            }
                             KeyCode::PageUp => scroll = scroll.saturating_add(5),
                             KeyCode::PageDown => scroll = scroll.saturating_sub(5),
                             _ => {}
@@ -466,6 +474,9 @@ async fn drive_turn(
     match end {
         End::Quit => Ok(Control::Quit),
         End::Finished(res) => {
+            if matches!(res, Ok(rupi_core::StopReason::Aborted)) {
+                view.push_system("[aborted]".into());
+            }
             match res {
                 Ok(_) => {
                     let (assistant, assistant_node) = session
