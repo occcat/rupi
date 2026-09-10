@@ -89,7 +89,7 @@ pub struct SkillRegistry {
 
 impl SkillRegistry {
     pub fn discover(dirs: &[PathBuf]) -> Self {
-        let mut this = Self::default();
+        let this = Self::default();
         this.refresh(dirs);
         this
     }

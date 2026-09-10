@@ -32,7 +32,7 @@ cargo test --workspace
 RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi memory-write add "likes tea"
 RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi memory-show
 RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi skills-list
-RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi skill-load --name commit-helper
+RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi skill-load commit-helper
 echo "/quit" | RUPI_HOME=/tmp/rupi-demo ./target/debug/rupi chat
 
 # 接真实模型（OpenAI-compatible）
