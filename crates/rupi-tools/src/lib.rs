@@ -174,6 +174,81 @@ impl Tool for SandboxedTool {
     }
 }
 
+// ---- file mutation queue ----
+
+/// 同文件写串行化（对标上游 `withFileMutationQueue`）：并行工具执行时，
+/// 同一 canonical path 的 write/edit 排队通过，防 read-modify-write 丢更新；
+/// 不同文件互不阻塞。异常路径（文件与父目录都不存在）退回原文 key，
+/// 与上游 not_found/not_supported 时退回 absolutePath 同理。
+pub struct FileMutationQueue {
+    inner: std::sync::Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl FileMutationQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn with_queued<F, Fut, T>(&self, key: std::path::PathBuf, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let slot = {
+            let mut inner = self.inner.lock().expect("mutation queue poisoned");
+            inner
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = slot.lock().await;
+        let out = f().await;
+        drop(guard);
+        // 仅剩 map 内与本地引用时回收槽位：后来者若在 remove 前 clone 过，
+        // 计数≥3 即跳过删除，由它们排空后回收；remove 后新来者建新槽，
+        // 此时临界区已结束，不存在并发重叠。
+        let mut inner = self.inner.lock().expect("mutation queue poisoned");
+        if Arc::strong_count(&slot) == 2 {
+            inner.remove(&key);
+        }
+        out
+    }
+}
+
+impl Default for FileMutationQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 突变 key：存在文件取 canonical（消 `..`/符号链接，与沙箱 resolve 同口径）；
+/// 新建文件取“父目录 canonical + 文件名”；都失败退回绝对路径原文。
+pub fn mutation_key(path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    if let Ok(c) = abs.canonicalize() {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) {
+        if let Ok(c) = parent.canonicalize() {
+            return c.join(name);
+        }
+    }
+    abs
+}
+
+fn global_mutation_queue() -> &'static FileMutationQueue {
+    static QUEUE: std::sync::LazyLock<FileMutationQueue> =
+        std::sync::LazyLock::new(FileMutationQueue::new);
+    &QUEUE
+}
+
 // ---- builtins ----
 
 pub struct ReadTool;
@@ -263,18 +338,23 @@ impl Tool for WriteTool {
         if path.is_empty() {
             return Ok(ToolOutput::err("path required"));
         }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
-        match tokio::fs::write(path, content).await {
-            Ok(()) => Ok(ToolOutput::ok(format!(
-                "wrote {path} ({} bytes)",
-                content.len()
-            ))),
-            Err(e) => Ok(ToolOutput::err(format!("write failed: {e}"))),
-        }
+        let key = mutation_key(path);
+        global_mutation_queue()
+            .with_queued(key, || async {
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                Ok(match tokio::fs::write(path, content).await {
+                    Ok(()) => ToolOutput::ok(format!(
+                        "wrote {path} ({} bytes)",
+                        content.len()
+                    )),
+                    Err(e) => ToolOutput::err(format!("write failed: {e}")),
+                })
+            })
+            .await
     }
 }
 
@@ -307,15 +387,20 @@ impl Tool for EditTool {
             .get("new_string")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let content = tokio::fs::read_to_string(path)
+        let key = mutation_key(path);
+        global_mutation_queue()
+            .with_queued(key, || async {
+                let content = tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+                if !content.contains(old) {
+                    return Ok(ToolOutput::err("old_string not found"));
+                }
+                let updated = content.replacen(old, new, 1);
+                tokio::fs::write(path, updated).await?;
+                Ok(ToolOutput::ok(format!("edited {path}")))
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
-        if !content.contains(old) {
-            return Ok(ToolOutput::err("old_string not found"));
-        }
-        let updated = content.replacen(old, new, 1);
-        tokio::fs::write(path, updated).await?;
-        Ok(ToolOutput::ok(format!("edited {path}")))
     }
 }
 
@@ -895,5 +980,101 @@ mod tests {
         assert!(esc.is_error);
         assert!(esc.content.contains("escapes workspace root"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mutation_queue_serializes_same_key() {
+        // 同 key 临界区互斥：8 任务各睡 20ms，最大并发恒为 1（任意 runtime 下确定成立）。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let q = std::sync::Arc::new(FileMutationQueue::new());
+        let key = std::path::PathBuf::from("same-key");
+        let cur = std::sync::Arc::new(AtomicUsize::new(0));
+        let max = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let (qq, k, c, m) = (q.clone(), key.clone(), cur.clone(), max.clone());
+            handles.push(tokio::spawn(async move {
+                qq.with_queued(k, || async {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    m.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    c.fetch_sub(1, Ordering::SeqCst);
+                    n
+                })
+                .await
+            }));
+        }
+        let mut sum = 0;
+        for h in handles {
+            sum += h.await.unwrap();
+        }
+        assert_eq!(sum, 8, "8 个临界区应全部串行执行完毕（每次进入时并发为 1）");
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1,
+            "同 key 必须串行，最大并发只能是 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_queue_keys_are_independent() {
+        // 不同 key 互不阻塞：结果各自正确；排空后槽位回收（复用同一 key 仍正常）。
+        let q = std::sync::Arc::new(FileMutationQueue::new());
+        let mut handles = vec![];
+        for i in 0..8 {
+            let qq = q.clone();
+            handles.push(tokio::spawn(async move {
+                qq.with_queued(std::path::PathBuf::from(format!("key-{i}")), || async move {
+                    i * 10
+                })
+                .await
+            }));
+        }
+        let mut got = vec![];
+        for h in handles {
+            got.push(h.await.unwrap());
+        }
+        got.sort();
+        assert_eq!(got, vec![0, 10, 20, 30, 40, 50, 60, 70]);
+        assert!(q.inner.lock().unwrap().is_empty(), "排空后槽位应回收");
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_to_same_file_all_survive() {
+        // 端到端：20 个并发 edit 各改独立锚点，串行化后应全数落盘、无一丢失。
+        //（无队列时 read-modify-write 竞态几乎必丢更新；有队列则确定通过。）
+        let dir = std::env::temp_dir().join(format!("rupi-mq-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slots.txt");
+        let body: String = (0..20).map(|i| format!("slot-{i}:0")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let path_s = path.to_string_lossy().to_string();
+        let r = std::sync::Arc::new(ToolRegistry::with_builtins());
+        let mut handles = vec![];
+        for i in 0..20 {
+            let (rr, p) = (r.clone(), path_s.clone());
+            handles.push(tokio::spawn(async move {
+                rr.execute(
+                    "edit",
+                    serde_json::json!({
+                        "path": p,
+                        "old_string": format!("slot-{i}:0"),
+                        "new_string": format!("slot-{i}:1"),
+                    }),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        for h in handles {
+            let out = h.await.unwrap();
+            assert!(!out.is_error, "{}", out.content);
+        }
+        let final_body = std::fs::read_to_string(&path).unwrap();
+        for i in 0..20 {
+            assert!(final_body.contains(&format!("slot-{i}:1")), "slot-{i} 更新丢失");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
