@@ -2,7 +2,8 @@
 """最小 fake MCP server：stdio 上换行分隔 JSON-RPC 2.0。
 
 实现 initialize / notifications/initialized / tools/list / tools/call(echo, fail) /
-resources/list + resources/read（单个静态文本资源），
+resources/list + resources/read（单个静态文本资源）/
+prompts/list + prompts/get（单个带参模板），
 供 rupi-mcp 集成测试做真实子进程联调。
 """
 
@@ -161,6 +162,58 @@ def main():
                         "jsonrpc": "2.0",
                         "id": rid,
                         "error": {"code": -32602, "message": "unknown resource"},
+                    }
+                )
+        elif method == "prompts/list":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "result": {
+                        "prompts": [
+                            {
+                                "name": "greet",
+                                "description": "greet a person by name",
+                                "arguments": [
+                                    {
+                                        "name": "name",
+                                        "description": "who to greet",
+                                        "required": True,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            )
+        elif method == "prompts/get":
+            params = req.get("params", {})
+            if params.get("name") == "greet":
+                who = params.get("arguments", {}).get("name", "stranger")
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {
+                            "description": "a greeting",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": {
+                                        "type": "text",
+                                        "text": "Hello, " + str(who) + "!",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+            else:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {"code": -32602, "message": "unknown prompt"},
                     }
                 )
         else:

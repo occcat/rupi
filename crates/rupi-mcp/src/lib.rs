@@ -1,6 +1,7 @@
 //! rupi-mcp: MCP-Direct 桥（Pi 官方立场：core 无 MCP，能力走扩展）。
 //! 实现 `spawn server → initialize → tools/list → registerTool` 全链路，
-//! 外加 `resources/list → resources/read`（每 server 一个 `{server}_read_resource` 原生工具）：
+//! 外加 `resources/list → resources/read` 与 `prompts/list → prompts/get`
+//!（每 server 各一个 `{server}_read_resource` / `{server}_get_prompt` 原生工具）：
 //! stdio 上跑换行分隔的 JSON-RPC 2.0，30s 超时，`sanitize_params` 把 LLM 传回的
 //! string 宽容转回 boolean/number，`prompt_snippet` 必填否则 agent 看不见工具。
 
@@ -366,6 +367,14 @@ pub struct McpResource {
     pub mime_type: Option<String>,
 }
 
+/// MCP 提示模板描述（`prompts/list` 条目）：arguments 原样保留给模型看哪些可填。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPrompt {
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: serde_json::Value,
+}
+
 impl McpBridge {
     /// `resources/list`（支持 cursor 分页）→ 全部资源。
     pub async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
@@ -420,6 +429,74 @@ impl McpBridge {
                 arr.iter()
                     .filter_map(|b| {
                         b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| result.to_string());
+        Ok(text)
+    }
+
+    /// `prompts/list`（支持 cursor 分页）→ 全部提示模板。
+    pub async fn list_prompts(&self) -> anyhow::Result<Vec<McpPrompt>> {
+        let mut out = vec![];
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(c) = cursor {
+                params["cursor"] = serde_json::json!(c);
+            }
+            let result = self.call("prompts/list", params).await?;
+            if let Some(arr) = result.get("prompts").and_then(|p| p.as_array()) {
+                for p in arr {
+                    out.push(McpPrompt {
+                        name: p
+                            .get("name")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        description: p
+                            .get("description")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        arguments: p.get("arguments").cloned().unwrap_or(serde_json::json!([])),
+                    });
+                }
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `prompts/get`：按 name + arguments 渲染模板，把 messages 里的 text 拼起来；
+    /// 未知模板走协议 error。
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let result = self
+            .call(
+                "prompts/get",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+            .await?;
+        let text = result
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|msg| {
+                        msg.get("content")
+                            .and_then(|c| c.get("text"))
                             .and_then(|t| t.as_str())
                             .map(|s| s.to_string())
                     })
@@ -512,6 +589,82 @@ impl rupi_tools::Tool for McpResourceReader {
             Ok(text) => Ok(rupi_tools::ToolOutput::ok(text)),
             Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
                 "MCP resource read failed: {e:#}"
+            ))),
+        }
+    }
+}
+
+/// MCP 提示模板渲染器：每 server 注册一个 `{server}_get_prompt` 原生工具。
+/// description 内嵌可用模板名与参数（模型不用猜）；arguments 按对象直传远端。
+/// 桥断了也不崩主循环：转成 tool error 回给模型（与资源/工具侧同策略）。
+pub struct McpPromptGetter {
+    definition: ToolDefinition,
+    bridge: Arc<McpBridge>,
+}
+
+impl McpPromptGetter {
+    pub fn tool_name(server: &str) -> String {
+        format!("{server}_get_prompt")
+    }
+
+    pub fn new(server: &str, bridge: Arc<McpBridge>, prompts: &[McpPrompt]) -> Self {
+        let names = prompts
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let description = if names.is_empty() {
+            format!("Render an MCP prompt template from server '{server}' by name.")
+        } else {
+            format!(
+                "Render an MCP prompt template from server '{server}' by name. Available: {names}"
+            )
+        };
+        Self {
+            definition: ToolDefinition {
+                name: Self::tool_name(server),
+                description,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["name"],
+                }),
+                prompt_snippet: Some(format!(
+                    "get_prompt (MCP via {server}): render a server-provided prompt template"
+                )),
+            },
+            bridge,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rupi_tools::Tool for McpPromptGetter {
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        let name = arguments.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return Ok(rupi_tools::ToolOutput::err(
+                "missing required argument: name",
+            ));
+        }
+        let args = arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        match self.bridge.get_prompt(name, args).await {
+            Ok(text) => Ok(rupi_tools::ToolOutput::ok(text)),
+            Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                "MCP prompt render failed: {e:#}"
             ))),
         }
     }
@@ -639,6 +792,27 @@ impl McpManager {
                         "MCP resources/list failed for '{}': {e:#}",
                         entry.config.name
                     )
+                }
+            }
+            // 提示模板渲染入口：每 server 一个 `{server}_get_prompt`，description 自带可用模板。
+            // prompts/list 失败只跳过自己，无模板不注册空工具（与资源侧同等的失败隔离）。
+            match entry.bridge.list_prompts().await {
+                Ok(prompts) if !prompts.is_empty() => {
+                    let name = McpPromptGetter::tool_name(&entry.config.name);
+                    if registered.contains(&name) {
+                        tracing::warn!("MCP tool name conflict: {name}; first wins");
+                    } else {
+                        registry.register(Arc::new(McpPromptGetter::new(
+                            &entry.config.name,
+                            entry.bridge.clone(),
+                            &prompts,
+                        )));
+                        registered.push(name);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("MCP prompts/list failed for '{}': {e:#}", entry.config.name)
                 }
             }
         }

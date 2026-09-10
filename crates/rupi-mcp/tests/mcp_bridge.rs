@@ -99,6 +99,64 @@ async fn manager_registers_resource_reader_as_native() {
 }
 
 #[tokio::test]
+async fn bridge_lists_and_renders_prompts() {
+    let bridge = rupi_mcp::McpBridge::spawn(fake_config())
+        .await
+        .expect("spawn");
+    let prompts = bridge.list_prompts().await.expect("list");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name, "greet");
+    assert!(prompts[0].arguments.is_array());
+
+    let text = bridge
+        .get_prompt("greet", serde_json::json!({"name": "Ada"}))
+        .await
+        .expect("get");
+    assert_eq!(text, "Hello, Ada!");
+
+    // 未知模板走协议 error（Err），不伪装成空文本
+    assert!(bridge
+        .get_prompt("nope", serde_json::json!({}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn manager_registers_prompt_getter_as_native() {
+    let configs = vec![fake_config()];
+    let manager = McpManager::spawn_all(&configs).await.expect("spawn all");
+    let mut registry = ToolRegistry::with_builtins();
+    let names = manager.register_all(&mut registry).await;
+    assert!(names.contains(&"fake_get_prompt".to_string()));
+
+    // description 自带可用模板名，原生执行真渲染远端
+    let defs = registry.definitions();
+    let getter_def = defs.iter().find(|d| d.name == "fake_get_prompt").unwrap();
+    assert!(getter_def.prompt_snippet.is_some());
+    assert!(
+        getter_def.description.contains("greet"),
+        "description 未内嵌可用模板: {}",
+        getter_def.description
+    );
+
+    let tool: Arc<dyn Tool> = Arc::new(rupi_mcp::McpPromptGetter::new(
+        "fake",
+        manager.entries[0].bridge.clone(),
+        &[],
+    ));
+    let out = tool
+        .execute(serde_json::json!({"name": "greet", "arguments": {"name": "Ada"}}))
+        .await
+        .expect("exec");
+    assert!(!out.is_error);
+    assert_eq!(out.content, "Hello, Ada!");
+
+    // 缺 name 参数转 tool error，不抛
+    let out = tool.execute(serde_json::json!({})).await.expect("exec");
+    assert!(out.is_error);
+}
+
+#[tokio::test]
 async fn manager_registers_remote_tools_as_native() {
     let configs = vec![fake_config()];
     let manager = McpManager::spawn_all(&configs).await.expect("spawn all");
