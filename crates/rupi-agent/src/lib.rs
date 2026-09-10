@@ -10,6 +10,9 @@ use rupi_skills::SkillRegistry;
 use rupi_tools::{Tool, ToolRegistry};
 use std::sync::Arc;
 
+pub mod review;
+pub use review::{HeuristicReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
+
 pub struct PromptBuilder {
     pub base: String,
 }
@@ -51,6 +54,9 @@ impl PromptBuilder {
 pub struct AgentLoop {
     pub max_turns: u32,
     pub builder: PromptBuilder,
+    /// 后台 review：主循环结束后安静复盘，提炼记忆/Skill 建议。默认关闭。
+    pub reviewer: Option<Arc<dyn Reviewer>>,
+    pub on_suggestion: Option<Arc<dyn Fn(ReviewSuggestion) + Send + Sync>>,
 }
 
 impl AgentLoop {
@@ -60,7 +66,19 @@ impl AgentLoop {
             builder: PromptBuilder::new(
                 "You are rupi, a minimal coding agent (Rust port of Pi). Use tools to act. Be concise.",
             ),
+            reviewer: None,
+            on_suggestion: None,
         }
+    }
+
+    pub fn with_reviewer(
+        mut self,
+        reviewer: Arc<dyn Reviewer>,
+        on_suggestion: Arc<dyn Fn(ReviewSuggestion) + Send + Sync>,
+    ) -> Self {
+        self.reviewer = Some(reviewer);
+        self.on_suggestion = Some(on_suggestion);
+        self
     }
 
     /// 运行一轮用户请求直到 `done` / 无工具调用 / max_turns。每步推 `AgentEvent`。
@@ -87,6 +105,7 @@ impl AgentLoop {
             system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
         }
 
+        let mut tool_names: Vec<String> = vec![];
         for turn in 1..=self.max_turns {
             on_event(AgentEvent::TurnStart { turn });
             let history: Vec<Message> = session.history().into_iter().cloned().collect();
@@ -118,6 +137,8 @@ impl AgentLoop {
             if !has_calls {
                 // 后台记忆 sync（fire-and-forget 语义：失败只 warning）
                 mem.sync_all(user_input, &resp.message.full_text()).await;
+                self.run_review(user_input, &resp.message.full_text(), &tool_names)
+                    .await;
                 on_event(AgentEvent::TurnEnd {
                     turn,
                     stop_reason: StopReason::Done,
@@ -148,6 +169,7 @@ impl AgentLoop {
                 .collect();
             let mut results = vec![];
             for (id, name, args) in calls {
+                tool_names.push(name.clone());
                 on_event(AgentEvent::ToolStart {
                     tool_call_id: id.clone(),
                     name: name.clone(),
@@ -189,6 +211,22 @@ impl AgentLoop {
             });
         }
         Ok(StopReason::MaxTurns)
+    }
+
+    /// 后台 review：主流程结束后安静复盘，非空建议推给 `on_suggestion`。永不抛错。
+    async fn run_review(&self, user: &str, assistant: &str, tool_names: &[String]) {
+        let (Some(reviewer), Some(cb)) = (&self.reviewer, &self.on_suggestion) else {
+            return;
+        };
+        let t = TurnTranscript {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+            tool_names: tool_names.to_vec(),
+        };
+        let s = review::review_with_timeout(reviewer, &t, std::time::Duration::from_secs(5)).await;
+        if !s.is_empty() {
+            cb(s);
+        }
     }
 }
 

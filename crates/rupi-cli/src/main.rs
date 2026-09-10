@@ -1,13 +1,39 @@
 //! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
 
 use clap::{Parser, Subcommand};
-use rupi_agent::AgentLoop;
+use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion};
 use rupi_core::SessionTree;
 use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
 use rupi_memory::{MemoryManager, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// 把 review 建议落盘：memory add 写 `MEMORY.md`，skill 草稿写 `~/.rupi/skills/<name>/`。
+/// 已存在的 skill 跳过（不覆盖人工成果），失败只打印不中断聊天。
+fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSuggestion>>>) {
+    let suggestions: Vec<ReviewSuggestion> = pending.lock().unwrap().drain(..).collect();
+    if suggestions.is_empty() {
+        return;
+    }
+    let store = MemoryStore::new(home.clone());
+    let acc = SkillAccumulator::new(home.join("skills"));
+    for s in suggestions {
+        for m in &s.memory_ops {
+            match store.apply_write("add", &m.entry) {
+                Ok(_) => println!("[review] memory saved"),
+                Err(e) => eprintln!("[review] memory save failed: {e:#}"),
+            }
+        }
+        if let Some(d) = &s.skill_draft {
+            match acc.propose(&d.name, &d.description, &d.steps) {
+                Ok(dir) => println!("[review] skill drafted at {}", dir.display()),
+                Err(e) => eprintln!("[review] skill draft skipped: {e:#}"),
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +52,12 @@ struct Cli {
     /// MCP server 配置 JSON 文件（数组）：[{"name":..,"command":..,"args":[..],"env":{..}}]
     #[arg(long)]
     mcp_config: Option<PathBuf>,
+    /// 每轮结束后后台 review，给出记忆/Skill 沉淀建议
+    #[arg(long, default_value_t = false)]
+    review: bool,
+    /// 把 review 建议直接落盘（memory add + skill 草稿）
+    #[arg(long, default_value_t = false)]
+    review_apply: bool,
 }
 
 #[derive(Subcommand)]
@@ -152,7 +184,32 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let provider = build_provider(&cli.model).await?;
-    let agent = AgentLoop::new(cli.max_turns);
+    let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
+        Arc::new(std::sync::Mutex::new(vec![]));
+    let mut agent = AgentLoop::new(cli.max_turns);
+    if cli.review || cli.review_apply {
+        let pending_clone = pending.clone();
+        agent = agent.with_reviewer(
+            Arc::new(HeuristicReviewer::default()),
+            Arc::new(move |s: ReviewSuggestion| {
+                println!(
+                    "\n[review] memory_ops={} skill={}",
+                    s.memory_ops.len(),
+                    s.skill_draft
+                        .as_ref()
+                        .map(|d| d.name.as_str())
+                        .unwrap_or("-")
+                );
+                for m in &s.memory_ops {
+                    println!("[review] memory add: {}", m.entry);
+                }
+                if let Some(d) = &s.skill_draft {
+                    println!("[review] skill draft: {} — {}", d.name, d.description);
+                }
+                pending_clone.lock().unwrap().push(s);
+            }),
+        );
+    }
     let mut tools = ToolRegistry::with_builtins();
     // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
     let _mcp = if let Some(path) = &cli.mcp_config {
@@ -228,6 +285,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 },
             )
             .await?;
+        if cli.review_apply {
+            apply_suggestions(home, &pending);
+        }
         println!();
     }
     Ok(())

@@ -67,3 +67,5 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
   `references/`/`assets/`；agent 内以 `load_skill` 工具激活。
 - 自积累：`skill-distill --name x --description d --steps s1 s2` 生成新 `SKILL.md` 草稿到
   `~/.rupi/skills/<name>/`，落盘前需校验（已实现 name 校验 + 重名拒绝）。
+- 后台 review：`chat --review` 每轮后安静复盘并打印记忆/Skill 建议，
+  `--review-apply` 直接落盘（`MEMORY.md` add + skill 草稿；已存在 skill 跳过不覆盖）。
