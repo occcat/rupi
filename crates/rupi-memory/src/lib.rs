@@ -752,15 +752,25 @@ impl SessionStore {
     }
 
     pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
+        self.add_message_with_id(
+            &uuid::Uuid::new_v4().to_string(),
+            session_id,
+            role,
+            content,
+        )
+    }
+
+    /// 指定行 id 写入（回合落盘时沿用树节点 id，resume 后短 id 稳定可 /goto）。
+    pub fn add_message_with_id(
+        &self,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO messages(id, session_id, role, content, created_at) VALUES(?,?,?,?,?)",
-            rusqlite::params![
-                uuid::Uuid::new_v4().to_string(),
-                session_id,
-                role,
-                content,
-                chrono::Utc::now().to_rfc3339()
-            ],
+            rusqlite::params![id, session_id, role, content, chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -828,23 +838,25 @@ impl SessionStore {
         Ok(rows)
     }
 
-    /// 会话明细：按时间正序（rowid 打平同秒并列）。
+    /// 会话明细：按时间正序（rowid 打平同秒并列）。返回 (行id, role, content, created)，
+    /// 行 id 即树节点 id（落盘时沿用），resume 后 `/goto 短id` 可用。
     pub fn session_messages(
         &self,
         session_id: &str,
         limit: usize,
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
+            "SELECT id, role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![session_id, limit as i64], |r| {
-                let role: String = r.get(0)?;
-                let content: String = r.get(1)?;
-                let created: String = r.get(2)?;
-                Ok((role, content, created))
+                let id: String = r.get(0)?;
+                let role: String = r.get(1)?;
+                let content: String = r.get(2)?;
+                let created: String = r.get(3)?;
+                Ok((id, role, content, created))
             })?
-            .collect::<Result<Vec<(String, String, String)>, _>>()?;
+            .collect::<Result<Vec<(String, String, String, String)>, _>>()?;
         Ok(rows)
     }
 }
@@ -1115,7 +1127,9 @@ mod tests {
         assert_eq!(list[0].3, 2);
         let msgs = store.session_messages(&sid, 10).unwrap();
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].0, "user");
+        assert_eq!(msgs[0].1, "user");
+        // 行 id 非空（resume 时沿用为树节点 id）
+        assert!(!msgs[0].0.is_empty());
         // 摘要写回与读回
         store.set_summary(&sid, "talked tea").unwrap();
         assert_eq!(store.get_summary(&sid).unwrap(), "talked tea");

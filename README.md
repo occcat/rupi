@@ -15,7 +15,7 @@
 | Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill` 工具） |
 | Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + provider/manager + `SessionStore` 触发器同步 FTS + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
 | Skill 自积累（后台 review 沉淀） | `SkillAccumulator::propose` + `rupi skill-distill` |
-| 会话持久化 | 每轮落盘 `sessions.db`，`sessions` / `session-show` / `session-search`，`--resume <id>` 断点续聊（REPL + TUI 通用） |
+| 会话持久化 | 每轮落盘 `sessions.db`，`sessions` / `session-show` / `session-search`，`--resume <id>` 断点续聊（REPL + TUI 通用）；`/tree` 全分支视图 + `/goto <短id>` 跨分支时间旅行（节点 id 即库行 id，跨进程稳定） |
 | Extension 热重载（自写工具-重载-自测） | `rupi-ext`（manifest + 外部进程契约 stdin JSON→stdout，`ExtensionSet::refresh` mtime 增量重载，`--ext-dir`/`ext-list`，REPL `/reload` + 每轮自动检查） |
 | 权限门与计划模式 | `rupi-agent::policy`（`AllowAll`/`RulePolicy`/`ChainPolicy` + `Approver`，拒绝转 tool error；`--plan` + REPL `/plan` 只读侦察；bash 高危子串转人工审批 `[y(es)/a(ll session)/N]`，选 a 的（工具+原因）本会话免打扰；TUI 内同语义全屏暂停问询） |
 | 子任务分发 | `rupi-agent::subagent`（`run_subagents` 分叉会话并发扇出 + `subagent` 委托工具，深度 guard 断递归；`--subagents` 开启） |

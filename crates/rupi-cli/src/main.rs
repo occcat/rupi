@@ -284,8 +284,8 @@ async fn main() -> anyhow::Result<()> {
             if !summary.is_empty() {
                 println!("== summary ==\n{summary}");
             }
-            for (role, content, created) in store.session_messages(&id, 200)? {
-                println!("== {role} @ {created} ==\n{content}");
+            for (id, role, content, created) in store.session_messages(&id, 200)? {
+                println!("== {role} @ {created} [{}] ==\n{content}", &id[..8.min(id.len())]);
             }
         }
         Some(Cmd::McpList { command, args }) => {
@@ -365,15 +365,13 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
             anyhow::bail!("unknown or empty session: {id} (see `rupi sessions`)");
         }
         let mut s = SessionTree::new();
-        for (role, content, _) in msgs {
-            match role.as_str() {
-                "assistant" => {
-                    s.push(Message::text(rupi_core::Role::Assistant, content));
-                }
-                _ => {
-                    s.push(Message::text(rupi_core::Role::User, content));
-                }
+        for (id, role, content, _) in msgs {
+            let msg = match role.as_str() {
+                "assistant" => Message::text(rupi_core::Role::Assistant, content),
+                _ => Message::text(rupi_core::Role::User, content),
             };
+            // 沿用库行 id：跨进程短 id 稳定，/tree 所见即 /goto 可达
+            s.push_with_id(id, msg);
         }
         eprintln!("[resume {}] restored {} msgs", id, s.history().len());
         // 压缩摘要预热：prompt 窗口直接带上旧摘要 + 近期，避免超长恢复历史全文送模型。
@@ -394,18 +392,33 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
 }
 
 /// 回合落盘：user 原文 + 本轮最后一条助手答复。失败只 warning，不断聊天。
-fn persist_turn(store: &SessionStore, sid: &str, user: &str, session: &SessionTree) {
-    if let Err(e) = store.add_message(sid, "user", user) {
+/// 行 id 沿用树节点 id（`before_len` 为本轮前路径长度，用户节点即 `current_path[before_len]`），
+/// resume 回填后短 id 跨进程稳定，`/goto` 可用；找不到则回退随机 id。
+fn persist_turn(
+    store: &SessionStore,
+    sid: &str,
+    user: &str,
+    session: &SessionTree,
+    before_len: usize,
+) {
+    let user_id = session
+        .current_path
+        .get(before_len)
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if let Err(e) = store.add_message_with_id(&user_id, sid, "user", user) {
         tracing::warn!("persist user msg failed: {e:#}");
     }
-    let assistant = session
-        .history()
+    let (asst_id, assistant) = session
+        .current_path
         .iter()
-        .rev()
-        .find(|m| m.role == rupi_core::Role::Assistant)
-        .map(|m| m.full_text())
-        .unwrap_or_default();
-    if let Err(e) = store.add_message(sid, "assistant", &assistant) {
+        .skip(before_len)
+        .filter_map(|id| session.nodes.get(id))
+        .filter(|n| n.message.role == rupi_core::Role::Assistant)
+        .last()
+        .map(|n| (n.id.clone(), n.message.full_text()))
+        .unwrap_or_else(|| (uuid::Uuid::new_v4().to_string(), String::new()));
+    if let Err(e) = store.add_message_with_id(&asst_id, sid, "assistant", &assistant) {
         tracing::warn!("persist assistant msg failed: {e:#}");
     }
 }
@@ -486,7 +499,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/tree 看树，/goto <短id> 跳转，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -526,10 +539,25 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             continue;
         }
+        if input == "/tree" {
+            print!("{}", session.tree_view());
+            continue;
+        }
+        if let Some(prefix) = input.strip_prefix("/goto ") {
+            let prefix = prefix.trim();
+            match session.resolve_short_id(prefix) {
+                Some(id) if session.goto_node(&id) => {
+                    println!("[goto {}]", &id[..8.min(id.len())]);
+                }
+                _ => println!("[goto] unknown or ambiguous node prefix: {prefix}"),
+            }
+            continue;
+        }
         // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）；
         // skill 注册表同轮刷新：上一轮蒸馏的新 skill 本轮即对模型可见（自积累闭环）
         refresh_extensions(&mut tools, &mut ext_set);
         skills.refresh(&skill_dirs(home));
+        let before_len = session.current_path.len();
         agent
             .run(
                 &*provider,
@@ -558,7 +586,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 },
             )
             .await?;
-        persist_turn(&sess_db, &sid, &input, &session);
+        persist_turn(&sess_db, &sid, &input, &session, before_len);
         // 压缩摘要落盘（变化才写）
         if let Some(sum) = &session.summary {
             if *sum != saved_summary {
@@ -688,12 +716,17 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         review_lines,
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
-            if let Err(e) = db.add_message(&sid, "user", &t.user) {
-                tracing::warn!("persist user msg failed: {e:#}");
-            }
-            if let Err(e) = db.add_message(&sid, "assistant", &t.assistant) {
-                tracing::warn!("persist assistant msg failed: {e:#}");
-            }
+            let persist = |node: &Option<String>, role: &str, content: &str| {
+                let res = match node {
+                    Some(id) => db.add_message_with_id(id, &sid, role, content),
+                    None => db.add_message(&sid, role, content),
+                };
+                if let Err(e) = res {
+                    tracing::warn!("persist {role} msg failed: {e:#}");
+                }
+            };
+            persist(&t.user_node, "user", &t.user);
+            persist(&t.assistant_node, "assistant", &t.assistant);
             if let Some(sum) = &t.summary {
                 if *sum != *saved.lock().unwrap() {
                     if let Err(e) = db.set_summary(&sid, sum) {

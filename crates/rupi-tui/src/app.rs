@@ -51,6 +51,9 @@ pub struct TurnRecord {
     pub assistant: String,
     /// 本轮结束时的会话压缩摘要（无压缩则为 None）。
     pub summary: Option<String>,
+    /// 树节点 id（落盘沿用，resume 后短 id 稳定）；缺失时调用方回退随机 id。
+    pub user_node: Option<String>,
+    pub assistant_node: Option<String>,
 }
 
 struct Guard;
@@ -128,7 +131,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，/quit 退出，/skills 看技能，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，/quit 退出，/tree 看树，/goto <短id> 跳转，/skills 看技能，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -156,6 +159,22 @@ async fn run_loop(
                 }
                 if text.trim() == "/skills" {
                     view.push_system(ctx.skills.index_block());
+                    continue;
+                }
+                if text.trim() == "/tree" {
+                    view.push_system(ctx.session.tree_view());
+                    continue;
+                }
+                if let Some(prefix) = text.trim().strip_prefix("/goto ") {
+                    let prefix = prefix.trim();
+                    match ctx.session.resolve_short_id(prefix) {
+                        Some(id) if ctx.session.goto_node(&id) => {
+                            view.push_system(format!("[goto {}]", &id[..8.min(id.len())]));
+                        }
+                        _ => view.push_system(format!(
+                            "[goto] unknown or ambiguous node prefix: {prefix}"
+                        )),
+                    }
                     continue;
                 }
                 view.push_user(text.clone());
@@ -210,6 +229,8 @@ async fn drive_turn(
     let on_event = |e: AgentEvent| {
         let _ = tx.send(e);
     };
+    // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
+    let before = session.current_path.len();
     let fut = agent.run(
         provider,
         session,
@@ -272,18 +293,23 @@ async fn drive_turn(
         End::Finished(res) => {
             match res {
                 Ok(_) => {
-                    let assistant = session
-                        .history()
+                    let (assistant, assistant_node) = session
+                        .current_path
                         .iter()
-                        .rev()
-                        .find(|m| m.role == rupi_core::Role::Assistant)
-                        .map(|m| m.full_text())
+                        .skip(before)
+                        .filter_map(|id| session.nodes.get(id))
+                        .filter(|n| n.message.role == rupi_core::Role::Assistant)
+                        .last()
+                        .map(|n| (n.message.full_text(), Some(n.id.clone())))
                         .unwrap_or_default();
+                    let user_node = session.current_path.get(before).cloned();
                     if let Some(cb) = on_turn {
                         cb(TurnRecord {
                             user: text.clone(),
                             assistant,
                             summary: session.summary.clone(),
+                            user_node,
+                            assistant_node,
                         });
                     }
                 }

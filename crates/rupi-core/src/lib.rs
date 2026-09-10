@@ -105,8 +105,12 @@ impl SessionTree {
 
     /// 追加一条消息，返回新节点 id。
     pub fn push(&mut self, message: Message) -> String {
+        self.push_with_id(Uuid::new_v4().to_string(), message)
+    }
+
+    /// 以指定 id 追加（resume 时沿用 sessions.db 行 id，跨进程短 id 稳定）。
+    pub fn push_with_id(&mut self, id: String, message: Message) -> String {
         let parent = self.current_path.last().cloned();
-        let id = Uuid::new_v4().to_string();
         let node = SessionNode {
             id: id.clone(),
             parent,
@@ -171,6 +175,104 @@ impl SessionTree {
         } else {
             false
         }
+    }
+
+    /// 跳转到任意节点（含废弃分支）：当前路径内则截断，否则沿 parent 链重建路径。
+    /// Pi `/tree` 时间旅行的底层语义；跳转不删节点，原分支仍在树上。
+    pub fn goto_node(&mut self, node_id: &str) -> bool {
+        if !self.nodes.contains_key(node_id) {
+            return false;
+        }
+        if self.rewind_to(node_id) {
+            return true;
+        }
+        let mut path = vec![];
+        let mut cur = Some(node_id.to_string());
+        while let Some(id) = cur {
+            let Some(n) = self.nodes.get(&id) else {
+                return false;
+            };
+            path.push(id.clone());
+            cur = n.parent.clone();
+        }
+        path.reverse();
+        self.current_path = path;
+        true
+    }
+
+    /// 短 id 前缀解析（≥4 字符，前缀唯一才成功，供 `/goto` 用）。
+    pub fn resolve_short_id(&self, prefix: &str) -> Option<String> {
+        if prefix.len() < 4 {
+            return None;
+        }
+        let mut hit = None;
+        for id in self.nodes.keys() {
+            if id.starts_with(prefix) {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some(id.clone());
+            }
+        }
+        hit
+    }
+
+    /// 树视图（Pi `/tree` 对齐）：从 roots DFS，全分支可见；
+    /// `*` 为当前游标路径，`+` 为废弃分支节点。每行：标记 短id role: 预览。
+    pub fn tree_view(&self) -> String {
+        use std::collections::HashMap;
+        let on_path: std::collections::HashSet<&str> =
+            self.current_path.iter().map(|s| s.as_str()).collect();
+        let mut children: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        let mut roots: Vec<String> = vec![];
+        // 确定性输出：按创建时间排序
+        let mut ids: Vec<&String> = self.nodes.keys().collect();
+        ids.sort_by_key(|id| self.nodes[*id].created_at);
+        for id in ids {
+            let parent = self.nodes[id].parent.clone();
+            if parent.as_ref().is_some_and(|p| self.nodes.contains_key(p)) {
+                children.entry(parent).or_default().push(id.clone());
+            } else {
+                roots.push(id.clone());
+            }
+        }
+        let mut out = String::new();
+        fn dfs(
+            tree: &SessionTree,
+            children: &HashMap<Option<String>, Vec<String>>,
+            on_path: &std::collections::HashSet<&str>,
+            id: &str,
+            depth: usize,
+            out: &mut String,
+        ) {
+            if let Some(n) = tree.nodes.get(id) {
+                let mark = if on_path.contains(id) { '*' } else { '+' };
+                let preview: String = n
+                    .message
+                    .full_text()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(60)
+                    .collect();
+                out.push_str(&format!(
+                    "{mark} {} {:?}: {preview}\n",
+                    &id[..8.min(id.len())],
+                    n.message.role,
+                ));
+                if let Some(kids) = children.get(&Some(id.to_string())) {
+                    for k in kids {
+                        out.push_str(&"  ".repeat(depth + 1));
+                        dfs(tree, children, on_path, k, depth + 1, out);
+                    }
+                }
+            }
+        }
+        for r in &roots {
+            dfs(self, &children, &on_path, r, 0, &mut out);
+        }
+        out
     }
 }
 
@@ -261,6 +363,38 @@ mod tests {
         assert_eq!(s.history().len(), 1);
         let forked = s.branch_from(&a).expect("branch");
         assert_eq!(forked.history().len(), 1);
+    }
+
+    #[test]
+    fn tree_view_and_goto_across_abandoned_branch() {
+        let mut s = SessionTree::new();
+        s.push(Message::text(Role::User, "root question"));
+        let fork_point = s.push(Message::text(Role::Assistant, "answer A"));
+        s.push(Message::text(Role::User, "follow A"));
+        // 回退并走新分支：旧 follow A 成为废弃分支
+        assert!(s.rewind_to(&fork_point));
+        let b = s.push(Message::text(Role::User, "follow B"));
+        // 树视图同时看见两分支
+        let view = s.tree_view();
+        assert!(view.contains("follow A"));
+        assert!(view.contains("follow B"));
+        assert!(view.contains('*'));
+        assert!(view.contains('+'));
+        // 跨分支跳转：沿 parent 链重建路径
+        let abandoned: String = s
+            .nodes
+            .iter()
+            .find(|(_, n)| n.message.full_text().contains("follow A"))
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        assert!(s.goto_node(&abandoned));
+        assert!(s.history().iter().any(|m| m.full_text().contains("follow A")));
+        assert!(!s.history().iter().any(|m| m.full_text().contains("follow B")));
+        // 短 id 解析往返
+        let short = &b[..8];
+        assert_eq!(s.resolve_short_id(short), Some(b.clone()));
+        assert!(s.resolve_short_id("ab") .is_none());
+        assert!(s.goto_node("no-such-node") == false);
     }
 
     #[test]
