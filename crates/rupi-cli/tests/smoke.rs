@@ -409,6 +409,28 @@ fn ext_list_discovers_valid_and_skips_invalid() {
 }
 
 #[test]
+fn repl_toggles_all_respond() {
+    // REPL 开关全路径：每个内建切换都给反馈且不炸（拼写/崩溃回归网）
+    let home = fresh_home();
+    let o = chat_with(
+        &home,
+        &[],
+        "/plan\n/thinking\n/model\n/skills\n/commands\n/reload\n/tree\n/rewind\n/quit\n".as_bytes(),
+    );
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "开关遍历非零退出: {o:?}");
+    for want in [
+        "[plan mode on]",
+        "[thinking",
+        "[model ",
+        "[ext] no changes",
+        "[rewind] nothing to undo",
+    ] {
+        assert!(out.contains(want), "缺 `{want}`:\n{out}");
+    }
+}
+
+#[test]
 fn trust_gate_skip_remember_and_silence() {
     // 项目信任门三态：n 跳过进聊天、y 记住、下次同目录免扰（cwd 即 home，项目资源自带）。
     let home = fresh_home();

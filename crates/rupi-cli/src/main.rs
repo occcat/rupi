@@ -344,9 +344,10 @@ fn load_extensions(tools: &mut ToolRegistry, dir: &PathBuf) -> rupi_ext::Extensi
     set
 }
 
-/// 增量热重载：新增/修改重注册，删除注销。
-fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet) {
+/// 增量热重载：新增/修改重注册，删除注销。返回是否有变化（显式 /reload 无变化时给反馈）。
+fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet) -> bool {
     let (changed, removed) = set.refresh();
+    let dirty = !changed.is_empty() || !removed.is_empty();
     for name in removed {
         tools.unregister(&name);
         eprintln!("[ext] removed {name}");
@@ -356,6 +357,7 @@ fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet
         rupi_ext::register_all(tools, changed);
         eprintln!("[ext] reloaded: {}", names.join(", "));
     }
+    dirty
 }
 
 async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
@@ -1004,7 +1006,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             continue;
         }
         if input == "/reload" {
-            refresh_extensions(&mut tools, &mut ext_set);
+            if !refresh_extensions(&mut tools, &mut ext_set) {
+                println!("[ext] no changes");
+            }
             continue;
         }
         if input == "/plan" {
