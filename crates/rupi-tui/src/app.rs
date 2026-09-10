@@ -6,7 +6,7 @@ use crate::complete;
 use crate::view::{ChatView, InputBuffer, Line};
 use anyhow::Context;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -134,6 +134,29 @@ pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
     run_loop(&mut terminal, ctx).await
 }
 
+/// 回合内按键收集：运行中继续打字则排队为 follow-up（对标上游 `followUpMode`
+/// 默认全量注入），本轮结束后自动作为下一轮输入发出；`Esc` 中止 + 排队并存
+/// （先停本轮再跑排队≈转向）。返回 true 表示该键已消费。
+/// 纯逻辑（无终端依赖），可单测。调用方在 false 时走原有分支（Ctrl-C/Esc/滚动）。
+fn collect_followup(buf: &mut String, key: &KeyEvent) -> bool {
+    match key.code {
+        // 修饰键组合（Ctrl-C 等）留给调用方，不吞
+        KeyCode::Char(c) if key.modifiers.is_empty() => {
+            buf.push(c);
+            true
+        }
+        KeyCode::Enter => {
+            buf.push('\n');
+            true
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 内建斜杠派发结果：Quit 退出主循环；Done 顯示一行系统消息并等下一输入；
 /// Compact 手动压实（async，调用方执行后推行反馈）；Pass 非内建，调用方走自定义展开/发送。
 /// 纯逻辑（无终端依赖），可单测。
@@ -256,7 +279,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -268,7 +291,7 @@ async fn run_loop(
             .map(|(n, _)| n)
             .collect();
         let completion = complete::candidates(&input.text(), &custom_names);
-        draw(terminal, &view, &input, scroll, false, &completion)?;
+        draw(terminal, &view, &input, scroll, false, 0, &completion)?;
         let Some(Ok(Event::Key(key))) = reader.next().await else {
             continue;
         };
@@ -289,92 +312,107 @@ async fn run_loop(
                 input.push_char(c);
             }
             KeyCode::Enter if !input.is_empty() => {
-                let text = input.take();
-                // MCP 工具热刷新：server 发 notifications/tools/list_changed 即重列差量更新
-                if let (Some(m), Some(rx)) = (ctx.mcp, ctx.mcp_rx.as_mut()) {
-                    while let Ok(srv) = rx.try_recv() {
-                        match m.refresh_server(&mut *ctx.tools, &srv).await {
-                            Ok(added) if !added.is_empty() => view.push_system(format!(
-                                "[mcp] {srv} tools added: {}",
-                                added.join(", ")
-                            )),
-                            Ok(_) => view.push_system(format!("[mcp] {srv} tools updated")),
-                            Err(e) => view.push_system(format!("[mcp] refresh {srv} failed: {e:#}")),
+                // follow-up 自动跟进：drive_turn 带回运行中排队的输入，非空则直接作为
+                // 下一轮发出（dispatch/展开/落盘全走同一路径；Quit 在内层直接返回）。
+                // 内层 Done/Compact 的 continue 因 next 已空而等价于回到外循环读键。
+                let mut next: Option<String> = Some(input.take());
+                while let Some(text) = next.take() {
+                    // MCP 工具热刷新：server 发 notifications/tools/list_changed 即重列差量更新
+                    if let (Some(m), Some(rx)) = (ctx.mcp, ctx.mcp_rx.as_mut()) {
+                        while let Ok(srv) = rx.try_recv() {
+                            match m.refresh_server(&mut *ctx.tools, &srv).await {
+                                Ok(added) if !added.is_empty() => view.push_system(format!(
+                                    "[mcp] {srv} tools added: {}",
+                                    added.join(", ")
+                                )),
+                                Ok(_) => view.push_system(format!("[mcp] {srv} tools updated")),
+                                Err(e) => {
+                                    view.push_system(format!("[mcp] refresh {srv} failed: {e:#}"))
+                                }
+                            }
                         }
                     }
-                }
-                match dispatch_builtin(
-                    &text,
-                    ctx.agent,
-                    ctx.session,
-                    ctx.provider,
-                    ctx.skills,
-                    &ctx.command_dirs,
-                    &ctx.session_id,
-                ) {
-                    Builtin::Quit => break,
-                    Builtin::Done(msg) => {
-                        view.push_system(msg);
-                        continue;
-                    }
-                    Builtin::Compact => {
-                        let before = ctx.session.summary.clone();
-                        let buffered =
-                            std::sync::Mutex::new(Vec::<rupi_core::AgentEvent>::new());
-                        ctx.agent
-                            .force_compress_with_event(
-                                &**ctx.provider,
-                                ctx.session,
-                                ctx.mem,
-                                &|e| {
-                                    buffered.lock().unwrap().push(e);
-                                },
-                            )
-                            .await;
-                        for e in buffered.lock().unwrap().drain(..) {
-                            view.push_event(&e);
+                    match dispatch_builtin(
+                        &text,
+                        ctx.agent,
+                        ctx.session,
+                        ctx.provider,
+                        ctx.skills,
+                        &ctx.command_dirs,
+                        &ctx.session_id,
+                    ) {
+                        Builtin::Quit => return Ok(()),
+                        Builtin::Done(msg) => {
+                            view.push_system(msg);
+                            continue;
                         }
-                        if ctx.session.summary != before && ctx.session.summary.is_some() {
-                            view.push_system("[compacted]".into());
-                        } else {
-                            view.push_system("[compact] nothing to compress".into());
+                        Builtin::Compact => {
+                            let before = ctx.session.summary.clone();
+                            let buffered =
+                                std::sync::Mutex::new(Vec::<rupi_core::AgentEvent>::new());
+                            ctx.agent
+                                .force_compress_with_event(
+                                    &**ctx.provider,
+                                    ctx.session,
+                                    ctx.mem,
+                                    &|e| {
+                                        buffered.lock().unwrap().push(e);
+                                    },
+                                )
+                                .await;
+                            for e in buffered.lock().unwrap().drain(..) {
+                                view.push_event(&e);
+                            }
+                            if ctx.session.summary != before && ctx.session.summary.is_some() {
+                                view.push_system("[compacted]".into());
+                            } else {
+                                view.push_system("[compact] nothing to compress".into());
+                            }
+                            continue;
                         }
-                        continue;
+                        Builtin::Pass => {}
                     }
-                    Builtin::Pass => {}
-                }
-                // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
-                let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
-                let mut send_text = text.clone();
-                if let Some((name, args)) = slash.as_ref() {
-                    if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args) {
-                        view.push_system(format!("[command /{name}]"));
-                        send_text = expanded;
+                    // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
+                    let slash =
+                        commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
+                    let mut send_text = text.clone();
+                    if let Some((name, args)) = slash.as_ref() {
+                        if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args) {
+                            view.push_system(format!("[command /{name}]"));
+                            send_text = expanded;
+                        }
                     }
-                }
-                view.push_user(send_text.clone());
-                scroll = 0;
-                // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
-                ctx.skills.refresh(&ctx.skill_dirs);
-                match drive_turn(
-                    terminal,
-                    ctx.agent,
-                    &**ctx.provider,
-                    ctx.session,
-                    &*ctx.tools,
-                    ctx.mem,
-                    ctx.frozen,
-                    ctx.skills,
-                    &ctx.review_lines,
-                    &ctx.on_turn,
-                    &mut reader,
-                    &mut view,
-                    send_text,
-                )
-                .await?
-                {
-                    Control::Continue => {}
-                    Control::Quit => break,
+                    view.push_user(send_text.clone());
+                    scroll = 0;
+                    // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
+                    ctx.skills.refresh(&ctx.skill_dirs);
+                    match drive_turn(
+                        terminal,
+                        ctx.agent,
+                        &**ctx.provider,
+                        ctx.session,
+                        &*ctx.tools,
+                        ctx.mem,
+                        ctx.frozen,
+                        ctx.skills,
+                        &ctx.review_lines,
+                        &ctx.on_turn,
+                        &mut reader,
+                        &mut view,
+                        send_text,
+                    )
+                    .await?
+                    {
+                        (Control::Continue, followup) => {
+                            let q = followup.trim().to_string();
+                            if q.is_empty() {
+                                break;
+                            }
+                            view.push_system("[follow-up] queued input auto-sending".into());
+                            next = Some(q);
+                        }
+                        (Control::Quit, _) => return Ok(()),
+                    }
                 }
             }
             _ => {}
@@ -384,6 +422,8 @@ async fn run_loop(
 }
 
 /// 回合内循环：agent future 与键盘事件同场 `select!`，delta 到达即画。
+/// 运行中继续打字排队为 follow-up（`collect_followup`），返回 `(Control, followup)`：
+/// 调用方在 `Continue` 且排队非空时自动发出下一轮（对标上游 follow-up 全量注入）。
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -399,7 +439,7 @@ async fn drive_turn(
     reader: &mut EventStream,
     view: &mut ChatView,
     text: String,
-) -> anyhow::Result<Control> {
+) -> anyhow::Result<(Control, String)> {
     let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
     let on_event = |e: AgentEvent| {
         let _ = tx.send(e);
@@ -421,6 +461,9 @@ async fn drive_turn(
         &cancel,
     );
     let mut scroll: u16 = 0;
+    // 运行中输入的排队缓冲：输入框实时回显（qb 镜像），结束自动跟进
+    let mut followup = String::new();
+    let mut qb = InputBuffer::default();
     // 内循环只负责驱动 + 渲染；pin 守卫连同 fut 一起终结于块内，之后才能再读 session
     enum End {
         Finished(anyhow::Result<rupi_core::StopReason>),
@@ -437,7 +480,15 @@ async fn drive_turn(
                     view.push_system(line);
                 }
             }
-            draw(terminal, view, &InputBuffer::default(), scroll, true, &[])?;
+            draw(
+                terminal,
+                view,
+                &qb,
+                scroll,
+                true,
+                followup.chars().count(),
+                &[],
+            )?;
             tokio::select! {
                 res = &mut fut => {
                     while let Ok(e) = rx.try_recv() {
@@ -452,19 +503,28 @@ async fn drive_turn(
                 }
                 maybe_key = reader.next() => {
                     match maybe_key {
-                        Some(Ok(Event::Key(key))) => match key.code {
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                break End::Quit;
+                        Some(Ok(Event::Key(key))) => {
+                            if collect_followup(&mut followup, &key) {
+                                qb.set_text(&followup);
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('c')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        break End::Quit;
+                                    }
+                                    // 中止本轮：只置位不 drop future，会话停在一致点，
+                                    // TurnEnd/RunEnd{Aborted} 照常进视图。排队保留，
+                                    // 中止后自动跑排队≈转向。
+                                    KeyCode::Esc => {
+                                        cancel.cancel();
+                                    }
+                                    KeyCode::PageUp => scroll = scroll.saturating_add(5),
+                                    KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+                                    _ => {}
+                                }
                             }
-                            // 中止本轮：只置位不 drop future，会话停在一致点，
-                            // TurnEnd/RunEnd{Aborted} 照常进视图。
-                            KeyCode::Esc => {
-                                cancel.cancel();
-                            }
-                            KeyCode::PageUp => scroll = scroll.saturating_add(5),
-                            KeyCode::PageDown => scroll = scroll.saturating_sub(5),
-                            _ => {}
-                        },
+                        }
                         _ => {}
                     }
                 }
@@ -472,7 +532,7 @@ async fn drive_turn(
         }
     };
     match end {
-        End::Quit => Ok(Control::Quit),
+        End::Quit => Ok((Control::Quit, String::new())),
         End::Finished(res) => {
             if matches!(res, Ok(rupi_core::StopReason::Aborted)) {
                 view.push_system("[aborted]".into());
@@ -503,7 +563,7 @@ async fn drive_turn(
                     view.push_system(format!("turn failed: {e:#}"));
                 }
             }
-            Ok(Control::Continue)
+            Ok((Control::Continue, followup))
         }
     }
 }
@@ -515,6 +575,7 @@ fn draw<B: Backend>(
     input: &InputBuffer,
     scroll: u16,
     busy: bool,
+    queued: usize,
     completion: &[String],
 ) -> anyhow::Result<()> {
     terminal
@@ -577,9 +638,13 @@ fn draw<B: Backend>(
             }
             f.render_widget(
                 Paragraph::new(if busy {
-                    "… thinking (Ctrl-C 退出)"
+                    if queued > 0 {
+                        format!("… thinking ({queued} queued · Ctrl-C 退出)")
+                    } else {
+                        "… thinking (Ctrl-C 退出)".to_string()
+                    }
                 } else {
-                    "ready"
+                    "ready".to_string()
                 }),
                 chunks[2],
             );
@@ -631,6 +696,40 @@ mod tests {
         }
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn followup_collects_text_enter_backspace() {
+        // 运行中打字排队：字符追加、Enter 换行、Backspace 删除
+        let mut buf = String::new();
+        assert!(collect_followup(&mut buf, &key(KeyCode::Char('h'))));
+        assert!(collect_followup(&mut buf, &key(KeyCode::Char('i'))));
+        assert!(collect_followup(&mut buf, &key(KeyCode::Enter)));
+        assert_eq!(buf, "hi\n");
+        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
+        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
+        assert_eq!(buf, "h");
+    }
+
+    #[test]
+    fn followup_leaves_control_keys_to_caller() {
+        // Esc/Ctrl-C/功能键不消费，留给调用方的取消/退出/滚动分支
+        let mut buf = String::new();
+        assert!(!collect_followup(&mut buf, &key(KeyCode::Esc)));
+        assert!(!collect_followup(
+            &mut buf,
+            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
+        assert!(!collect_followup(&mut buf, &key(KeyCode::PageUp)));
+        assert!(!collect_followup(&mut buf, &key(KeyCode::Tab)));
+        assert!(buf.is_empty());
+        // 空缓冲退格不 panic
+        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
+        assert!(buf.is_empty());
+    }
+
     #[test]
     fn draw_renders_messages_input_completion_and_status() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -645,7 +744,7 @@ mod tests {
         }
         let completion = vec!["help".to_string(), "history".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, false, &completion).unwrap();
+        draw(&mut terminal, &view, &input, 0, false, 0, &completion).unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
