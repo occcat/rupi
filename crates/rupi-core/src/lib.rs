@@ -19,7 +19,10 @@ pub enum Role {
     Tool,
 }
 
-/// 内容块：文本 / 工具调用 / 工具结果三态，与 OpenAI/Anthropic 两种风格兼容。
+/// 内容块：文本 / 工具调用 / 工具结果 / 思考块，与 OpenAI/Anthropic 两种风格兼容。
+/// Thinking 系 Anthropic extended-thinking 专有：`signature` 是回放凭证，
+/// 多轮工具流必须原样带回，否则 API 400；`RedactedThinking` 是服务端加密块，
+/// 无明文、必须按 `data` 原样回放。OpenAI/Gemini 请求映射跳过它们（服务端各自管理推理态）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -35,6 +38,14 @@ pub enum ContentBlock {
         tool_call_id: String,
         content: String,
         is_error: bool,
+    },
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -67,6 +78,11 @@ impl Message {
                 ContentBlock::ToolCall {
                     name, arguments, ..
                 } => Some(format!("{name} {arguments}")),
+                // 思考过程计入 transcript（压缩摘要可见）；加密块无明文，跳过
+                ContentBlock::Thinking { text, .. } if !text.is_empty() => {
+                    Some(format!("[thinking] {text}"))
+                }
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n")
