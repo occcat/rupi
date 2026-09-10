@@ -7,6 +7,7 @@ members = [
   "crates/rupi-mcp",
   "crates/rupi-memory",
   "crates/rupi-skills",
+  "crates/rupi-ext",
   "crates/rupi-tui",
   "crates/rupi-cli",
 ]

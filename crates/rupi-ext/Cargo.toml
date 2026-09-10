@@ -1,0 +1,21 @@
+[package]
+name = "rupi-ext"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rupi-core = { path = "../rupi-core" }
+rupi-tools = { path = "../rupi-tools" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rupi-agent = { path = "../rupi-agent" }
+rupi-llm = { path = "../rupi-llm" }
+rupi-memory = { path = "../rupi-memory" }
+rupi-skills = { path = "../rupi-skills" }
+chrono = { workspace = true }

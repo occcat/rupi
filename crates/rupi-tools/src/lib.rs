@@ -46,6 +46,11 @@ impl ToolRegistry {
         self.tools.insert(tool.definition().name.clone(), tool);
     }
 
+    /// 注销（热重载删除扩展时用）。
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|t| t.definition()).collect()
     }

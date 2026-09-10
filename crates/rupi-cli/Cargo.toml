@@ -15,6 +15,7 @@ rupi-agent = { path = "../rupi-agent" }
 rupi-mcp = { path = "../rupi-mcp" }
 rupi-memory = { path = "../rupi-memory" }
 rupi-skills = { path = "../rupi-skills" }
+rupi-ext = { path = "../rupi-ext" }
 rupi-tui = { path = "../rupi-tui" }
 tokio = { workspace = true }
 serde = { workspace = true }

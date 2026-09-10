@@ -1364,6 +1364,7 @@ dependencies = [
  "clap",
  "rupi-agent",
  "rupi-core",
+ "rupi-ext",
  "rupi-llm",
  "rupi-mcp",
  "rupi-memory",
@@ -1388,6 +1389,25 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "rupi-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "rupi-agent",
+ "rupi-core",
+ "rupi-llm",
+ "rupi-memory",
+ "rupi-skills",
+ "rupi-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

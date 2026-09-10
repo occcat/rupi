@@ -15,6 +15,7 @@
 | Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill` 工具） |
 | Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（`MemoryStore::frozen_snapshot` + `MemoryProvider` trait + `MemoryManager` + `SessionStore`） |
 | Skill 自积累（后台 review 沉淀） | `SkillAccumulator::propose` + `rupi skill-distill` |
+| Extension 热重载（自写工具-重载-自测） | `rupi-ext`（manifest + 外部进程契约 stdin JSON→stdout，`ExtensionSet::refresh` mtime 增量重载，`--ext-dir`/`ext-list`，REPL `/reload` + 每轮自动检查） |
 | coding-agent CLI + TUI | `rupi-cli`（`rupi` 二进制；`chat` REPL + `tui` ratatui 全屏界面：流式渲染/滚动/review 行） |
 
 ## 快速开始

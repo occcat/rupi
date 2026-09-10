@@ -64,6 +64,9 @@ struct Cli {
     /// 压缩后保留的近期消息条数
     #[arg(long, default_value_t = 20)]
     compress_keep: usize,
+    /// 外部扩展目录（*.json manifests），默认 ~/.rupi/extensions
+    #[arg(long)]
+    ext_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -88,6 +91,8 @@ enum Cmd {
     },
     /// 会话全文检索
     SessionSearch { query: String },
+    /// 列出外部扩展工具
+    ExtList,
     /// MCP tools/list 探活
     McpList { command: String, args: Vec<String> },
 }
@@ -110,6 +115,41 @@ fn skill_dirs(home: &PathBuf) -> Vec<PathBuf> {
         home.join("skills"),
         PathBuf::from(".rupi/skills"),
     ]
+}
+
+fn ext_dir(home: &PathBuf, cli: &Cli) -> PathBuf {
+    cli.ext_dir
+        .clone()
+        .unwrap_or_else(|| home.join("extensions"))
+}
+
+/// 启动时加载扩展并注册；返回 loader（REPL 每轮 `refresh()` 热重载）。
+fn load_extensions(tools: &mut ToolRegistry, dir: &PathBuf) -> rupi_ext::ExtensionSet {
+    let mut set = rupi_ext::ExtensionSet::new(dir.clone());
+    let manifests = set.load_all();
+    if !manifests.is_empty() {
+        eprintln!(
+            "[ext] {} extensions from {}",
+            manifests.len(),
+            dir.display()
+        );
+    }
+    rupi_ext::register_all(tools, manifests);
+    set
+}
+
+/// 增量热重载：新增/修改重注册，删除注销。
+fn refresh_extensions(tools: &mut ToolRegistry, set: &mut rupi_ext::ExtensionSet) {
+    let (changed, removed) = set.refresh();
+    for name in removed {
+        tools.unregister(&name);
+        eprintln!("[ext] removed {name}");
+    }
+    if !changed.is_empty() {
+        let names: Vec<String> = changed.iter().map(|m| m.name.clone()).collect();
+        rupi_ext::register_all(tools, changed);
+        eprintln!("[ext] reloaded: {}", names.join(", "));
+    }
 }
 
 async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
@@ -175,6 +215,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("[{sid}] {snippet}");
             }
         }
+        Some(Cmd::ExtList) => {
+            let dir = ext_dir(&home, &cli);
+            let mut set = rupi_ext::ExtensionSet::new(dir);
+            for m in set.load_all() {
+                println!("{} — {}", m.name, m.description);
+            }
+        }
         Some(Cmd::McpList { command, args }) => {
             let cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
             let bridge = rupi_mcp::McpBridge::spawn(cfg).await?;
@@ -233,13 +280,16 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     } else {
         None
     };
+    // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
+    let ext_path = ext_dir(home, cli);
+    let mut ext_set = load_extensions(&mut tools, &ext_path);
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
     let mem = MemoryManager::new(store);
     let skills = SkillRegistry::discover(&skill_dirs(home));
     let mut session = SessionTree::new();
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/skills 看技能");
+    println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/skills 看技能");
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -261,6 +311,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             println!("{}", skills.index_block());
             continue;
         }
+        if input == "/reload" {
+            refresh_extensions(&mut tools, &mut ext_set);
+            continue;
+        }
         if input == "/rewind" {
             if session.current_path.len() >= 2 {
                 let target = session.current_path[session.current_path.len() - 2].clone();
@@ -269,6 +323,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             continue;
         }
+        // 每轮自动热检查：扩展目录有变即重载，无变零开销（一次 mtime 扫描）
+        refresh_extensions(&mut tools, &mut ext_set);
         agent
             .run(
                 provider.as_ref(),
@@ -317,6 +373,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     } else {
         None
     };
+    let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
     let mem = MemoryManager::new(store);

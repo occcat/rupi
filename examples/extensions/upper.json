@@ -1,0 +1,15 @@
+{
+  "name": "upper",
+  "description": "Uppercase demo: echoes arguments JSON uppercased (external-process extension example)",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "description": "text to uppercase" }
+    }
+  },
+  "prompt_snippet": "upper(text): echo arguments uppercased (example extension)",
+  "command": "sh",
+  "args": ["-c", "tr a-z A-Z"],
+  "env": {},
+  "timeout_secs": 30
+}
