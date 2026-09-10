@@ -122,6 +122,21 @@ fn sessions_empty_then_run_persists() {
 }
 
 #[test]
+fn no_memory_run_still_works() {
+    // --no-memory：回合内撤下内建记忆工具与指导块，run 照常走通
+    let home = fresh_home();
+    let o = rupi(&home, &["--no-memory", "run", "say hi"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--no-memory run 失败:\nstdout={out}\nstderr={err}"
+    );
+    assert!(out.contains("demo mode"));
+}
+
+#[test]
 fn chat_quit_exits_zero() {
     let home = fresh_home();
     let mut child = Command::new(env!("CARGO_BIN_EXE_rupi"));

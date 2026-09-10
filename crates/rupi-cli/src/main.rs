@@ -105,6 +105,10 @@ struct Cli {
     /// 思考强度（对标上游 /thinking：off|low|medium|high；映射为各 provider 推理参数）
     #[arg(long)]
     thinking: Option<String>,
+    /// 回合内禁用内建记忆（MEMORY.md/USER.md 不注入、memory 工具与指导块撤下；
+    /// 对标 Hermes memory_enabled=false；显式记忆子命令与外部 provider 不受影响）
+    #[arg(long, default_value_t = false)]
+    no_memory: bool,
 }
 
 #[derive(Subcommand)]
@@ -659,7 +663,11 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
             false
         }
     };
-    let store = memory_store(home, load_project);
+    let mut store = memory_store(home, load_project);
+    if cli.no_memory {
+        store.memory_enabled = false;
+        store.user_profile_enabled = false;
+    }
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
@@ -841,7 +849,11 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut ext_set = load_extensions(&mut tools, &ext_path);
     // 项目信任门：未信任则项目记忆/skills/命令全部不加载（只用全局）
     let load_project = load_project_resources(home, cli);
-    let store = memory_store(home, load_project);
+    let mut store = memory_store(home, load_project);
+    if cli.no_memory {
+        store.memory_enabled = false;
+        store.user_profile_enabled = false;
+    }
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
@@ -1039,7 +1051,11 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
     // 项目信任门（全屏启动前 stdin 问一次，与 REPL 同语义）
     let load_project = load_project_resources(home, cli);
-    let store = memory_store(home, load_project);
+    let mut store = memory_store(home, load_project);
+    if cli.no_memory {
+        store.memory_enabled = false;
+        store.user_profile_enabled = false;
+    }
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;

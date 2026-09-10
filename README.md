@@ -67,6 +67,8 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - `~/.rupi/memories/MEMORY.md` / `USER.md` / `failures.md`，`memory_char_limit=5000` / `user_char_limit=5000`。
 - 启动时冻结快照注入系统提示（保 prefix cache）；会话内 `memory` 工具写盘即时生效，
   但快照不变，下个 session 才可见；`tool` 回包永远显示实时状态。
+- 模型指导块 `<MemoryGuidance>`（静态文本，不伤 prefix cache）：何存（可复用的偏好/纠正/教训，项目事实用 `scope=project`）、何取（先 `memory_search` 再追问）、不存瞬态与密钥；空库时也注入，否则存→冻→忆的环转不起来。
+- `--no-memory`：回合内撤下内建记忆（内容/工具/指导块，外部 provider 不受影响），显式记忆子命令照常可用。
 - 密钥扫描：`memory` 写入 / `failures.md` 记录含疑似密钥（api key / token / 私钥）一律拒绝落盘。
 - 失败记忆：review 纠正检测（用户纠正 / 助手自认失败）→ `failures.md`，随快照注入 `<FailureMemory>`。
 - 成功写入即镜像到 `sessions.db`（memories 表 + FTS5），`memory-search` / `memory_search` 工具按需查，不进每轮 prompt。

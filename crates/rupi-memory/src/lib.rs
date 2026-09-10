@@ -331,6 +331,17 @@ impl MemoryStore {
         }
     }
 
+    /// 记忆引导语（对标 Hermes “给模型何存何取的指导”）：静态文本，前缀缓存安全；
+    /// 空库时更要出现（否则模型永远不调 memory 工具，存→冻→忆的环转不起来）。
+    /// 双开关全关时返回空（Hermes `memory_enabled=false`：工具与指导块一并撤下，
+    /// 模型收不到用不了的工具）。
+    pub fn guidance_block(&self) -> String {
+        if !self.memory_enabled && !self.user_profile_enabled {
+            return String::new();
+        }
+        "\n<MemoryGuidance>\nLong-term memory persists across sessions: MEMORY.md keeps durable facts (project conventions, environment, lessons learned), USER.md keeps user preferences. Save via the `memory` tool (op=add) when you learn something reusable — a preference, a correction, a gotcha; scope=project for repo-specific facts. Do NOT store ephemeral task state or secrets. Writes take effect in the prompt from the next session; the tool response shows live state. Recall with `memory_search` before asking the user twice; past failures arrive as <FailureMemory> — do not repeat them.\n</MemoryGuidance>\n".to_string()
+    }
+
     /// SQLite 镜像（best-effort）：成功写入的记忆同步一行到 sessions.db，
     /// 失败只 warning，绝不影响 markdown 主写入。
     fn mirror_memory(&self, target: &str, content: &str) {
@@ -475,6 +486,7 @@ impl MemoryManager {
 
     pub fn system_block(&self, frozen: &FrozenMemory) -> String {
         let mut s = frozen.system_block();
+        s.push_str(&self.store.guidance_block());
         if let Some(e) = &self.external {
             s.push_str(&e.system_prompt_block());
         }
@@ -1016,6 +1028,38 @@ mod tests {
         // 正常写入不受影响
         store.apply_write("add", "likes tea").unwrap();
         assert!(store.memory_text().contains("tea"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn guidance_present_when_enabled_absent_when_fully_disabled() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-guide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        // 空库也有指导块：否则模型永远不调 memory 工具
+        let g = store.guidance_block();
+        assert!(g.contains("MemoryGuidance"));
+        assert!(g.contains("memory_search"));
+        // manager 系统块 = 冻结内容 + 指导（静态文本，前缀缓存安全）
+        let mgr = MemoryManager::new(store);
+        let frozen = FrozenMemory::default();
+        assert!(mgr.system_block(&frozen).contains("MemoryGuidance"));
+        // 双关：工具 schema 与指导块一并撤下，模型收不到用不了的工具
+        assert!(mgr
+            .all_tool_definitions()
+            .iter()
+            .any(|t| t.name == "memory"));
+        let mut off = MemoryStore::new(home.clone());
+        off.memory_enabled = false;
+        off.user_profile_enabled = false;
+        assert!(off.guidance_block().is_empty());
+        assert!(off.memory_tool_definition().is_none());
+        let mgr_off = MemoryManager::new(off);
+        assert!(!mgr_off.system_block(&frozen).contains("MemoryGuidance"));
+        assert!(mgr_off
+            .all_tool_definitions()
+            .iter()
+            .all(|t| t.name != "memory" && t.name != "memory_search"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
