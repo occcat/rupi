@@ -286,6 +286,53 @@ fn run_review_apply_persists_memory() {
 }
 
 #[test]
+fn run_resume_continues_same_session() {
+    // --resume 断点续聊：第二次 run 不建新会话，同会话消息数增长
+    let home = fresh_home();
+    let o = rupi(&home, &["--no-approve", "run", "first hello"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "首次 run 失败: {o:?}");
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 1, "首次 run 后应恰 1 会话:\n{out}");
+    let sid = lines[0]
+        .split_whitespace()
+        .nth(1)
+        .expect("解析会话 id")
+        .to_string();
+
+    let o = rupi(
+        &home,
+        &["--no-approve", "--resume", &sid, "run", "second hello"],
+    )
+    .output()
+    .unwrap();
+    let (out2, err2) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "resume run 失败:\nstdout={out2}\nstderr={err2}"
+    );
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out3, _) = out_text(&o);
+    let lines3: Vec<&str> = out3.lines().collect();
+    assert_eq!(lines3.len(), 1, "resume 后不应建新会话:\n{out3}");
+    assert!(
+        lines3[0].contains(&sid[..8.min(sid.len())]) || lines3[0].contains(&sid),
+        "会话 id 不一致:\n{out3}"
+    );
+    // 两轮共 4 条消息（2 问 2 答），数只增不重置
+    let count: i64 = lines3[0]
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(count >= 4, "续聊后消息数未增长:\n{out3}");
+}
+
+#[test]
 fn empty_states_exit_zero() {
     let home = fresh_home();
     for sub in ["ext-list", "commands"] {
