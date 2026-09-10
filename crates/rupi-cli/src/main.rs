@@ -23,6 +23,9 @@ struct Cli {
     model: String,
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
+    /// MCP server 配置 JSON 文件（数组）：[{"name":..,"command":..,"args":[..],"env":{..}}]
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -150,7 +153,17 @@ async fn main() -> anyhow::Result<()> {
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let provider = build_provider(&cli.model).await?;
     let agent = AgentLoop::new(cli.max_turns);
-    let tools = ToolRegistry::with_builtins();
+    let mut tools = ToolRegistry::with_builtins();
+    // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
+    let _mcp = if let Some(path) = &cli.mcp_config {
+        let configs = rupi_mcp::load_configs(path)?;
+        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let names = manager.register_all(&mut tools, &configs).await;
+        println!("[mcp] {} tools: {}", names.len(), names.join(", "));
+        Some(manager)
+    } else {
+        None
+    };
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
     let mem = MemoryManager::new(store);

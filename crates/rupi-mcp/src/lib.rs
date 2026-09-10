@@ -7,6 +7,7 @@ use anyhow::Context;
 use rupi_core::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -310,6 +311,110 @@ pub fn mcp_tool_to_definition(prefix: &str, tool: &McpTool) -> ToolDefinition {
             }
         )),
     }
+}
+
+// ---- registerToolsFromMCP：把远端 MCP 工具注册为本地原生工具 ----
+
+/// 单个 MCP 工具的本地执行器：`Tool` trait 实现，`tools/call` 前做 sanitize。
+pub struct McpToolExecutor {
+    definition: ToolDefinition,
+    bridge: Arc<McpBridge>,
+    tool_name: String,
+    input_schema: serde_json::Value,
+}
+
+impl McpToolExecutor {
+    pub fn new(prefix: &str, bridge: Arc<McpBridge>, tool: &McpTool) -> Self {
+        Self {
+            definition: mcp_tool_to_definition(prefix, tool),
+            bridge,
+            tool_name: tool.name.clone(),
+            input_schema: tool.input_schema.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rupi_tools::Tool for McpToolExecutor {
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<rupi_tools::ToolOutput> {
+        match self
+            .bridge
+            .call_tool(&self.tool_name, arguments, &self.input_schema)
+            .await
+        {
+            Ok(r) => Ok(if r.is_error {
+                rupi_tools::ToolOutput::err(r.text)
+            } else {
+                rupi_tools::ToolOutput::ok(r.text)
+            }),
+            // 桥断了也不崩主循环：转成 tool error 回给模型
+            Err(e) => Ok(rupi_tools::ToolOutput::err(format!(
+                "MCP call failed: {e:#}"
+            ))),
+        }
+    }
+}
+
+/// 多 server 管理器：对标 `registerToolsFromMCP`，为每个 server spawn 一座桥，
+/// 把全部远端工具注册进 `ToolRegistry`（命名 `{server}_{tool}`，首注册者胜）。
+pub struct McpManager {
+    pub bridges: Vec<Arc<McpBridge>>,
+}
+
+impl McpManager {
+    pub async fn spawn_all(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
+        let mut bridges = vec![];
+        for cfg in configs {
+            match McpBridge::spawn(cfg.clone()).await {
+                Ok(b) => bridges.push(Arc::new(b)),
+                Err(e) => tracing::warn!("MCP server '{}' failed to start: {e:#}", cfg.name),
+            }
+        }
+        Ok(Self { bridges })
+    }
+
+    /// 发现全部远端工具并注册进 registry。返回成功注册的工具名。
+    pub async fn register_all(
+        &self,
+        registry: &mut rupi_tools::ToolRegistry,
+        configs: &[McpServerConfig],
+    ) -> Vec<String> {
+        let mut registered = vec![];
+        for (bridge, cfg) in self.bridges.iter().zip(configs.iter()) {
+            match bridge.list_tools().await {
+                Ok(tools) => {
+                    for t in tools {
+                        let name = format!("{}_{}", cfg.name, t.name);
+                        if registered.contains(&name) {
+                            tracing::warn!("MCP tool name conflict: {name}; first wins");
+                            continue;
+                        }
+                        registry.register(Arc::new(McpToolExecutor::new(
+                            &cfg.name,
+                            bridge.clone(),
+                            &t,
+                        )));
+                        registered.push(name);
+                    }
+                }
+                Err(e) => tracing::warn!("MCP tools/list failed for '{}': {e:#}", cfg.name),
+            }
+        }
+        registered
+    }
+}
+
+/// 从 JSON 文件加载 server 配置：`[{"name":..,"command":..,"args":[..],"env":{..}}]`。
+pub fn load_configs(path: &Path) -> anyhow::Result<Vec<McpServerConfig>> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw)?)
 }
 
 #[cfg(test)]

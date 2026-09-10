@@ -297,8 +297,123 @@ impl MemoryManager {
     }
 }
 
-// ---- session store (SQLite + FTS5) ----
+/// 示例外部 provider：JSONL 回放日志（`turns.jsonl`）。
+/// 对标 Hermes 的 Honcho/Mem0 插件位：`prefetch` 读后台缓存绝不阻塞，
+/// `sync_turn` 追加持久化，另带一个 `recall` 工具做关键词回想。
+pub struct JsonlProvider {
+    file: PathBuf,
+    recent: std::sync::Mutex<Vec<String>>,
+    recent_n: usize,
+}
 
+impl JsonlProvider {
+    pub fn new(recent_n: usize) -> Self {
+        Self {
+            file: PathBuf::new(),
+            recent: std::sync::Mutex::new(vec![]),
+            recent_n,
+        }
+    }
+
+    fn append_line(&self, line: &str) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    }
+
+    fn reload_cache(&self) {
+        let content = std::fs::read_to_string(&self.file).unwrap_or_default();
+        let mut lines: Vec<String> = content
+            .lines()
+            .rev()
+            .take(self.recent_n)
+            .map(|s| s.to_string())
+            .collect();
+        lines.reverse();
+        *self.recent.lock().unwrap() = lines;
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for JsonlProvider {
+    async fn initialize(&mut self, home: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(home)?;
+        self.file = home.join("turns.jsonl");
+        if !self.file.exists() {
+            std::fs::write(&self.file, "")?;
+        }
+        self.reload_cache();
+        Ok(())
+    }
+
+    fn system_prompt_block(&self) -> String {
+        "\n<ExternalMemory provider=\"jsonl\">Recent turns are prefetched below; use recall(query) to search history.</ExternalMemory>\n".to_string()
+    }
+
+    async fn prefetch(&self) -> String {
+        // 必须立即返回：只读内存缓存，后台 sync 后刷新
+        self.recent.lock().unwrap().join("\n")
+    }
+
+    async fn sync_turn(&self, user: &str, assistant: &str) -> anyhow::Result<()> {
+        let line = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "user": user.chars().take(500).collect::<String>(),
+            "assistant": assistant.chars().take(500).collect::<String>(),
+        })
+        .to_string();
+        self.append_line(&line)?;
+        self.reload_cache();
+        Ok(())
+    }
+
+    fn tool_schemas(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "recall".into(),
+            description: "Search past turns in external memory".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+            prompt_snippet: Some("recall(query): search past turns".into()),
+        }]
+    }
+
+    async fn handle_tool_call(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<Option<String>> {
+        if name != "recall" {
+            return Ok(None);
+        }
+        let q = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let content = std::fs::read_to_string(&self.file).unwrap_or_default();
+        let hits: Vec<String> = content
+            .lines()
+            .filter(|l| l.to_lowercase().contains(&q))
+            .rev()
+            .take(5)
+            .map(|s| s.to_string())
+            .collect();
+        Ok(Some(if hits.is_empty() {
+            "no matches".to_string()
+        } else {
+            hits.join("\n")
+        }))
+    }
+}
+
+// ---- session store (SQLite + FTS5) ----
 pub struct SessionStore {
     conn: rusqlite::Connection,
 }
@@ -391,5 +506,29 @@ mod tests {
             }
         }
         assert!(m.register_external("b".into(), Box::new(Q)).is_err());
+    }
+
+    #[tokio::test]
+    async fn jsonl_provider_prefetch_sync_recall() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        assert_eq!(p.prefetch().await, "");
+        p.sync_turn("hello world", "hi there").await.unwrap();
+        assert!(p.prefetch().await.contains("hello world"));
+        let hit = p
+            .handle_tool_call("recall", serde_json::json!({"query": "hello"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("hello world"));
+        let miss = p
+            .handle_tool_call("recall", serde_json::json!({"query": "zzz-no-match"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(miss, "no matches");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

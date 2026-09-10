@@ -1217,6 +1217,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rupi-core",
+ "rupi-tools",
  "serde",
  "serde_json",
  "thiserror",

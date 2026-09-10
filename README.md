@@ -39,7 +39,10 @@ export RUPI_API_KEY=... RUPI_BASE_URL=https://api.openai.com/v1
 ## MCP 探活
 
 ```bash
-./target/debug/rupi mcp-list --command npx --args @modelcontextprotocol/server-everything
+./target/debug/rupi mcp-list python3 crates/rupi-mcp/tests/fake_mcp_server.py
+echo '[{"name":"fake","command":"python3","args":["crates/rupi-mcp/tests/fake_mcp_server.py"],"env":{}}]' > /tmp/mcp.json
+echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
+# → [mcp] 2 tools: fake_echo, fake_fail
 ```
 
 语义与 `pi-directx` 一致：stdio 上换行分隔 JSON-RPC 2.0，
