@@ -3,7 +3,9 @@
 use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::{Message, SessionTree};
-use rupi_llm::{AnthropicProvider, LlmProvider, MockProvider, OpenAiCompatProvider};
+use rupi_llm::{
+    AnthropicProvider, GeminiProvider, LlmProvider, MockProvider, OpenAiCompatProvider,
+};
 use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
@@ -321,6 +323,20 @@ async fn build_provider(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
                 return Ok(Box::new(MockProvider::new(vec![
                     MockProvider::text_response(
                         "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。",
+                    ),
+                ])));
+            }
+        }
+    }
+    // gemini-* 走 Gemini 原生
+    if model.starts_with("gemini-") {
+        match GeminiProvider::from_env(model.to_string()) {
+            Ok(p) => return Ok(Box::new(p)),
+            Err(e) => {
+                eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                return Ok(Box::new(MockProvider::new(vec![
+                    MockProvider::text_response(
+                        "demo mode：设置 RUPI_GEMINI_KEY 后可接 Gemini。已收到你的请求，工具链就绪。",
                     ),
                 ])));
             }
