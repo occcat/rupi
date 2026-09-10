@@ -407,8 +407,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::ExtList) => {
             let dir = ext_dir(&home, &cli);
-            let mut set = rupi_ext::ExtensionSet::new(dir);
-            for m in set.load_all() {
+            let mut set = rupi_ext::ExtensionSet::new(dir.clone());
+            let manifests = set.load_all();
+            if manifests.is_empty() {
+                println!("no extensions in {} (*.json manifests)", dir.display());
+            }
+            for m in manifests {
                 println!("{} — {}", m.name, m.description);
             }
         }
