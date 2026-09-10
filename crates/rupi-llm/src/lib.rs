@@ -204,6 +204,19 @@ fn openai_body(model: &str, req: &ChatRequest, stream: bool) -> serde_json::Valu
     serde_json::Value::Object(m)
 }
 
+/// 按模型名前缀选原生 provider（`claude-*`→Anthropic，`gemini-*`→Gemini，
+/// 其余→OpenAI-compatible）：缺 key 即 Err，由调用方决定回 mock 还是报错。
+/// CLI 与 TUI 的 `/model` 共用此路由，避免两端漂移。
+pub fn provider_for_model(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
+    if model.starts_with("claude-") {
+        return Ok(Box::new(AnthropicProvider::from_env(model.to_string())?));
+    }
+    if model.starts_with("gemini-") {
+        return Ok(Box::new(GeminiProvider::from_env(model.to_string())?));
+    }
+    Ok(Box::new(OpenAiCompatProvider::from_env(model.to_string())?))
+}
+
 /// OpenAI-compatible provider：覆盖 OpenAI / DeepSeek / Moonshot / 本地 Ollama 等。
 /// 通过 `base_url + api_key + model` 配置，默认 `https://api.openai.com/v1`。
 #[derive(Debug, Clone)]
@@ -228,7 +241,9 @@ impl OpenAiCompatProvider {
         let base_url = std::env::var("RUPI_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let api_key = std::env::var("RUPI_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"))?;
+        let api_key = std::env::var("RUPI_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .map_err(|_| anyhow::anyhow!("set RUPI_API_KEY or OPENAI_API_KEY"))?;
         Ok(Self::new(base_url, api_key, model))
     }
 }
@@ -662,6 +677,47 @@ mod tests {
         let b = openai_body("m", &high, true);
         assert_eq!(b["reasoning_effort"], "high");
         assert_eq!(b["stream"], true);
+    }
+
+    #[test]
+    fn provider_for_model_routes_by_prefix() {
+        //  hermetic：暂存并清空三家 key，断言路由选型（错误信息带各家 key 名即选对分支）
+        let saved: Vec<(&str, Option<String>)> = [
+            "RUPI_ANTHROPIC_KEY",
+            "ANTHROPIC_API_KEY",
+            "RUPI_GEMINI_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "RUPI_API_KEY",
+            "OPENAI_API_KEY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+        // 补回 base 系变量干扰？from_env 只读 key 与 *_BASE，不动 BASE 即走默认网关
+        let ea = match provider_for_model("claude-sonnet-4-5") {
+            Ok(_) => panic!("expected missing-key error without env"),
+            Err(e) => e.to_string(),
+        };
+        assert!(ea.contains("ANTHROPIC_API_KEY"), "anthropic branch: {ea}");
+        let eb = match provider_for_model("gemini-2.5-flash") {
+            Ok(_) => panic!("expected missing-key error without env"),
+            Err(e) => e.to_string(),
+        };
+        assert!(eb.contains("GEMINI_API_KEY"), "gemini branch: {eb}");
+        let ec = match provider_for_model("gpt-4o-mini") {
+            Ok(_) => panic!("expected missing-key error without env"),
+            Err(e) => e.to_string(),
+        };
+        assert!(ec.contains("RUPI_API_KEY"), "openai branch: {ec}");
+        for (k, v) in saved {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val) };
+            }
+        }
     }
 
     #[test]
