@@ -1879,6 +1879,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_skill_draft_flows_to_accumulator_end_to_end() {
+        use rupi_core::ContentBlock;
+        use std::sync::{Arc, Mutex};
+        // 磁盘 skill（复用 load_skill + read_resource 的安全读路径）
+        let base =
+            std::env::temp_dir().join(format!("rupi-agent-reviewdraft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("ops");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: ops-skill\ndescription: ops runbook\n---\n\n# Ops\nFollow runbook.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("references").join("runbook.md"),
+            "RUNBOOK-SECRET-SAUCE",
+        )
+        .unwrap();
+        let skills = SkillRegistry::discover(std::slice::from_ref(&base));
+        let mk_call = |name: &str, args: serde_json::Value| ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: name.into(),
+                    arguments: args,
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let provider = MockProvider::new(vec![
+            mk_call("load_skill", serde_json::json!({"name": "ops-skill"})),
+            mk_call(
+                "read_resource",
+                serde_json::json!({"name": "ops-skill", "path": "references/runbook.md"}),
+            ),
+            MockProvider::text_response("ops done"),
+        ]);
+        // 主循环 → 启发式复盘（同步 await）→ 回调拿到草稿 → Accumulator 落盘
+        let got: Arc<Mutex<Vec<ReviewSuggestion>>> = Arc::new(Mutex::new(vec![]));
+        let got_clone = got.clone();
+        let agent = AgentLoop::new(5).with_reviewer(
+            Arc::new(HeuristicReviewer::default()),
+            Arc::new(move |s: ReviewSuggestion| {
+                got_clone.lock().unwrap().push(s);
+            }),
+        );
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-reviewdraft-mem");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "run ops checklist and verify",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &skills,
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let suggestions = got.lock().unwrap();
+        assert_eq!(suggestions.len(), 1, "复盘回调未触发");
+        let draft = suggestions[0]
+            .skill_draft
+            .clone()
+            .expect("双工具回合应产出 skill 草稿");
+        assert!(draft.name.starts_with("auto-"), "{}", draft.name);
+        drop(suggestions);
+        // 草稿经 Accumulator 落盘为可用 skill（自积累闭环的最后一段）
+        let acc = rupi_skills::SkillAccumulator::new(base.join("landed"));
+        let landed = acc
+            .propose(&draft.name, &draft.description, &draft.steps)
+            .expect("草稿落盘");
+        assert!(
+            landed.join("SKILL.md").exists(),
+            "SKILL.md 未落盘: {}",
+            landed.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
     async fn discovery_gates_then_reveals_tools() {
         let provider = MockProvider::new(vec![
             tool_call_response("c1", "search_tools", serde_json::json!({"query": "memory"})),
