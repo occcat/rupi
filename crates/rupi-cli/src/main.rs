@@ -683,6 +683,32 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }
+    // 后台 review（与 chat 同语义）：--review 只建议，--review-apply 直接落盘
+    let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
+        Arc::new(std::sync::Mutex::new(vec![]));
+    if cli.review || cli.review_apply {
+        let pending_clone = pending.clone();
+        let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
+            Arc::new(rupi_agent::LlmReviewer::new(provider.clone()))
+        } else {
+            Arc::new(HeuristicReviewer::default())
+        };
+        agent = agent.with_reviewer(
+            reviewer,
+            Arc::new(move |s: ReviewSuggestion| {
+                eprintln!(
+                    "[review] memory_ops={} failures={} skill={}",
+                    s.memory_ops.len(),
+                    s.failures.len(),
+                    s.skill_draft
+                        .as_ref()
+                        .map(|d| d.name.as_str())
+                        .unwrap_or("-")
+                );
+                pending_clone.lock().unwrap().push(s);
+            }),
+        );
+    }
     let before_len = session.current_path.len();
     use std::io::Write as _;
     agent
@@ -712,6 +738,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
         .await?;
     println!();
     persist_turn(&sess_db, &sid, prompt, &session, before_len);
+    if cli.review_apply {
+        apply_suggestions(home, &pending);
+    }
     Ok(())
 }
 
