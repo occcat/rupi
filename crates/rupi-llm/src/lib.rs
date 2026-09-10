@@ -17,6 +17,68 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// 思考强度（对标上游 `/thinking`）：None = 不干预（provider/模型默认）；
+    /// Some(Off) = 显式关闭（能关的 provider 省 token），Low/Medium/High 逐档加码。
+    /// 压缩摘要与后台 review 请求永远为 None（内部任务不需要烧推理 token）。
+    #[serde(default)]
+    pub thinking: Option<ThinkingLevel>,
+}
+
+/// 思考强度四档（对标上游 thinking levels）：各 provider 按自家参数名映射，
+/// 语义统一为“推理预算逐档放大”。`FromStr` 供 CLI `--thinking` 解析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl std::str::FromStr for ThinkingLevel {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "disabled" => Ok(ThinkingLevel::Off),
+            "low" | "minimal" | "min" => Ok(ThinkingLevel::Low),
+            "medium" | "med" => Ok(ThinkingLevel::Medium),
+            "high" | "max" => Ok(ThinkingLevel::High),
+            other => anyhow::bail!("invalid thinking level '{other}' (off|low|medium|high)"),
+        }
+    }
+}
+
+impl ThinkingLevel {
+    /// OpenAI chat-completions `reasoning_effort` 取值；Off 返回 None（字段省略）。
+    pub fn openai_effort(self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High => Some("high"),
+        }
+    }
+
+    /// Gemini `thinkingConfig.thinkingLevel` 取值；Off 返回 None（字段省略）。
+    pub fn gemini_level(self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some("LOW"),
+            ThinkingLevel::Medium => Some("MEDIUM"),
+            ThinkingLevel::High => Some("HIGH"),
+        }
+    }
+
+    /// Anthropic extended-thinking 预算 token；Off 返回 None（字段省略）。
+    pub fn anthropic_budget(self) -> Option<u32> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some(1024),
+            ThinkingLevel::Medium => Some(4096),
+            ThinkingLevel::High => Some(8192),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +180,29 @@ pub fn to_openai_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// OpenAI chat-completions 请求体：thinking 有档位时加 `reasoning_effort`，
+/// 无/Off 时字段省略（显式传空值部分网关会 400）。
+fn openai_body(model: &str, req: &ChatRequest, stream: bool) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("model".into(), model.to_string().into());
+    m.insert(
+        "messages".into(),
+        serde_json::Value::Array(to_openai_messages(&req.system, &req.messages)),
+    );
+    m.insert(
+        "tools".into(),
+        serde_json::Value::Array(to_openai_tools(&req.tools)),
+    );
+    m.insert("temperature".into(), req.temperature.unwrap_or(0.2).into());
+    if stream {
+        m.insert("stream".into(), true.into());
+    }
+    if let Some(effort) = req.thinking.and_then(|t| t.openai_effort()) {
+        m.insert("reasoning_effort".into(), effort.into());
+    }
+    serde_json::Value::Object(m)
+}
+
 /// OpenAI-compatible provider：覆盖 OpenAI / DeepSeek / Moonshot / 本地 Ollama 等。
 /// 通过 `base_url + api_key + model` 配置，默认 `https://api.openai.com/v1`。
 #[derive(Debug, Clone)]
@@ -155,12 +240,7 @@ impl LlmProvider for OpenAiCompatProvider {
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": to_openai_messages(&req.system, &req.messages),
-            "tools": to_openai_tools(&req.tools),
-            "temperature": req.temperature.unwrap_or(0.2),
-        });
+        let body = openai_body(&self.model, &req, false);
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let resp =
@@ -179,13 +259,7 @@ impl LlmProvider for OpenAiCompatProvider {
     ) -> anyhow::Result<ChatResponse> {
         use futures::StreamExt as _;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": to_openai_messages(&req.system, &req.messages),
-            "tools": to_openai_tools(&req.tools),
-            "temperature": req.temperature.unwrap_or(0.2),
-            "stream": true,
-        });
+        let body = openai_body(&self.model, &req, true);
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let resp =
@@ -549,6 +623,47 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_parses_and_maps() {
+        use std::str::FromStr as _;
+        assert_eq!(
+            ThinkingLevel::from_str("high").unwrap(),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            ThinkingLevel::from_str("MED").unwrap(),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(ThinkingLevel::from_str("none").unwrap(), ThinkingLevel::Off);
+        assert!(ThinkingLevel::from_str("ultra").is_err());
+        assert_eq!(ThinkingLevel::High.openai_effort(), Some("high"));
+        assert_eq!(ThinkingLevel::Off.openai_effort(), None);
+        assert_eq!(ThinkingLevel::Low.gemini_level(), Some("LOW"));
+        assert_eq!(ThinkingLevel::Medium.anthropic_budget(), Some(4096));
+    }
+
+    #[test]
+    fn openai_body_carries_reasoning_effort_only_when_set() {
+        let base = ChatRequest {
+            system: "s".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        };
+        assert!(openai_body("m", &base, false)
+            .get("reasoning_effort")
+            .is_none());
+        let high = ChatRequest {
+            thinking: Some(ThinkingLevel::High),
+            ..base
+        };
+        let b = openai_body("m", &high, true);
+        assert_eq!(b["reasoning_effort"], "high");
+        assert_eq!(b["stream"], true);
+    }
+
+    #[test]
     fn openai_message_mapping_keeps_tool_calls() {
         let m = Message {
             id: "1".into(),
@@ -625,6 +740,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            thinking: None,
         };
         let resp = p.complete_streaming(req, tx).await.unwrap();
         drop(resp);

@@ -297,6 +297,7 @@ impl Reviewer for LlmReviewer {
             tools: vec![],
             max_tokens: Some(600),
             temperature: Some(0.0),
+            thinking: None,
         };
         let resp = self.provider.complete(req).await?;
         Ok(Self::parse(&resp.message.full_text()))

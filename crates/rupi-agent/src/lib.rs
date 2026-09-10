@@ -4,7 +4,7 @@
 use rupi_core::{
     AgentEvent, ContentBlock, Extension, Message, Role, SessionTree, StopReason, ToolDefinition,
 };
-use rupi_llm::{ChatRequest, LlmProvider};
+use rupi_llm::{ChatRequest, LlmProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager};
 use rupi_skills::SkillRegistry;
 use rupi_tools::{Tool, ToolRegistry};
@@ -105,6 +105,9 @@ pub struct AgentLoop {
     pub tool_execution: ToolExecution,
     /// 渐进式工具发现（默认关闭，全量可见）；开启后可发现工具按需注入 schema。
     pub discovery: Option<DiscoveryConfig>,
+    /// 思考强度（对标上游 `/thinking`）：None = 不干预；透传给 provider 映射为
+    /// reasoning_effort / thinkingLevel / thinking+budget。压缩与 review 不用。
+    pub thinking: Option<ThinkingLevel>,
     /// 跨轮持久的已发现工具名（同 agent 多轮对话共享；clone 共享底表）。
     pub discovered: Arc<std::sync::Mutex<HashSet<String>>>,
 }
@@ -126,6 +129,7 @@ impl AgentLoop {
             hooks: vec![],
             tool_execution: ToolExecution::Sequential,
             discovery: None,
+            thinking: None,
             discovered: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -173,6 +177,12 @@ impl AgentLoop {
 
     pub fn with_discovery(mut self, discovery: DiscoveryConfig) -> Self {
         self.discovery = Some(discovery);
+        self
+    }
+
+    /// 思考强度（对标上游 `/thinking`）：只影响主循环发模型的请求。
+    pub fn with_thinking(mut self, thinking: ThinkingLevel) -> Self {
+        self.thinking = Some(thinking);
         self
     }
 
@@ -312,6 +322,7 @@ impl AgentLoop {
                 tools: req_tools,
                 max_tokens: None,
                 temperature: Some(0.2),
+                thinking: self.thinking,
             };
             // 流式补全：delta 到达即推 TextDelta（TUI 逐字渲染），最终仍得完整响应
             let (tx, mut rx) = tokio::sync::mpsc::channel::<rupi_llm::StreamEvent>(64);
@@ -606,6 +617,7 @@ impl AgentLoop {
             tools: vec![],
             max_tokens: None,
             temperature: Some(0.0),
+            thinking: None,
         };
         let summary = match provider.complete(req).await {
             Ok(r) => r.message.full_text(),

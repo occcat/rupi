@@ -50,15 +50,33 @@ impl GeminiProvider {
     }
 
     fn body(&self, req: &super::ChatRequest) -> serde_json::Value {
-        serde_json::json!({
-            "system_instruction": {"parts": [{"text": req.system}]},
-            "contents": to_gemini_contents(&req.messages),
-            "tools": [{"functionDeclarations": to_gemini_tools(&req.tools)}],
-            "generationConfig": {
-                "temperature": req.temperature.unwrap_or(0.2),
-                "maxOutputTokens": req.max_tokens.unwrap_or(4096),
-            },
-        })
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "system_instruction".into(),
+            serde_json::json!({"parts": [{"text": req.system}]}),
+        );
+        m.insert(
+            "contents".into(),
+            serde_json::Value::Array(to_gemini_contents(&req.messages)),
+        );
+        m.insert(
+            "tools".into(),
+            serde_json::json!([{"functionDeclarations": to_gemini_tools(&req.tools)}]),
+        );
+        let mut gen = serde_json::Map::new();
+        gen.insert("temperature".into(), req.temperature.unwrap_or(0.2).into());
+        gen.insert(
+            "maxOutputTokens".into(),
+            req.max_tokens.unwrap_or(4096).into(),
+        );
+        if let Some(level) = req.thinking.and_then(|t| t.gemini_level()) {
+            gen.insert(
+                "thinkingConfig".into(),
+                serde_json::json!({"thinkingLevel": level}),
+            );
+        }
+        m.insert("generationConfig".into(), serde_json::Value::Object(gen));
+        serde_json::Value::Object(m)
     }
 }
 
@@ -482,6 +500,32 @@ mod tests {
             }
             _ => panic!("expected tool call"),
         }
+    }
+
+    #[test]
+    fn body_carries_thinking_level_only_when_set() {
+        let p = GeminiProvider::new("https://x".into(), "k".into(), "m".into());
+        let base = super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        };
+        assert!(p
+            .body(&base)
+            .pointer("/generationConfig/thinkingConfig")
+            .is_none());
+        let high = super::super::ChatRequest {
+            thinking: Some(super::super::ThinkingLevel::High),
+            ..base
+        };
+        assert_eq!(
+            p.body(&high)
+                .pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&serde_json::json!("HIGH"))
+        );
     }
 
     #[test]

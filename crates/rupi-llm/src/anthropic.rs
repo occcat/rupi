@@ -63,7 +63,26 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             m.insert("tools".into(), serde_json::Value::Array(tools));
         }
-        m.insert("temperature".into(), req.temperature.unwrap_or(0.2).into());
+        // extended thinking 开启时 temperature 必须为 1（API 硬性要求），且
+        // max_tokens 必须大于 budget；不满足任一条即省略 thinking（退化为普通请求，
+        // 否则 400）。thinking 块签名回放尚未实现，多轮工具流暂不支持开启。
+        let budget = req.thinking.and_then(|t| t.anthropic_budget());
+        let thinking_on = budget.is_some_and(|b| req.max_tokens.unwrap_or(4096) > b);
+        if thinking_on {
+            m.insert(
+                "thinking".into(),
+                serde_json::json!({"type": "enabled", "budget_tokens": budget.unwrap()}),
+            );
+        }
+        m.insert(
+            "temperature".into(),
+            if thinking_on {
+                1.0
+            } else {
+                req.temperature.unwrap_or(0.2)
+            }
+            .into(),
+        );
         m.insert("stream".into(), stream.into());
         serde_json::Value::Object(m)
     }
@@ -456,6 +475,7 @@ mod tests {
             tools: vec![tool("a"), tool("b")],
             max_tokens: None,
             temperature: None,
+            thinking: None,
         };
         let b = p.body(&req, false);
         // system 数组挂 ephemeral
@@ -476,6 +496,39 @@ mod tests {
             ..req
         };
         assert!(p.body(&empty, false).get("tools").is_none());
+    }
+
+    #[test]
+    fn body_maps_thinking_budget_and_forces_temperature() {
+        let p = AnthropicProvider::new("https://x".into(), "k".into(), "m".into());
+        let base = || super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: Some(0.2),
+            thinking: None,
+        };
+        // 默认关闭：无 thinking 字段，温度保持原值
+        let b = p.body(&base(), false);
+        assert!(b.get("thinking").is_none());
+        let temp = b["temperature"].as_f64().unwrap();
+        assert!((temp - 0.2).abs() < 1e-6, "temperature passthrough");
+        // Medium + 足够 max_tokens：thinking 启用，温度强制 1
+        let mut med = base();
+        med.thinking = Some(super::super::ThinkingLevel::Medium);
+        med.max_tokens = Some(8192);
+        let b = p.body(&med, false);
+        assert_eq!(b["thinking"]["budget_tokens"], 4096);
+        assert_eq!(b["temperature"], 1.0);
+        // max_tokens 不大于 budget：省略 thinking（否则 API 400），温度不变
+        let mut tight = base();
+        tight.thinking = Some(super::super::ThinkingLevel::High);
+        tight.max_tokens = Some(4096);
+        let b = p.body(&tight, false);
+        assert!(b.get("thinking").is_none());
+        let temp = b["temperature"].as_f64().unwrap();
+        assert!((temp - 0.2).abs() < 1e-6, "temperature untouched");
     }
 
     #[test]
