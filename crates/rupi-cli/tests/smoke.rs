@@ -180,6 +180,25 @@ fn chat_quit_exits_zero() {
 }
 
 #[test]
+fn chat_compact_reports_compaction_operation() {
+    // /compact 走 force_compress_with_event：真压实发射 CompactionStart/End，
+    // stderr 可见 [compacting]/[compacted] 进度行（对标上游 compaction operation）。
+    let home = fresh_home();
+    let o = chat_with(
+        &home,
+        &["--no-review", "--compress-keep", "2"],
+        "hi one\nhello two\n/compact\n/quit\n".as_bytes(),
+    );
+    let (_, err) = out_text(&o);
+    assert!(o.status.success(), "chat /compact 非零退出: {o:?}");
+    assert!(err.contains("[compacting]"), "缺压实开始行:\n{err}");
+    assert!(
+        err.contains("[compacted: summarized"),
+        "缺压实结束行:\n{err}"
+    );
+}
+
+#[test]
 fn chat_bare_goto_shows_usage_without_model_call() {
     // 裸 `/goto` 必须本地拦截给用法：stdout 有 usage，且 stdout 无 demo mode
     //（无模型回包=没漏进模型白烧一轮；stderr 的 mock 横幅恒含 demo mode，只能断言 stdout）。

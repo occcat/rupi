@@ -32,6 +32,10 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
             }
         }
         if let Some(d) = &s.skill_draft {
+            if acc.exists(&d.name) {
+                tracing::debug!("[review] skill {} already exists, skip", d.name);
+                continue;
+            }
             match acc.propose(&d.name, &d.description, &d.steps) {
                 Ok(dir) => println!("[review] skill drafted at {}", dir.display()),
                 Err(e) => eprintln!("[review] skill draft skipped: {e:#}"),
@@ -867,6 +871,12 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
                 rupi_core::AgentEvent::MemoryRecall { detail } => {
                     eprintln!("{detail}")
                 }
+                rupi_core::AgentEvent::CompactionStart => {
+                    eprintln!("\n[compacting]…")
+                }
+                rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                    eprintln!("\n[compacted: summarized {summarized}, kept {kept}]")
+                }
                 _ => {}
             },
         )
@@ -1083,7 +1093,15 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         // 手动压实（对标上游 /compact）：阈值外的主动压缩，短历史给反馈不烧模型
         if input == "/compact" {
             let before = session.summary.clone();
-            agent.force_compress(&*provider, &mut session, &mem).await;
+            agent
+                .force_compress_with_event(&*provider, &mut session, &mem, &|e| match e {
+                    rupi_core::AgentEvent::CompactionStart => eprintln!("[compacting]…"),
+                    rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                        eprintln!("[compacted: summarized {summarized}, kept {kept}]")
+                    }
+                    _ => {}
+                })
+                .await;
             if session.summary != before && session.summary.is_some() {
                 println!("[compacted]");
             } else {
@@ -1160,6 +1178,12 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                     }
                     rupi_core::AgentEvent::MemoryRecall { detail } => {
                         println!("{detail}")
+                    }
+                    rupi_core::AgentEvent::CompactionStart => {
+                        println!("\n[compacting]…")
+                    }
+                    rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                        println!("\n[compacted: summarized {summarized}, kept {kept}]")
                     }
                     _ => {}
                 },
@@ -1301,11 +1325,15 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                     }
                     if let Some(d) = &s.skill_draft {
                         let acc = SkillAccumulator::new(home_clone.join("skills"));
-                        match acc.propose(&d.name, &d.description, &d.steps) {
-                            Ok(dir) => {
-                                lines.push(format!("[review] skill drafted at {}", dir.display()))
+                        if acc.exists(&d.name) {
+                            tracing::debug!("[review] skill {} already exists, skip", d.name);
+                        } else {
+                            match acc.propose(&d.name, &d.description, &d.steps) {
+                                Ok(dir) => {
+                                    lines.push(format!("[review] skill drafted at {}", dir.display()))
+                                }
+                                Err(e) => lines.push(format!("[review] skill draft skipped: {e:#}")),
                             }
-                            Err(e) => lines.push(format!("[review] skill draft skipped: {e:#}")),
                         }
                     }
                 }

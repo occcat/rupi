@@ -355,6 +355,12 @@ pub enum AgentEvent {
     MemoryRecall {
         detail: String,
     },
+    /// 压实开始（对标上游 compaction operation 的 `compaction_start`）：真正要调模型
+    /// 做摘要前发射（阈值未命中等跳过路径不发射），前端可借此显示状态而非静默卡住。
+    CompactionStart,
+    /// 压实结束（对标上游 `compaction_end`）：`summarized` 为被摘要的消息数，
+    /// `kept` 为保留的尾部条数。
+    CompactionEnd { summarized: usize, kept: usize },
     Error {
         message: String,
     },

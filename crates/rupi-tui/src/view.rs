@@ -116,6 +116,14 @@ impl ChatView {
             AgentEvent::MemoryRecall { detail } => {
                 self.lines.push(Line::System(detail.clone()));
             }
+            AgentEvent::CompactionStart => {
+                self.lines.push(Line::Tool("◌ compacting …".into()));
+            }
+            AgentEvent::CompactionEnd { summarized, kept } => {
+                self.lines.push(Line::Tool(format!(
+                    "✓ compacted: summarized {summarized}, kept {kept}"
+                )));
+            }
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }
@@ -189,5 +197,19 @@ mod tests {
             v.lines,
             vec![Line::System("🧠 jsonl — recalled 2 memories".into())]
         );
+    }
+
+    #[test]
+    fn compaction_events_render_as_tool_status_lines() {
+        // 压实操作框定：start 转圈行，end 落盘行（含摘要/保留计数）
+        let mut v = ChatView::default();
+        v.push_event(&AgentEvent::CompactionStart);
+        v.push_event(&AgentEvent::CompactionEnd {
+            summarized: 4,
+            kept: 2,
+        });
+        assert_eq!(v.lines.len(), 2);
+        assert!(matches!(&v.lines[0], Line::Tool(s) if s.contains("compacting")));
+        assert!(matches!(&v.lines[1], Line::Tool(s) if s.contains("summarized 4") && s.contains("kept 2")));
     }
 }

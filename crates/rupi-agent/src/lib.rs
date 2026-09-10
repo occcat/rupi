@@ -359,7 +359,8 @@ impl AgentLoop {
     ) -> anyhow::Result<StopReason> {
         session.push(Message::text(Role::User, user_input));
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
-        self.maybe_compress(provider, session, mem).await;
+        self.maybe_compress_with_event(provider, session, mem, on_event)
+            .await;
         // 记忆 + 外部 provider + skill 工具全部暴露给模型
         // （memory/recall 走 mem 路由执行，load_skill/read_resource 走 skills 路由执行）
         let mut all_tools = tools.definitions();
@@ -447,7 +448,8 @@ impl AgentLoop {
                         tracing::warn!(
                             "上下文溢出：强制压实后重发第 {turn} 轮（第 {overflow_recoveries} 次恢复）: {msg}"
                         );
-                        self.force_compress(provider, session, mem).await;
+                        self.force_compress_with_event(provider, session, mem, on_event)
+                            .await;
                         turn -= 1;
                         continue;
                     }
@@ -667,7 +669,8 @@ impl AgentLoop {
             });
             // 轮中压实：大工具结果可能一步冲破阈值，必须在下一轮送模型前摘要，
             // 否则超窗历史先发出去才壓缩（上游 #6879 同修）。
-            self.maybe_compress(provider, session, mem).await;
+            self.maybe_compress_with_event(provider, session, mem, on_event)
+                .await;
             on_event(AgentEvent::TurnEnd {
                 turn,
                 stop_reason: StopReason::Done,
@@ -692,7 +695,20 @@ impl AgentLoop {
         session: &mut SessionTree,
         mem: &MemoryManager,
     ) {
-        self.compress_inner(provider, session, mem, false).await;
+        self.maybe_compress_with_event(provider, session, mem, &|_| {})
+            .await;
+    }
+
+    /// 带事件的 maybe_compress：真正压实才发射 `CompactionStart/End`（跳过路径静默）。
+    pub async fn maybe_compress_with_event(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+    ) {
+        self.compress_inner(provider, session, mem, false, on_event)
+            .await;
     }
 
     /// 强制压实（溢出恢复用）：跳过阈值与“新增不足一窗”检查，只要条数够切就摘要。
@@ -703,7 +719,20 @@ impl AgentLoop {
         session: &mut SessionTree,
         mem: &MemoryManager,
     ) {
-        self.compress_inner(provider, session, mem, true).await;
+        self.force_compress_with_event(provider, session, mem, &|_| {})
+            .await;
+    }
+
+    /// 带事件的 force_compress（手动 /compact 与溢出恢复共用）：语义同上。
+    pub async fn force_compress_with_event(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+    ) {
+        self.compress_inner(provider, session, mem, true, on_event)
+            .await;
     }
 
     async fn compress_inner(
@@ -712,6 +741,7 @@ impl AgentLoop {
         session: &mut SessionTree,
         mem: &MemoryManager,
         force: bool,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
     ) {
         // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的阈值。
         let (threshold_chars, keep_last) = self.compression_for(provider);
@@ -746,6 +776,7 @@ impl AgentLoop {
             .map(|m| m.full_text())
             .collect();
         let through = session.current_path[cut - 1].clone();
+        on_event(AgentEvent::CompactionStart);
         // 先给外部记忆落盘/收尾机会（Hermes on_pre_compress）
         mem.pre_compress_all().await;
 
@@ -790,6 +821,10 @@ impl AgentLoop {
         let mut summary = summary;
         summary.push_str(&format_file_operations(&read_files, &modified_files));
         session.set_summary(summary, through);
+        on_event(AgentEvent::CompactionEnd {
+            summarized: cut,
+            kept: keep_last,
+        });
         tracing::info!("session compressed: {total} msgs, kept last {keep_last}");
     }
 
@@ -1201,6 +1236,53 @@ mod tests {
             )
             .await;
         assert_eq!(session.summary.as_deref(), Some("SUM3"));
+    }
+
+    #[tokio::test]
+    async fn compress_with_event_frames_compaction_operation() {
+        // 对标上游 compaction_start/end：真压实发射起止事件（6 条压前 4 留后 2），
+        // 跳过路径（阈值未命中）静默无事件。
+        use std::sync::Mutex;
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let mut session = SessionTree::new();
+        for i in 0..6 {
+            session.push(Message::text(
+                Role::User,
+                format!("long message number {i} with padding xxxxxxxxxx"),
+            ));
+        }
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-compev-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let seen = Mutex::new(Vec::<AgentEvent>::new());
+        agent
+            .force_compress_with_event(
+                &MockProvider::new(vec![MockProvider::text_response("SUM")]),
+                &mut session,
+                &mem,
+                &|e| seen.lock().unwrap().push(e),
+            )
+            .await;
+        let events: Vec<AgentEvent> = seen.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], AgentEvent::CompactionStart));
+        match &events[1] {
+            AgentEvent::CompactionEnd { summarized, kept } => {
+                assert_eq!((*summarized, *kept), (4, 2));
+            }
+            other => panic!("expected CompactionEnd, got {other:?}"),
+        }
+        // 跳过路径：阈值 MAX 的 maybe 不发射任何事件
+        let seen2 = Mutex::new(Vec::<AgentEvent>::new());
+        agent
+            .maybe_compress_with_event(
+                &MockProvider::new(vec![MockProvider::text_response("UNUSED")]),
+                &mut session,
+                &mem,
+                &|e| seen2.lock().unwrap().push(e),
+            )
+            .await;
+        assert!(seen2.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1804,7 +1886,7 @@ mod tests {
             "RUNBOOK-SECRET-SAUCE",
         )
         .unwrap();
-        let skills = SkillRegistry::discover(&[base.clone()]);
+        let skills = SkillRegistry::discover(std::slice::from_ref(&base));
         // 模型能看见两个工具 schema
         let defs = skills.tool_definitions();
         assert!(defs.iter().any(|d| d.name == "load_skill"));

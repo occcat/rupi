@@ -319,9 +319,21 @@ async fn run_loop(
                     }
                     Builtin::Compact => {
                         let before = ctx.session.summary.clone();
+                        let buffered =
+                            std::sync::Mutex::new(Vec::<rupi_core::AgentEvent>::new());
                         ctx.agent
-                            .force_compress(&**ctx.provider, ctx.session, ctx.mem)
+                            .force_compress_with_event(
+                                &**ctx.provider,
+                                ctx.session,
+                                ctx.mem,
+                                &|e| {
+                                    buffered.lock().unwrap().push(e);
+                                },
+                            )
                             .await;
+                        for e in buffered.lock().unwrap().drain(..) {
+                            view.push_event(&e);
+                        }
                         if ctx.session.summary != before && ctx.session.summary.is_some() {
                             view.push_system("[compacted]".into());
                         } else {
