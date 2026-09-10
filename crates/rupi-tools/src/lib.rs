@@ -75,6 +75,80 @@ impl ToolRegistry {
         r.register(Arc::new(BashTool));
         r
     }
+
+    /// 沙箱四件套：read/write/edit 的 `path` 约束在 `root` 内（bash/mcp/扩展进程不在此层约束）。
+    pub fn with_sandboxed_builtins(root: &std::path::Path) -> Self {
+        let root = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf());
+        let mut r = Self::new();
+        r.register(Arc::new(SandboxedTool::new(Arc::new(ReadTool), root.clone())));
+        r.register(Arc::new(SandboxedTool::new(Arc::new(WriteTool), root.clone())));
+        r.register(Arc::new(SandboxedTool::new(Arc::new(EditTool), root.clone())));
+        r.register(Arc::new(BashTool));
+        r
+    }
+}
+
+/// 工作区沙箱守卫：`path` 参数解析（相对→root 下，绝对→原样），canonicalize 消解
+/// `..` 与符号链接后必须仍在 `root` 内，否则拒绝执行。缺 `path` 参数透传给内层判错。
+pub struct SandboxedTool {
+    inner: Arc<dyn Tool>,
+    root: std::path::PathBuf,
+}
+
+impl SandboxedTool {
+    pub fn new(inner: Arc<dyn Tool>, root: std::path::PathBuf) -> Self {
+        Self { inner, root }
+    }
+
+    /// root（canonicalize 过的绝对路径），供调用方展示。
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    fn resolve(&self, path: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(path);
+        let joined = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        };
+        // 存在文件直接 canonicalize；新建文件则 canonicalize 父目录后拼回文件名
+        if let Ok(c) = joined.canonicalize() {
+            return Some(c);
+        }
+        let parent = joined.parent()?;
+        let c = parent.canonicalize().ok()?;
+        Some(c.join(joined.file_name()?))
+    }
+}
+
+#[async_trait]
+impl Tool for SandboxedTool {
+    fn definition(&self) -> ToolDefinition {
+        self.inner.definition()
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        let mut arguments = arguments;
+        if let Some(path) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+        {
+            match self.resolve(&path) {
+                // 放行并改写为绝对路径：内层不再依赖进程 cwd，结果稳定
+                Some(c) if c.starts_with(&self.root) => {
+                    arguments["path"] = serde_json::Value::String(c.to_string_lossy().into_owned());
+                }
+                _ => {
+                    return Ok(ToolOutput::err(format!(
+                        "path escapes workspace root ({}): {path}",
+                        self.root.display()
+                    )))
+                }
+            }
+        }
+        self.inner.execute(arguments).await
+    }
 }
 
 // ---- builtins ----
@@ -281,7 +355,7 @@ impl Tool for BashTool {
 /// 工具回包有界：超限保留首尾、中部折叠并标注截掉字符数，保上下文窗口不被大输出撑爆。
 pub const MAX_TOOL_OUTPUT: usize = 12_000;
 
-fn truncate_middle(s: &str, limit: usize) -> String {
+pub fn truncate_middle(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
     }
@@ -390,5 +464,55 @@ mod tests {
             .unwrap();
         assert!(slow.is_error);
         assert!(slow.content.contains("timed out after 1s"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_blocks_escapes_allows_inside() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("rupi-sbx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner.txt"), "inner").unwrap();
+        let r = ToolRegistry::with_sandboxed_builtins(&root);
+        // 内部相对路径读写正常
+        let ok = r
+            .execute("read", serde_json::json!({"path": "sub/inner.txt"}))
+            .await
+            .unwrap();
+        assert!(!ok.is_error, "{}", ok.content);
+        // `..` 逃逸拒绝
+        let esc = r
+            .execute("read", serde_json::json!({"path": "../nope.txt"}))
+            .await
+            .unwrap();
+        assert!(esc.is_error);
+        assert!(esc.content.contains("escapes workspace root"));
+        // 绝对路径逃逸拒绝
+        let abs = r
+            .execute(
+                "write",
+                serde_json::json!({"path": "/tmp/rupi-sbx-outside.txt", "content": "x"}),
+            )
+            .await
+            .unwrap();
+        assert!(abs.is_error);
+        // 符号链接逃逸拒绝
+        symlink("/tmp", root.join("sub/link")).unwrap();
+        let link = r
+            .execute("read", serde_json::json!({"path": "sub/link/nope.txt"}))
+            .await
+            .unwrap();
+        assert!(link.is_error);
+        // 不存在的新文件（父目录在内）放行，由内层 write 正常创建
+        let fresh = r
+            .execute(
+                "write",
+                serde_json::json!({"path": "sub/fresh.txt", "content": "new"}),
+            )
+            .await
+            .unwrap();
+        assert!(!fresh.is_error, "{}", fresh.content);
+        assert!(!std::path::Path::new("/tmp/rupi-sbx-outside.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -161,6 +161,21 @@ fn skill_dirs(home: &PathBuf) -> Vec<PathBuf> {
     ]
 }
 
+/// 工作区沙箱根：启动时 cwd（canonicalize 消解符号链接），read/write/edit 约束其内。
+fn sandbox_root() -> PathBuf {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 沙箱工具表：文件工具约束在工作区内，相对路径按 root 解析（subagent 克隆继承）。
+fn sandboxed_tools() -> ToolRegistry {
+    let root = sandbox_root();
+    println!("[sandbox workspace: {}]", root.display());
+    ToolRegistry::with_sandboxed_builtins(&root)
+}
+
 fn ext_dir(home: &PathBuf, cli: &Cli) -> PathBuf {
     cli.ext_dir
         .clone()
@@ -481,7 +496,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }),
         );
     }
-    let mut tools = ToolRegistry::with_builtins();
+    let mut tools = sandboxed_tools();
     // MCP-Direct：spawn 各 server 并把远端工具注册为原生工具（失败只 warning，不断主循环）
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
@@ -661,7 +676,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
-    let mut tools = ToolRegistry::with_builtins();
+    let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
         let configs = rupi_mcp::load_configs(path)?;
         let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
