@@ -1493,7 +1493,6 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tracing",
- "walkdir",
 ]
 
 [[package]]

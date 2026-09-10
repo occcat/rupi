@@ -16,6 +16,9 @@ pub struct SkillMetadata {
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub dir: PathBuf,
+    /// 实际入口文件：常规为 `SKILL.md`，根 `.md` 回退时为对应的 `.md` 文件。
+    /// `load_skill` 的 location 必须指真实文件，否则模型按址取不到内容。
+    pub entry: PathBuf,
     pub meta: SkillMetadata,
     /// SKILL.md 全文（body 部分，不含 frontmatter）
     pub instructions: String,
@@ -24,19 +27,71 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// 解析单个 skill 目录。校验 name/description 约束（小写-数字-连字符，≤64/≤1024）。
+    /// 解析单个 skill 目录。校验 name/description 约束（小写-数字-连字符，≤64/≤1024 字符）。
+    /// description 按字符计数（中文场景按字节算会把上限压到 1/3）。
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        let md_path = dir.join("SKILL.md");
-        let raw = std::fs::read_to_string(&md_path)?;
+        Self::load_file(&dir.join("SKILL.md"))
+    }
+
+    /// 从任意 `.md` 文件解析 skill（对标上游根 `.md` 回退）：frontmatter 缺 name 时
+    /// 回退父目录名；缺 description（或空）则拒绝——无 description 无法 advertise。
+    pub fn load_file(md_path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(md_path)?;
         let (front, body) = split_frontmatter(&raw)?;
-        let meta: SkillMetadata = serde_yaml::from_str(&front)?;
-        validate_name(&meta.name)?;
-        if meta.description.is_empty() || meta.description.len() > 1024 {
+        #[derive(serde::Deserialize)]
+        struct Front {
+            name: Option<String>,
+            description: Option<String>,
+            license: Option<String>,
+            compatibility: Option<String>,
+        }
+        let front: Front = serde_yaml::from_str(&front)?;
+        let dir = md_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let name = match front.name.filter(|n| !n.is_empty()) {
+            Some(n) => n,
+            None => dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow::anyhow!("skill name missing and parent dir has no name"))?
+                .to_string(),
+        };
+        let description = match front.description.filter(|d| !d.trim().is_empty()) {
+            Some(d) => d,
+            None => anyhow::bail!("skill description must be 1..=1024 chars"),
+        };
+        Self::assemble(
+            dir,
+            md_path.to_path_buf(),
+            name,
+            description,
+            body,
+            front.license,
+            front.compatibility,
+        )
+    }
+
+    fn assemble(
+        dir: PathBuf,
+        entry: PathBuf,
+        name: String,
+        description: String,
+        body: String,
+        license: Option<String>,
+        compatibility: Option<String>,
+    ) -> anyhow::Result<Self> {
+        validate_name(&name)?;
+        if description.is_empty() || description.chars().count() > 1024 {
             anyhow::bail!("skill description must be 1..=1024 chars");
         }
         Ok(Self {
-            dir: dir.to_path_buf(),
-            meta,
+            dir: dir.clone(),
+            entry,
+            meta: SkillMetadata {
+                name,
+                description,
+                license,
+                compatibility,
+            },
             instructions: body,
             has_scripts: dir.join("scripts").exists(),
             has_references: dir.join("references").exists(),
@@ -99,34 +154,120 @@ impl SkillRegistry {
     }
 
     /// 重扫目录并原地替换，返回 skill 数量。失败的目录只 warning（与初次发现同语义）。
+    ///
+    /// 发现规则对标上游 `loadSkillsFromDirInternal`：含 `SKILL.md` 的目录即视为
+    /// skill 根，不再下钻（skill 内部 `references/*.md` 不会被误收）；否则递归子目录
+    /// （不限深度，支持 `base/group/<skill>/SKILL.md` 分组嵌套）；仅顶层直接 `.md`
+    /// 子文件可回退为 skill（有 frontmatter description 才收，无则静默跳过）。
+    /// 条目按文件名排序，保证同名去重（先发现者胜）跨次稳定。
+    /// 已知差距：上游按 `.gitignore/.ignore/.fdignore` 逐目录过滤，本实现暂只跳过
+    /// 点文件与 `node_modules`（skills 多为专用目录，ignore 文件罕见；全量 gitignore
+    /// 语义需引入 `ignore` crate，后续补）。
     pub fn refresh(&self, dirs: &[PathBuf]) -> usize {
-        let mut skills = vec![];
+        let mut skills: Vec<Skill> = vec![];
+        let mut seen_files = std::collections::HashSet::new();
+        let mut seen_dirs = std::collections::HashSet::new();
         for base in dirs {
             if !base.exists() {
                 continue;
             }
-            for entry in walkdir::WalkDir::new(base)
-                .max_depth(2)
-                .into_iter()
-                .flatten()
-            {
-                let p = entry.path();
-                if p.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
-                    if let Some(dir) = p.parent() {
-                        match Skill::load(dir) {
-                            Ok(s) => skills.push(s),
-                            Err(e) => tracing::warn!("skip skill {}: {e:#}", dir.display()),
-                        }
-                    }
-                }
-            }
+            Self::visit(base, base, true, &mut skills, &mut seen_files, &mut seen_dirs, 0);
         }
-        // 同名去重：先发现者胜
+        // 同名去重：先发现者胜；后来者记 warning（对标上游 collision diagnostic）。
         let mut seen = std::collections::HashSet::new();
-        skills.retain(|s| seen.insert(s.meta.name.clone()));
+        let mut collisions = vec![];
+        skills.retain(|s| {
+            if seen.insert(s.meta.name.clone()) {
+                true
+            } else {
+                collisions.push(format!("{} at {}", s.meta.name, s.entry.display()));
+                false
+            }
+        });
+        for c in collisions {
+            tracing::warn!("skill name collision, keeping first: {c}");
+        }
         let n = skills.len();
         *self.skills.write().unwrap() = skills;
         n
+    }
+
+    /// 递归扫描单个目录。`root` 为本次 base（算相对路径用），`include_root_files`
+    /// 仅顶层为真。目录 symlink 跟随进入，但 canonical 目录去重（防环＋同一 skill
+    /// 经 symlink 多路径到达只收一次）；断链 symlink 的 `is_file/is_dir` 为假，天然跳过。
+    fn visit(
+        dir: &Path,
+        root: &Path,
+        include_root_files: bool,
+        out: &mut Vec<Skill>,
+        seen_files: &mut std::collections::HashSet<PathBuf>,
+        seen_dirs: &mut std::collections::HashSet<PathBuf>,
+        depth: usize,
+    ) {
+        if depth > 32 {
+            tracing::warn!("skill scan too deep, stop at {}", dir.display());
+            return;
+        }
+        let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !seen_dirs.insert(canon_dir) {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(rd) => {
+                let mut v: Vec<_> = rd.flatten().collect();
+                v.sort_by_key(|a| a.file_name());
+                v
+            }
+            Err(e) => {
+                tracing::warn!("skip skill dir {}: {e:#}", dir.display());
+                return;
+            }
+        };
+        // skill 根优先：本目录有 SKILL.md 则收后即返，不再下钻。
+        if let Some(md) = entries
+            .iter()
+            .find(|e| e.file_name().to_str() == Some("SKILL.md"))
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+        {
+            Self::collect(out, seen_files, root, &md, true);
+            return;
+        }
+        for e in &entries {
+            let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                Self::visit(&p, root, false, out, seen_files, seen_dirs, depth + 1);
+            } else if include_root_files && p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
+                Self::collect(out, seen_files, root, &p, false);
+            }
+        }
+    }
+
+    /// 收单个 `.md` 为 skill：canonical 文件去重；`declared`（SKILL.md）失败记 warn，
+    /// 根 `.md` 回退失败只记 debug（普通 md 本来就不是 skill，不应噪音）。
+    fn collect(
+        out: &mut Vec<Skill>,
+        seen_files: &mut std::collections::HashSet<PathBuf>,
+        _root: &Path,
+        md: &Path,
+        declared: bool,
+    ) {
+        match Skill::load_file(md) {
+            Ok(s) => {
+                let canon = md.canonicalize().unwrap_or_else(|_| md.to_path_buf());
+                if seen_files.insert(canon) {
+                    out.push(s);
+                }
+            }
+            Err(e) if declared => tracing::warn!("skip skill {}: {e:#}", md.display()),
+            Err(e) => tracing::debug!("skip non-skill md {}: {e:#}", md.display()),
+        }
     }
 
     /// 系统提示索引块（阶段 1）。
@@ -151,7 +292,7 @@ impl SkillRegistry {
         self.skills.read().unwrap().iter().find(|s| s.meta.name == name).map(|s| {
             format!(
                 "<skill name=\"{name}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-                s.dir.join("SKILL.md").display(),
+                s.entry.display(),
                 s.dir.display(),
                 s.instructions,
             )
@@ -229,6 +370,13 @@ impl SkillAccumulator {
         Self { dest_dir }
     }
 
+    /// 同名 skill 是否已存在。调用方（review 落盘）在 propose 前预检：已存在即静默
+    /// 跳过，避免每轮重复打印 `skill draft skipped` 噪音；propose 内仍保留拒绝
+    /// 检查（防 TOCTOU，显式 `skill-distill` 命令走 Err 语义不变）。
+    pub fn exists(&self, name: &str) -> bool {
+        self.dest_dir.join(name).exists()
+    }
+
     /// 启发式提炼：调用者传入“任务描述 + 关键步骤”，生成符合规范的 SKILL.md。
     /// 落盘前校验：description 压成单行且 1..=1024 字符（否则写出的 frontmatter 下次发现即跳过），
     /// steps 非空（空流程没有复用价值），超 50 步截断。
@@ -240,7 +388,7 @@ impl SkillAccumulator {
     ) -> anyhow::Result<PathBuf> {
         validate_name(name)?;
         let description: String = description.split_whitespace().collect::<Vec<_>>().join(" ");
-        if description.is_empty() || description.len() > 1024 {
+        if description.is_empty() || description.chars().count() > 1024 {
             anyhow::bail!("skill description must be 1..=1024 chars");
         }
         if steps.is_empty() {
@@ -284,7 +432,7 @@ mod tests {
             "---\nname: demo-skill\ndescription: do demo things\n---\n\n# Demo\nDo X.\n",
         )
         .unwrap();
-        let reg = SkillRegistry::discover(&[base.clone()]);
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
         assert_eq!(reg.len(), 1);
         assert!(reg.index_block().contains("demo-skill"));
         assert!(reg.load_skill("demo-skill").unwrap().contains("Do X"));
@@ -323,7 +471,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("rupi-skill-tools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let empty = SkillRegistry::discover(&[base.clone()]);
+        let empty = SkillRegistry::discover(std::slice::from_ref(&base));
         assert!(empty.tool_definitions().is_empty());
         let dir = base.join("res");
         std::fs::create_dir_all(dir.join("references")).unwrap();
@@ -333,7 +481,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("references").join("deep.md"), "DEEP-KNOWLEDGE").unwrap();
-        let reg = SkillRegistry::discover(&[base.clone()]);
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
         let defs = reg.tool_definitions();
         assert_eq!(defs.len(), 2);
         assert!(defs.iter().all(|d| d.prompt_snippet.is_some()));
@@ -373,7 +521,7 @@ mod tests {
             .unwrap();
         let raw = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
         assert!(raw.contains("line one line two"));
-        let reg = SkillRegistry::discover(&[base.clone()]);
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
         assert!(reg.load_skill("multiline-desc").is_some());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -383,7 +531,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("rupi-skill-ref-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let reg = SkillRegistry::discover(&[base.clone()]);
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
         assert_eq!(reg.len(), 0);
         assert!(reg.index_block().is_empty());
         // 会话中途新增 skill：refresh 后立即可见（自积累闭环）
@@ -394,7 +542,7 @@ mod tests {
             "---\nname: fresh-skill\ndescription: just arrived\n---\n\n# Fresh\nGo.\n",
         )
         .unwrap();
-        assert_eq!(reg.refresh(&[base.clone()]), 1);
+        assert_eq!(reg.refresh(std::slice::from_ref(&base)), 1);
         assert!(reg.index_block().contains("fresh-skill"));
         assert!(reg.load_skill("fresh-skill").unwrap().contains("Go."));
         let _ = std::fs::remove_dir_all(&base);
@@ -431,6 +579,93 @@ mod tests {
             reg.read_resource("link-skill", "references/ok").unwrap(),
             "DEEP-KNOWLEDGE"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn discovery_supports_nested_groups_and_root_md_fallback() {
+        // 对标上游：分组嵌套 base/group/<skill>/SKILL.md 可发现；顶层根 .md
+        // 有 description 回退为 skill，无 description 静默跳过；skill 目录为终端，
+        // 其内部 references/*.md 与嵌套 SKILL.md 不得被误收。
+        let base = std::env::temp_dir().join(format!("rupi-skill-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let grouped = base.join("group").join("deep-skill");
+        std::fs::create_dir_all(grouped.join("references")).unwrap();
+        std::fs::write(
+            grouped.join("SKILL.md"),
+            "---\nname: deep-skill\ndescription: nested skill\n---\n\n# Deep\nGo deep.\n",
+        )
+        .unwrap();
+        std::fs::write(grouped.join("references").join("notes.md"), "just notes").unwrap();
+        std::fs::write(
+            grouped.join("references").join("SKILL.md"),
+            "---\nname: fake-inner\ndescription: must not load\n---\n\n# Fake\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("standalone.md"),
+            "---\nname: root-note\ndescription: top-level md fallback\n---\n\n# Root\nHi.\n",
+        )
+        .unwrap();
+        std::fs::write(base.join("plain.md"), "# no frontmatter, not a skill\n").unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        assert_eq!(reg.len(), 2);
+        assert!(reg.load_skill("deep-skill").unwrap().contains("Go deep."));
+        let root = reg.load_skill("root-note").expect("root md fallback");
+        assert!(root.contains("Hi."));
+        assert!(root.contains("standalone.md"), "{root}");
+        assert!(reg.load_skill("fake-inner").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn skill_name_falls_back_to_parent_dir() {
+        // frontmatter 缺 name：回退父目录名（对标上游 parentDirName）；缺 description 仍拒绝。
+        let base = std::env::temp_dir().join(format!("rupi-skill-noname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("fallback-name");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\ndescription: nameless but describable\n---\n\n# Body\nContent.\n",
+        )
+        .unwrap();
+        let sk = Skill::load(&dir).expect("name fallback");
+        assert_eq!(sk.meta.name, "fallback-name");
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        assert!(reg.load_skill("fallback-name").is_some());
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: fallback-name\n---\n\n# Body\nNo description.\n",
+        )
+        .unwrap();
+        assert!(Skill::load(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn description_limit_counts_chars_not_bytes() {
+        // 400 中文字符 ≈1200 字节：按字节算会被误杀，按字符算应通过。
+        let base = std::env::temp_dir().join(format!("rupi-skill-cjk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let acc = SkillAccumulator::new(base.clone());
+        let desc = "中".repeat(400);
+        let dir = acc.propose("cjk-skill", &desc, &["do it".into()]).expect("CJK 400 字应通过");
+        assert!(dir.join("SKILL.md").exists());
+        assert!(acc.propose("cjk-too-long", &"中".repeat(2000), &["do it".into()]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn accumulator_exists_precheck_avoids_noisy_repropose() {
+        // review 落盘预检：已存在即跳过，不再走到 propose 的 Err 分支打印噪音。
+        let base = std::env::temp_dir().join(format!("rupi-skill-exists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let acc = SkillAccumulator::new(base.clone());
+        assert!(!acc.exists("dup-skill"));
+        acc.propose("dup-skill", "first write", &["step".into()]).unwrap();
+        assert!(acc.exists("dup-skill"));
+        assert!(!acc.exists("other-skill"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
