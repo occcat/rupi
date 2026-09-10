@@ -128,7 +128,7 @@ impl MemoryStore {
     }
 
     /// 容量压实（Hermes auto-consolidation 的确定性底层）：超限时按行丢最旧、保最新；
-    /// 单行超长才按字节截尾。读路径与写路径共用，不变量：输出永远 ≤ limit（+ 一行标记）。
+    /// 单行超长才按字符截尾。读路径与写路径共用，不变量：输出永远 ≤ limit（+ 一行标记）。
     fn fit_to_limit(content: &str, limit: usize) -> String {
         if content.len() <= limit {
             return content.to_string();
@@ -150,10 +150,10 @@ impl MemoryStore {
         if content.ends_with('\n') {
             out.push('\n');
         }
-        // 极端：单行即超限
+        // 极端：单行即超限（按字符截尾；字节切片会切断 UTF-8 导致 panic）
         if out.len() > limit + 128 {
-            let start = out.len() - limit;
-            out = format!("...[truncated]\n{}", &out[start..]);
+            let tail: String = out.chars().rev().take(limit).collect();
+            out = format!("...[truncated]\n{}", tail.chars().rev().collect::<String>());
         }
         out
     }
@@ -877,6 +877,16 @@ mod tests {
         assert!(frozen.memory.contains("tea"));
         assert!(!frozen.memory.contains("coffee"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fit_to_limit_never_panics_on_multibyte_tail() {
+        // 单行 6000 个 CJK 字符：旧字节切片会在字符中间切断而 panic
+        let line: String = "中".repeat(6000);
+        let out = MemoryStore::fit_to_limit(&line, 5000);
+        assert!(out.starts_with("...[truncated]"));
+        assert!(out.ends_with('中'));
+        assert!(out.chars().count() <= 5000 + 32);
     }
 
     #[test]
