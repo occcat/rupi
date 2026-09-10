@@ -59,6 +59,24 @@ impl Drop for Guard {
     }
 }
 
+/// TUI 内审批器：Ask 裁决时暂停全屏 UI 回主屏问一句 `[y/N]`，默认拒绝。
+/// 与 REPL 的 `TerminalApprover` 同语义；失败（无 TTY / 读不到行）一律拒绝。
+pub struct TuiApprover;
+impl rupi_agent::Approver for TuiApprover {
+    fn approve(&self, tool: &str, args: &serde_json::Value, reason: &str) -> bool {
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        eprintln!("[approve] {tool} {args} — {reason} [y/N]");
+        let mut line = String::new();
+        let ok = std::io::stdin().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
+        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = enable_raw_mode();
+        ok
+    }
+}
+
 /// 启动 TUI（async：在现有 tokio runtime 内跑）。非 TTY 直接报错，调用方回落 REPL。
 pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
     if !crossterm::tty::IsTty::is_tty(&std::io::stdin()) {

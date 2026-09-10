@@ -548,9 +548,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     };
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
-    // TUI 内无 stdin 审批：Ask 一律拒绝；plan mode 同 REPL
+    // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     agent = agent
         .with_policy(Arc::new(default_policy()))
+        .with_approver(Arc::new(rupi_tui::TuiApprover))
         .with_plan_mode(cli.plan);
     if cli.subagents {
         let sub = SubagentTool::new(
