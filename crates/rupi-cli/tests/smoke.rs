@@ -136,23 +136,52 @@ fn no_memory_run_still_works() {
     assert!(out.contains("demo mode"));
 }
 
-#[test]
-fn chat_quit_exits_zero() {
-    let home = fresh_home();
+/// chat 子进程：全局 flag 在子命令前，stdin 喂整段输入后 EOF。
+fn chat_with(home: &Path, global: &[&str], input: &[u8]) -> Output {
+    let mut args: Vec<&str> = global.to_vec();
+    args.push("chat");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rupi"));
     child
-        .env("RUPI_HOME", &home)
-        .current_dir(&home)
-        .arg("chat")
+        .env("RUPI_HOME", home)
+        .current_dir(home)
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("RUPI_API_KEY")
         .env_remove("OPENAI_API_KEY");
     let mut child = child.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"/quit\n").unwrap();
-    let o = child.wait_with_output().unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn chat_quit_exits_zero() {
+    let home = fresh_home();
+    let o = chat_with(&home, &[], b"/quit\n");
     assert!(o.status.success(), "chat /quit 非零退出: {o:?}");
+}
+
+#[test]
+fn heuristic_review_on_by_default_no_review_opts_out() {
+    // 默认启发式复盘：“请记住”触发 memory 建议并打印；--no-review 关闭后无声。
+    let home = fresh_home();
+    let o = chat_with(&home, &[], "请记住我爱喝乌龙茶\n/quit\n".as_bytes());
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "chat 非零退出: {o:?}");
+    assert!(
+        out.contains("[review] memory add"),
+        "默认复盘未建议:\n{out}"
+    );
+    let home2 = fresh_home();
+    let o = chat_with(
+        &home2,
+        &["--no-review"],
+        "请记住我爱喝乌龙茶\n/quit\n".as_bytes(),
+    );
+    let (out2, _) = out_text(&o);
+    assert!(o.status.success(), "--no-review chat 非零退出: {o:?}");
+    assert!(!out2.contains("[review]"), "--no-review 仍有复盘:\n{out2}");
 }
 
 #[test]

@@ -57,9 +57,12 @@ struct Cli {
     /// MCP server 配置 JSON 文件（数组）：[{"name":..,"command":..,"args":[..],"env":{..}}]
     #[arg(long)]
     mcp_config: Option<PathBuf>,
-    /// 每轮结束后后台 review，给出记忆/Skill 沉淀建议
+    /// 每轮结束后后台 review，给出记忆/Skill 沉淀建议（默认已开启启发式复盘，此 flag 保留兼容）
     #[arg(long, default_value_t = false)]
     review: bool,
+    /// 关闭默认开启的每轮启发式复盘（--review-llm 的模型复盘不受此影响，需显式传才开）
+    #[arg(long, default_value_t = false)]
+    no_review: bool,
     /// 把 review 建议直接落盘（memory add + skill 草稿）
     #[arg(long, default_value_t = false)]
     review_apply: bool,
@@ -109,6 +112,15 @@ struct Cli {
     /// 对标 Hermes memory_enabled=false；显式记忆子命令与外部 provider 不受影响）
     #[arg(long, default_value_t = false)]
     no_memory: bool,
+}
+
+impl Cli {
+    /// 后台复盘总开关：离开启发式默认开启（空建议零打扰，非空才打印）；
+    /// `--review` 是旧显式开关，保留兼容；`--no-review` 关闭。
+    /// 落盘仍需 `--review-apply` 显式授权（无自主写盘，对标 Hermes write_approval 精神）。
+    fn review_enabled(&self) -> bool {
+        !self.no_review || self.review
+    }
 }
 
 #[derive(Subcommand)]
@@ -708,10 +720,10 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }
-    // 后台 review（与 chat 同语义）：--review 只建议，--review-apply 直接落盘
+    // 后台 review（与 chat 同语义）：默认启发式复盘，非空建议打印，--review-apply 直接落盘
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
-    if cli.review || cli.review_apply {
+    if cli.review_enabled() {
         let pending_clone = pending.clone();
         let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
             Arc::new(rupi_agent::LlmReviewer::new(provider.clone()))
@@ -800,7 +812,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[thinking] level: {t:?}");
         agent = agent.with_thinking(t);
     }
-    if cli.review || cli.review_apply {
+    if cli.review_enabled() {
         let pending_clone = pending.clone();
         // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
         let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
@@ -1104,8 +1116,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }
-    let review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>> = if cli.review || cli.review_apply
-    {
+    let review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>> = if cli.review_enabled() {
         Some(Arc::new(std::sync::Mutex::new(vec![])))
     } else {
         None
