@@ -16,13 +16,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-/// MCP server 配置：一条命令 + 参数 + 可选环境变量。
+/// MCP server 配置：stdio 是一条命令 + 参数 + 可选环境变量；
+/// StreamableHTTP 是 `url`（`command` 可空，`spawn_all` 按有无 url 分流）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// StreamableHTTP 端点（`POST /mcp` 这类完整 URL）；`None` 走 stdio。
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 impl McpServerConfig {
@@ -32,6 +36,7 @@ impl McpServerConfig {
             command: command.into(),
             args,
             env: HashMap::new(),
+            url: None,
         }
     }
 }
@@ -123,16 +128,69 @@ pub fn sanitize_params(
 
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>;
 
-/// MCP stdio 桥：拥有子进程 + JSON-RPC 路由（requestId 自增、30s 超时、退出清理）。
+/// 从 SSE 流体里挑出与本次请求 id 相符的 JSON-RPC 消息（纯函数，可单测）。
+/// 空行分块、`data:` 行拼 JSON；带 `method` 的 server 请求跳过（HTTP 侧无 GET 常驻流可应答）。
+fn parse_sse_response(body: &str, id: i64) -> Option<serde_json::Value> {
+    let mut data_lines: Vec<&str> = vec![];
+    let flush = |data_lines: &mut Vec<&str>| -> Option<serde_json::Value> {
+        if data_lines.is_empty() {
+            return None;
+        }
+        let raw = data_lines.join("\n");
+        data_lines.clear();
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        if v.get("method").is_some() {
+            return None;
+        }
+        if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
+            Some(v)
+        } else {
+            None
+        }
+    };
+    let mut found = None;
+    for line in body.lines().chain(std::iter::once("")) {
+        let t = line.trim();
+        if t.is_empty() {
+            if let Some(v) = flush(&mut data_lines) {
+                found = Some(v);
+                break;
+            }
+            continue;
+        }
+        if t == ": ping" || t.starts_with(':') {
+            continue;
+        }
+        if let Some(payload) = t.strip_prefix("data:") {
+            data_lines.push(payload.trim());
+        }
+    }
+    found
+}
+
+/// 传输层：stdio（子进程，server→client 请求可应答）或
+/// StreamableHTTP（POST + JSON 或 SSE 回包，无 GET 常驻流）。
+enum Transport {
+    Stdio {
+        pending: PendingMap,
+        stdin: Arc<Mutex<ChildStdin>>,
+        _child: Child,
+        _reader_task: tokio::task::JoinHandle<()>,
+        _stderr_task: tokio::task::JoinHandle<()>,
+    },
+    Http {
+        client: reqwest::Client,
+        url: String,
+        session_id: Mutex<Option<String>>,
+    },
+}
+
+/// MCP 桥：拥有传输 + JSON-RPC 路由（requestId 自增、30s 超时、退出清理）。
 pub struct McpBridge {
     pub config: McpServerConfig,
     pub roots: Vec<McpRoot>,
     next_id: AtomicI64,
-    pending: PendingMap,
-    stdin: Arc<Mutex<ChildStdin>>,
-    _child: Child,
-    _reader_task: tokio::task::JoinHandle<()>,
-    _stderr_task: tokio::task::JoinHandle<()>,
+    transport: Transport,
 }
 
 impl McpBridge {
@@ -210,25 +268,57 @@ impl McpBridge {
             config,
             roots: roots_route.clone(),
             next_id: AtomicI64::new(1),
-            pending,
-            stdin: stdin_route,
-            _child: child,
-            _reader_task: reader_task,
-            _stderr_task: stderr_task,
+            transport: Transport::Stdio {
+                pending,
+                stdin: stdin_route,
+                _child: child,
+                _reader_task: reader_task,
+                _stderr_task: stderr_task,
+            },
         };
-        bridge
-            .call(
-                "initialize",
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"roots": {"listChanged": false}},
-                    "clientInfo": {"name": "rupi", "version": "0.1.0"}
-                }),
-            )
+        bridge.handshake().await?;
+        Ok(bridge)
+    }
+
+    /// 建连握手（传输无关）：`initialize` + `notifications/initialized`。
+    async fn handshake(&self) -> anyhow::Result<()> {
+        self.call(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"roots": {"listChanged": false}},
+                "clientInfo": {"name": "rupi", "version": "0.1.0"}
+            }),
+        )
+        .await?;
+        self.notify("notifications/initialized", serde_json::json!({}))
             .await?;
-        bridge
-            .notify("notifications/initialized", serde_json::json!({}))
-            .await?;
+        Ok(())
+    }
+
+    /// StreamableHTTP 建连：`config.url` 做 POST initialize 握手，session id 走 header 保持。
+    ///
+    /// 已知局限：server→client 请求（roots/ping）只在 stdio 侧应答；
+    /// HTTP server 若反向请求 roots，会在其侧超时——工具/资源/提示正向调用不受影响。
+    pub async fn spawn_http(config: McpServerConfig) -> anyhow::Result<Self> {
+        let url = config
+            .url
+            .clone()
+            .context("MCP http transport requires config.url")?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let bridge = Self {
+            config,
+            roots: vec![McpRoot::cwd()],
+            next_id: AtomicI64::new(1),
+            transport: Transport::Http {
+                client,
+                url,
+                session_id: Mutex::new(None),
+            },
+        };
+        bridge.handshake().await?;
         Ok(bridge)
     }
 
@@ -238,19 +328,38 @@ impl McpBridge {
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        match &self.transport {
+            Transport::Stdio { pending, stdin, .. } => {
+                Self::call_stdio(pending, stdin, id, method, params).await
+            }
+            Transport::Http {
+                client,
+                url,
+                session_id,
+            } => Self::call_http(client, url, session_id, id, method, params).await,
+        }
+    }
+
+    async fn call_stdio(
+        pending: &PendingMap,
+        stdin: &Arc<Mutex<ChildStdin>>,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let req = serde_json::json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        pending.lock().await.insert(id, tx);
         {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(format!("{}\n", req).as_bytes()).await?;
-            stdin.flush().await?;
+            let mut guard = stdin.lock().await;
+            guard.write_all(format!("{}\n", req).as_bytes()).await?;
+            guard.flush().await?;
         }
         let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(r) => r?,
             Err(_) => {
                 // 超时即摘掉挂起项：迟到响应无人认领，不留泄漏
-                self.pending.lock().await.remove(&id);
+                pending.lock().await.remove(&id);
                 anyhow::bail!("MCP {method} timed out after 30s");
             }
         };
@@ -263,12 +372,82 @@ impl McpBridge {
             .unwrap_or(serde_json::Value::Null))
     }
 
+    /// StreamableHTTP POST：单 JSON 回包或 SSE 流二选一；`mcp-session-id` 捕获后回传保持。
+    /// 202/空体（notification 应答）按 `Null` 回，调用方视为成功。
+    async fn call_http(
+        client: &reqwest::Client,
+        url: &str,
+        session_id: &Mutex<Option<String>>,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let req = serde_json::json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
+        let mut post = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&req);
+        if let Some(s) = session_id.lock().await.clone() {
+            post = post.header("mcp-session-id", s);
+        }
+        let resp = post.send().await.context("MCP http POST failed")?;
+        if let Some(s) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *session_id.lock().await = Some(s.to_string());
+        }
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::ACCEPTED || body.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        if !status.is_success() {
+            anyhow::bail!("MCP http {method} failed with status {status}: {body}");
+        }
+        let msg = if ctype.contains("text/event-stream") {
+            parse_sse_response(&body, id)
+                .with_context(|| format!("MCP http {method}: no matching SSE response"))?
+        } else {
+            serde_json::from_str(&body).context("MCP http: invalid JSON body")?
+        };
+        if let Some(err) = msg.get("error") {
+            anyhow::bail!("MCP error for {method}: {err}");
+        }
+        Ok(msg
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
     pub async fn notify(&self, method: &str, params: serde_json::Value) -> anyhow::Result<()> {
-        let req = serde_json::json!({"jsonrpc":"2.0","method": method, "params": params});
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(format!("{}\n", req).as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        match &self.transport {
+            Transport::Stdio { stdin, .. } => {
+                let req = serde_json::json!({"jsonrpc":"2.0","method": method, "params": params});
+                let mut guard = stdin.lock().await;
+                guard.write_all(format!("{}\n", req).as_bytes()).await?;
+                guard.flush().await?;
+                Ok(())
+            }
+            // notification 只有 202/空体：call_http 本就按 Null 成功处理，id 仅占位
+            Transport::Http {
+                client,
+                url,
+                session_id,
+            } => {
+                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                Self::call_http(client, url, session_id, id, method, params).await?;
+                Ok(())
+            }
+        }
     }
 
     /// `tools/list`（支持 cursor 分页）→ 全部工具。
@@ -735,7 +914,13 @@ impl McpManager {
     pub async fn spawn_all(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
         let mut entries = vec![];
         for cfg in configs {
-            match McpBridge::spawn(cfg.clone()).await {
+            // 有 url 走 StreamableHTTP，否则 stdio 子进程
+            let spawned = if cfg.url.is_some() {
+                McpBridge::spawn_http(cfg.clone()).await
+            } else {
+                McpBridge::spawn(cfg.clone()).await
+            };
+            match spawned {
                 Ok(b) => entries.push(McpServerEntry {
                     config: cfg.clone(),
                     bridge: Arc::new(b),
@@ -858,5 +1043,15 @@ mod tests {
         let d = mcp_tool_to_definition("exa", &t);
         assert_eq!(d.name, "exa_search");
         assert!(d.prompt_snippet.is_some());
+    }
+
+    #[test]
+    fn sse_parse_picks_matching_id_and_skips_server_requests() {
+        let body = ": ping\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}\n\n\
+            data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let v = parse_sse_response(body, 7).expect("matched");
+        assert_eq!(v["result"], serde_json::json!({"ok": true}));
+        assert!(parse_sse_response(body, 8).is_none());
+        assert!(parse_sse_response("not events at all", 7).is_none());
     }
 }

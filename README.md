@@ -61,6 +61,10 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 `tools/list`（cursor 分页）→ 每个工具 `registerTool` 为 `{prefix}_{name}`，
 `tools/call` 前按 `inputSchema` 把 string 纠正回 boolean/number/integer，
 `prompt_snippet` 必填否则 agent 看不见工具。
+外加 `resources/list → resources/read`（每 server 一个 `{server}_read_resource`）、
+`prompts/list → prompts/get`（每 server 一个 `{server}_get_prompt`），description 自带可用 URI/模板名。
+传输除 stdio 外还支持 StreamableHTTP：配置里给 `url` 即走 POST（单 JSON 或 SSE 回包二选一，
+`mcp-session-id` 自动保持），例：`[{"name":"h","command":"","args":[],"env":{},"url":"http://127.0.0.1:8000/mcp"}]`。
 
 ## 记忆语义（Hermes 对齐）
 

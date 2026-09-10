@@ -249,3 +249,134 @@ fn server_request_response_covers_roots_ping_unknown() {
     assert_eq!(e["error"]["code"], serde_json::json!(-32601));
     assert!(rupi_mcp::server_request_response("ping", None, &roots).is_none());
 }
+
+/// 最小 StreamableHTTP stub：手写 HTTP/1.1 成帧（每连接一请求，`Connection: close`）。
+/// initialize→JSON+session 头，initialized→202，tools/list→JSON，tools/call→SSE 流（含 ping 注释
+/// 与一条 server 请求，验证桥只挑本轮 id）。`seen.session_header` 记录非握手请求是否回传 session。
+struct HttpStubSeen {
+    session_header: std::sync::Mutex<bool>,
+}
+
+async fn start_http_stub() -> (String, Arc<HttpStubSeen>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let seen = Arc::new(HttpStubSeen {
+        session_header: std::sync::Mutex::new(false),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let seen_clone = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = seen_clone.clone();
+            tokio::spawn(async move {
+                let (rh, mut wh) = sock.into_split();
+                let mut reader = tokio::io::BufReader::new(rh);
+                let mut content_len = 0usize;
+                let mut has_session = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let t = line.trim();
+                    if t.is_empty() {
+                        break;
+                    }
+                    let lower = t.to_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("mcp-session-id:") {
+                        has_session = true;
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                if content_len > 0 {
+                    reader.read_exact(&mut body).await.unwrap();
+                }
+                let req: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+                let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = req.get("id").cloned().unwrap_or(serde_json::json!(0));
+                if method != "initialize" && has_session {
+                    *seen.session_header.lock().unwrap() = true;
+                }
+                let (status, ctype, extra, payload): (_, _, _, Vec<u8>) = match method {
+                    "initialize" => (
+                        "200 OK",
+                        "application/json",
+                        "mcp-session-id: stub-1\r\n",
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2024-11-05"}})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                    "notifications/initialized" => ("202 Accepted", "application/json", "", vec![]),
+                    "tools/list" => (
+                        "200 OK",
+                        "application/json",
+                        "",
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{
+                            "name":"hecho","description":"http echo",
+                            "inputSchema":{"type":"object"}}]}})
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                    "tools/call" => (
+                        "200 OK",
+                        "text/event-stream",
+                        "",
+                        format!(
+                            ": ping\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}}\n\n\
+                             data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\
+                             \"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"HTTP-HI\"}}]}}}}\n\n"
+                        )
+                        .into_bytes(),
+                    ),
+                    _ => (
+                        "200 OK",
+                        "application/json",
+                        "",
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"not found"}})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n{extra}\r\n",
+                    payload.len()
+                );
+                wh.write_all(head.as_bytes()).await.unwrap();
+                wh.write_all(&payload).await.unwrap();
+            });
+        }
+    });
+    (url, seen)
+}
+
+#[tokio::test]
+async fn http_transport_lists_calls_tools_and_keeps_session() {
+    let (url, seen) = start_http_stub().await;
+    let mut cfg = McpServerConfig::new("h", "", vec![]);
+    cfg.url = Some(url);
+    let bridge = rupi_mcp::McpBridge::spawn_http(cfg)
+        .await
+        .expect("spawn http");
+    let tools = bridge.list_tools().await.expect("list");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "hecho");
+
+    // tools/call 经 SSE 流回包：桥正确挑出本轮 id（跳过 ping 注释与 server 请求）
+    let r = bridge
+        .call_tool("hecho", serde_json::json!({}), &tools[0].input_schema)
+        .await
+        .expect("call");
+    assert!(!r.is_error);
+    assert_eq!(r.text, "HTTP-HI");
+
+    // initialize 后下发的 session id，后续请求经 header 回传
+    assert!(*seen.session_header.lock().unwrap(), "session id 未回传");
+}
