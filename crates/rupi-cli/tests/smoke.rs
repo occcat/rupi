@@ -333,6 +333,45 @@ fn run_resume_continues_same_session() {
 }
 
 #[test]
+fn run_resume_empty_session_starts_fresh() {
+    // 进 chat 即退：留下零消息会话行；resume 它应续进同 id 而非 bail。
+    // 完全未知的 id 仍 bail（与空会话区分）。
+    let home = fresh_home();
+    let o = chat_with(&home, &[], b"/quit\n");
+    assert!(o.status.success(), "空 chat 非零退出: {o:?}");
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    let sid = out
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .expect("解析空会话 id")
+        .to_string();
+
+    let o = rupi(&home, &["--no-approve", "--resume", &sid, "run", "hello"])
+        .output()
+        .unwrap();
+    let (out2, err2) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "空会话 resume 失败:\nstdout={out2}\nstderr={err2}"
+    );
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out3, _) = out_text(&o);
+    assert_eq!(out3.lines().count(), 1, "空会话续聊建了新会话:\n{out3}");
+
+    let o = rupi(
+        &home,
+        &["--no-approve", "--resume", "deadbeef", "run", "hi"],
+    )
+    .output()
+    .unwrap();
+    assert!(!o.status.success(), "未知会话 resume 应失败: {o:?}");
+    let (_, err) = out_text(&o);
+    assert!(err.contains("unknown session"), "未知会话提示不对:\n{err}");
+}
+
+#[test]
 fn empty_states_exit_zero() {
     let home = fresh_home();
     for sub in ["ext-list", "commands"] {

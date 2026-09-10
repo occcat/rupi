@@ -654,7 +654,16 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
     if let Some(id) = &cli.resume {
         let msgs = sess_db.session_messages(id, 500)?;
         if msgs.is_empty() {
-            anyhow::bail!("unknown or empty session: {id} (see `rupi sessions`)");
+            // 存在但零消息（建完即退）与完全未知要区分：前者续进同 id 空树，后者 bail
+            if sess_db.has_session(id)? {
+                eprintln!(
+                    "[resume {}] session exists but empty, starting fresh under same id",
+                    id
+                );
+                rupi_tools::export_session_id(id);
+                return Ok((SessionTree::new(), id.clone()));
+            }
+            anyhow::bail!("unknown session: {id} (see `rupi sessions`)");
         }
         let mut s = SessionTree::new();
         for (id, role, content, _) in msgs {
