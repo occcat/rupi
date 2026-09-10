@@ -212,6 +212,12 @@ fn openai_body(model: &str, req: &ChatRequest, stream: bool) -> serde_json::Valu
     serde_json::Value::Object(m)
 }
 
+/// 是否走 OpenRouter 网关（对标上游 `model.provider === "openrouter" ||
+/// baseUrl.includes("openrouter.ai")`；本仓库无 provider 名字段，只看 base_url）。
+pub fn is_openrouter_base_url(url: &str) -> bool {
+    url.contains("openrouter.ai")
+}
+
 /// 按模型名前缀选原生 provider（`claude-*`→Anthropic，`gemini-*`→Gemini，
 /// 其余→OpenAI-compatible）：缺 key 即 Err，由调用方决定回 mock 还是报错。
 /// CLI 与 TUI 的 `/model` 共用此路由，避免两端漂移。
@@ -227,11 +233,15 @@ pub fn provider_for_model(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
 
 /// OpenAI-compatible provider：覆盖 OpenAI / DeepSeek / Moonshot / 本地 Ollama 等。
 /// 通过 `base_url + api_key + model` 配置，默认 `https://api.openai.com/v1`。
+/// OpenRouter 会话亲和（对标上游 bbb61e3）：base_url 含 `openrouter.ai` 时默认
+/// 带 `x-session-id` 头（同一实例 id，同轮请求落同一下游），显式开关可覆盖。
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub session_id: String,
+    pub session_affinity: Option<bool>,
     client: reqwest::Client,
 }
 
@@ -241,7 +251,35 @@ impl OpenAiCompatProvider {
             base_url,
             api_key,
             model,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            session_affinity: None,
             client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = id.into();
+        self
+    }
+
+    pub fn with_session_affinity(mut self, on: bool) -> Self {
+        self.session_affinity = Some(on);
+        self
+    }
+
+    fn session_header(&self) -> Option<(&'static str, &str)> {
+        let on = match self.session_affinity {
+            Some(v) => v,
+            None => is_openrouter_base_url(&self.base_url),
+        };
+        on.then_some(("x-session-id", self.session_id.as_str()))
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.bearer_auth(&self.api_key);
+        match self.session_header() {
+            Some((k, v)) => req.header(k, v),
+            None => req,
         }
     }
 
@@ -269,12 +307,10 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = openai_body(&self.model, &req, false);
-        let api_key = self.api_key.clone();
         let client = self.client.clone();
-        let resp =
-            post_json_with_retry(|| client.post(url.clone()).bearer_auth(&api_key), &body, 3)
-                .await?
-                .error_for_status()?;
+        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3)
+            .await?
+            .error_for_status()?;
         let v: serde_json::Value = resp.json().await?;
         parse_openai_response(v)
     }
@@ -288,10 +324,8 @@ impl LlmProvider for OpenAiCompatProvider {
         use futures::StreamExt as _;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = openai_body(&self.model, &req, true);
-        let api_key = self.api_key.clone();
         let client = self.client.clone();
-        let resp =
-            post_json_with_retry(|| client.post(url.clone()).bearer_auth(&api_key), &body, 3)
+        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3)
                 .await?
                 .error_for_status()?;
         let mut stream = resp.bytes_stream();
@@ -616,6 +650,88 @@ impl LlmProvider for MockProvider {
     }
 }
 
+/// HTTP stub（`#[tokio::test]` 端到端用）：手写 HTTP/1.1 成帧，每连接读一个请求、
+/// 回固定 JSON，对标 `rupi-mcp/tests/mcp_bridge.rs` 的 stub 写法。无 key 也能覆盖
+/// 真模型请求路径（path/头/体形状），key-gated 代码不再只有纯逻辑单测。
+#[cfg(test)]
+mod teststub {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    pub struct Seen {
+        pub path: Mutex<String>,
+        pub headers: Mutex<HashMap<String, String>>,
+        pub body: Mutex<serde_json::Value>,
+        pub count: Mutex<usize>,
+    }
+
+    pub async fn start(payload: serde_json::Value) -> (String, Arc<Seen>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let seen = Arc::new(Seen::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen_clone = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = seen_clone.clone();
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let (rh, mut wh) = sock.into_split();
+                    let mut reader = tokio::io::BufReader::new(rh);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    let mut headers = HashMap::new();
+                    let mut content_len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let t = line.trim();
+                        if t.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = t.split_once(':') {
+                            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+                        }
+                        if let Some(v) = t.to_lowercase().strip_prefix("content-length:") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut raw = vec![0u8; content_len];
+                    if content_len > 0 && reader.read_exact(&mut raw).await.is_err() {
+                        return;
+                    }
+                    *seen.path.lock().unwrap() = path;
+                    *seen.headers.lock().unwrap() = headers;
+                    *seen.body.lock().unwrap() =
+                        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                    *seen.count.lock().unwrap() += 1;
+                    let body = payload.to_string().into_bytes();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = wh.write_all(head.as_bytes()).await;
+                    let _ = wh.write_all(&body).await;
+                });
+            }
+        });
+        (base, seen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +990,98 @@ mod tests {
             })
             .expect("tool call rebuilt");
         assert_eq!(args["path"], serde_json::json!("a"));
+    }
+
+    #[test]
+    fn openrouter_detection_matches_upstream_rule() {
+        assert!(is_openrouter_base_url("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter_base_url(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(!is_openrouter_base_url("https://api.openai.com/v1"));
+        assert!(!is_openrouter_base_url("http://127.0.0.1:8080/v1"));
+    }
+
+    #[test]
+    fn session_header_auto_by_url_with_explicit_override() {
+        let auto = OpenAiCompatProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        );
+        let (k, v) = auto.session_header().expect("openrouter auto affinity");
+        assert_eq!(k, "x-session-id");
+        assert_eq!(v, auto.session_id.as_str());
+        let plain =
+            OpenAiCompatProvider::new("https://api.openai.com/v1".into(), "k".into(), "m".into());
+        assert!(plain.session_header().is_none());
+        // 显式开关优先于 URL 判定（对标上游 explicit opt-out）
+        let forced =
+            OpenAiCompatProvider::new("https://api.openai.com/v1".into(), "k".into(), "m".into())
+                .with_session_affinity(true)
+                .with_session_id("sess-1");
+        assert_eq!(
+            forced.session_header(),
+            Some(("x-session-id", "sess-1"))
+        );
+        let opted_out = OpenAiCompatProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        )
+        .with_session_affinity(false);
+        assert!(opted_out.session_header().is_none());
+    }
+
+    fn stub_request() -> ChatRequest {
+        ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_compat_complete_posts_json_without_affinity_by_default() {
+        let payload = serde_json::json!({
+            "choices": [{"message": {"content": "stub-hi"}, "finish_reason": "stop"}]
+        });
+        let (base, seen) = super::teststub::start(payload).await;
+        let p = OpenAiCompatProvider::new(base, "k".into(), "stub-model".into());
+        let resp = p.complete(stub_request()).await.unwrap();
+        assert_eq!(resp.message.full_text(), "stub-hi");
+        assert_eq!(resp.stop_reason, "stop");
+        assert_eq!(*seen.path.lock().unwrap(), "/chat/completions");
+        let headers = seen.headers.lock().unwrap();
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer k")
+        );
+        assert!(headers.get("x-session-id").is_none());
+        let body = seen.body.lock().unwrap();
+        assert_eq!(body["model"], "stub-model");
+        // 非流式不带 stream 字段（只在 true 时插入）
+        assert!(body.get("stream").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_compat_complete_sends_session_id_when_affinity_on() {
+        let payload = serde_json::json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        });
+        let (base, seen) = super::teststub::start(payload).await;
+        let p = OpenAiCompatProvider::new(base, "k".into(), "m".into())
+            .with_session_affinity(true)
+            .with_session_id("sess-9");
+        p.complete(stub_request()).await.unwrap();
+        let headers = seen.headers.lock().unwrap();
+        assert_eq!(
+            headers.get("x-session-id").map(String::as_str),
+            Some("sess-9")
+        );
     }
 }

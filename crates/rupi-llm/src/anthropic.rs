@@ -14,6 +14,8 @@ pub struct AnthropicProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub session_id: String,
+    pub session_affinity: Option<bool>,
     client: reqwest::Client,
 }
 
@@ -23,8 +25,28 @@ impl AnthropicProvider {
             base_url,
             api_key,
             model,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            session_affinity: None,
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = id.into();
+        self
+    }
+
+    pub fn with_session_affinity(mut self, on: bool) -> Self {
+        self.session_affinity = Some(on);
+        self
+    }
+
+    fn session_header(&self) -> Option<(&'static str, &str)> {
+        let on = match self.session_affinity {
+            Some(v) => v,
+            None => super::is_openrouter_base_url(&self.base_url),
+        };
+        on.then_some(("x-session-id", self.session_id.as_str()))
     }
 
     pub fn from_env(model: String) -> anyhow::Result<Self> {
@@ -37,8 +59,15 @@ impl AnthropicProvider {
     }
 
     fn headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        let req = req
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        // OpenRouter 会话亲和（对标上游 bbb61e3 的 Messages 路径）：base_url 指向
+        // openrouter.ai 时默认带 `x-session-id`，显式开关可覆盖。
+        match self.session_header() {
+            Some((k, v)) => req.header(k, v),
+            None => req,
+        }
     }
 
     fn body(&self, req: &super::ChatRequest, stream: bool) -> serde_json::Value {
@@ -603,6 +632,7 @@ impl super::LlmProvider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LlmProvider;
     use super::*;
     use rupi_core::Message;
 
@@ -1106,5 +1136,95 @@ mod tests {
         assert_eq!(stripped.messages[0].blocks.len(), 1);
         // 原请求不动（重试是纯构造，不污染主历史）
         assert_eq!(req.messages[0].blocks.len(), 3);
+    }
+
+    #[test]
+    fn session_header_auto_by_url_with_explicit_override() {
+        let auto = AnthropicProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        );
+        let (k, v) = auto.session_header().expect("openrouter auto affinity");
+        assert_eq!(k, "x-session-id");
+        assert_eq!(v, auto.session_id.as_str());
+        let plain =
+            AnthropicProvider::new("https://api.anthropic.com".into(), "k".into(), "m".into());
+        assert!(plain.session_header().is_none());
+        // 显式开关优先于 URL 判定（对标上游 explicit opt-out）
+        let forced =
+            AnthropicProvider::new("https://api.anthropic.com".into(), "k".into(), "m".into())
+                .with_session_affinity(true)
+                .with_session_id("sess-2");
+        assert_eq!(forced.session_header(), Some(("x-session-id", "sess-2")));
+        let opted_out = AnthropicProvider::new(
+            "https://openrouter.ai/api/v1".into(),
+            "k".into(),
+            "m".into(),
+        )
+        .with_session_affinity(false);
+        assert!(opted_out.session_header().is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_complete_posts_messages_shape_without_affinity_by_default() {
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": "a-hi"}],
+            "stop_reason": "end_turn",
+        });
+        let (base, seen) = crate::teststub::start(payload).await;
+        let p = AnthropicProvider::new(base, "ak".into(), "claude-x".into());
+        let req = super::super::ChatRequest {
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        };
+        let resp = p.complete(req).await.unwrap();
+        assert_eq!(resp.message.full_text(), "a-hi");
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert_eq!(*seen.path.lock().unwrap(), "/v1/messages");
+        let headers = seen.headers.lock().unwrap();
+        assert_eq!(headers.get("x-api-key").map(String::as_str), Some("ak"));
+        assert_eq!(
+            headers.get("anthropic-version").map(String::as_str),
+            Some(super::ANTHROPIC_VERSION)
+        );
+        assert!(headers.get("x-session-id").is_none());
+        let body = seen.body.lock().unwrap();
+        assert_eq!(body["model"], "claude-x");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body.pointer("/system/0/text"), Some(&serde_json::json!("sys")));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_complete_sends_session_id_when_affinity_on() {
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+        });
+        let (base, seen) = crate::teststub::start(payload).await;
+        let p = AnthropicProvider::new(base, "ak".into(), "m".into())
+            .with_session_affinity(true)
+            .with_session_id("sess-7");
+        p.complete(super::super::ChatRequest {
+            system: "s".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        })
+        .await
+        .unwrap();
+        let headers = seen.headers.lock().unwrap();
+        assert_eq!(
+            headers.get("x-session-id").map(String::as_str),
+            Some("sess-7")
+        );
     }
 }
