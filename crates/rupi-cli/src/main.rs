@@ -104,6 +104,9 @@ struct Cli {
     /// Ask 裁决一律拒绝且不问（与 --approve 互斥）
     #[arg(long, default_value_t = false)]
     no_approve: bool,
+    /// 思考强度（对标上游 /thinking：off|low|medium|high；映射为各 provider 推理参数）
+    #[arg(long)]
+    thinking: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -504,6 +507,17 @@ impl rupi_agent::Approver for AutoApprover {
     }
 }
 
+/// 思考强度解析：未传 flag 即 None（不干预）；非法值直接 bail 并列合法档。
+fn thinking_for(cli: &Cli) -> anyhow::Result<Option<rupi_llm::ThinkingLevel>> {
+    cli.thinking
+        .as_deref()
+        .map(|s| {
+            s.parse()
+                .map_err(|e| anyhow::anyhow!("--thinking 解析失败: {e:#}"))
+        })
+        .transpose()
+}
+
 /// 三档审批装配：--approve 全放行 / --no-approve 全拒绝（互斥，错配直接 bail）
 /// / 默认走各端交互审批器（REPL 问询 / TUI 弹窗 / run 无审批=拒绝）。
 fn approver_for(
@@ -619,8 +633,9 @@ fn persist_turn(
 /// 无问询：Ask 无审批器即拒绝（除非 --approve）；项目资源默认跳过（除非 --trust-project）。
 /// stdout 只走模型正文（可管道），诊断走 stderr。
 async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()> {
-    // 审批档位先验（互斥错配直接 bail，不建会话不落盘）
+    // 审批档位 + thinking 档位先验（错配直接 bail，不建会话不落盘）
     let approver = approver_for(cli, None)?;
+    let thinking = thinking_for(cli)?;
     let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
@@ -669,6 +684,10 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     }
     if cli.discover_tools {
         agent = agent.with_discovery(rupi_agent::DiscoveryConfig::default());
+    }
+    if let Some(t) = thinking {
+        eprintln!("[thinking] level: {t:?}");
+        agent = agent.with_thinking(t);
     }
     if cli.subagents {
         let sub = SubagentTool::new(
@@ -769,6 +788,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
     if cli.plan {
         println!("[plan mode] read-only: write/edit/bash disabled");
+    }
+    if let Some(t) = thinking_for(cli)? {
+        println!("[thinking] level: {t:?}");
+        agent = agent.with_thinking(t);
     }
     if cli.review || cli.review_apply {
         let pending_clone = pending.clone();
@@ -981,6 +1004,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 }
 
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
+    // thinking 档位先验：非法值在建会话前 bail，不污染会话库
+    let thinking = thinking_for(cli)?;
     let provider: Arc<dyn LlmProvider> = build_provider(&cli.model).await?.into();
     let mut tools = sandboxed_tools();
     let _mcp = if let Some(path) = &cli.mcp_config {
@@ -1024,6 +1049,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         eprintln!(
             "[discover tools] only resident tool schemas injected; search_tools to reveal more"
         );
+    }
+    if let Some(t) = thinking {
+        eprintln!("[thinking] level: {t:?}");
+        agent = agent.with_thinking(t);
     }
     if cli.subagents {
         let sub = SubagentTool::new(
