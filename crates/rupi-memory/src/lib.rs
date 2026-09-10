@@ -805,7 +805,7 @@ impl SessionStore {
         let mut stmt = self.conn.prepare(
             "SELECT m.session_id, snippet(messages_fts, 0, '<b>', '</b>', '...', 20)
              FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
-             WHERE messages_fts MATCH ? LIMIT ?",
+             WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fts_phrase(query), limit as i64], |r| {
@@ -856,7 +856,7 @@ impl SessionStore {
         let mut stmt = self.conn.prepare(
             "SELECT m.target, snippet(memory_fts, 0, '<b>', '</b>', '...', 20)
              FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
-             WHERE memory_fts MATCH ? LIMIT ?",
+             WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fts_phrase(query), limit as i64], |r| {
@@ -1096,6 +1096,33 @@ mod tests {
         assert_eq!(fhits.len(), 1);
         assert_eq!(fhits[0].0, "failure");
         assert!(db.memory_search("zzz-no-match", 5).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn memory_search_ranks_best_match_first() {
+        // bm25 排名：高频条目排前，limit=1 直接拿到最相关的（召回质量即记忆 harness 质量）
+        let home = std::env::temp_dir().join(format!("rupi-mem-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let db = SessionStore::open(&home).unwrap();
+        db.mirror_memory_entry("memory", "likes tea").unwrap();
+        db.mirror_memory_entry("memory", "tea tea tea tea ritual")
+            .unwrap();
+        let hits = db.memory_search("tea", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].1.contains("ritual"), "高频条目未排前: {:?}", hits);
+        // 会话检索同享排名：limit=1 截到的是最相关的那条
+        let sid = db.create_session("test").unwrap();
+        db.add_message(&sid, "user", "mentions tea once").unwrap();
+        db.add_message(&sid, "user", "tea tea tea tea deepdive")
+            .unwrap();
+        let shits = db.search("tea", 1).unwrap();
+        assert_eq!(shits.len(), 1);
+        assert!(
+            shits[0].1.contains("deepdive"),
+            "session limit=1 未截到最相关: {:?}",
+            shits
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
