@@ -71,6 +71,10 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     if name.starts_with('-') || name.ends_with('-') {
         anyhow::bail!("skill name must not start/end with hyphen");
     }
+    // 上游 validateName 同款：连续连字符拒绝（`auto--x` 这类 review 拼装名上游不认）
+    if name.contains("--") {
+        anyhow::bail!("skill name must not contain consecutive hyphens");
+    }
     if !name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -140,14 +144,18 @@ impl SkillRegistry {
         s
     }
 
-    /// 阶段 2：激活 skill，返回全文指令。
+    /// 阶段 2：激活 skill，返回调用块（对标上游 `formatSkillInvocation`）：
+    /// location 让模型知道 skill 落在哪，`References are relative to …` 让阶段 3 的
+    /// `read_resource(name, path)` 相对路径有锚可依，不再盲猜。
     pub fn load_skill(&self, name: &str) -> Option<String> {
-        self.skills
-            .read()
-            .unwrap()
-            .iter()
-            .find(|s| s.meta.name == name)
-            .map(|s| s.instructions.clone())
+        self.skills.read().unwrap().iter().find(|s| s.meta.name == name).map(|s| {
+            format!(
+                "<skill name=\"{name}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+                s.dir.join("SKILL.md").display(),
+                s.dir.display(),
+                s.instructions,
+            )
+        })
     }
 
     /// 阶段 3：按需读资源文件（references/、assets/、templates/）。
@@ -280,6 +288,33 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_returns_invocation_block_with_location() {
+        // 对标上游 formatSkillInvocation：location + 相对引用锚点随指令一起给模型，
+        // 阶段 3 的 read_resource 相对路径有锚可依
+        let base = std::env::temp_dir().join(format!("rupi-skill-invoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: do demo things\n---\n\n# Demo\nDo X.\n",
+        )
+        .unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        let body = reg.load_skill("demo-skill").expect("skill");
+        assert!(body.contains("<skill name=\"demo-skill\""), "{body}");
+        assert!(body.contains("SKILL.md"), "{body}");
+        assert!(
+            body.contains(&format!("References are relative to {}.", dir.display())),
+            "{body}"
+        );
+        assert!(body.contains("Do X."), "{body}");
+        assert!(body.trim_end().ends_with("</skill>"), "{body}");
+        assert!(reg.load_skill("missing").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn tool_definitions_visible_only_when_skills_exist() {
         let base = std::env::temp_dir().join(format!("rupi-skill-tools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -313,6 +348,8 @@ mod tests {
     fn accumulator_rejects_bad_names() {
         let acc = SkillAccumulator::new(std::env::temp_dir());
         assert!(acc.propose("Bad_Name", "d", &[]).is_err());
+        // 上游同款：连续连字符拒绝（与 Skill::load 共用 validate_name）
+        assert!(acc.propose("auto--x", "d", &["s".into()]).is_err());
     }
 
     #[test]
