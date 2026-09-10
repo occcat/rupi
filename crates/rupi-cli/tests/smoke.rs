@@ -372,6 +372,32 @@ fn run_resume_empty_session_starts_fresh() {
 }
 
 #[test]
+fn trust_gate_skip_remember_and_silence() {
+    // 项目信任门三态：n 跳过进聊天、y 记住、下次同目录免扰（cwd 即 home，项目资源自带）。
+    let home = fresh_home();
+    std::fs::create_dir_all(home.join(".rupi")).unwrap();
+    std::fs::write(
+        home.join(".rupi").join("MEMORY.md"),
+        "project convention: tabs",
+    )
+    .unwrap();
+
+    let o = chat_with(&home, &[], "n\n/quit\n".as_bytes());
+    let (out, _) = out_text(&o);
+    assert!(o.status.success(), "信任门跳过非零退出: {o:?}");
+    assert!(out.contains("[trust]"), "未弹信任门:\n{out}");
+    assert!(out.contains("已跳过"), "跳过无反馈:\n{out}");
+
+    let o = chat_with(&home, &[], "y\n/quit\n".as_bytes());
+    assert!(o.status.success(), "信任记住非零退出: {o:?}");
+
+    let o = chat_with(&home, &[], b"/quit\n");
+    let (out3, _) = out_text(&o);
+    assert!(o.status.success(), "记住后进聊天非零退出: {o:?}");
+    assert!(!out3.contains("[trust]"), "记住后仍打扰:\n{out3}");
+}
+
+#[test]
 fn empty_states_exit_zero() {
     let home = fresh_home();
     for sub in ["ext-list", "commands"] {
