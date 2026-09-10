@@ -304,19 +304,24 @@ impl AgentLoop {
                             }
                             rupi_tools::ToolOutput::ok(capped)
                         }
-                        Err(e) => rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}")),
+                        Err(e) => {
+                            rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}"))
+                        }
                     }
                 } else {
                     // 工具执行错误一律转 tool error 回模型，主循环不中断
                     // （与权限拒绝/未知工具同语义；此前 `?` 会直接 abort 整轮）
                     match mem.handle_tool_call(&name, args.clone()).await {
                         Ok(Some(routed)) => rupi_tools::ToolOutput::ok(routed),
-                        Ok(None) => tools.execute(&name, args.clone()).await.unwrap_or_else(|e| {
-                            rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
-                        }),
-                        Err(e) => rupi_tools::ToolOutput::err(format!(
-                            "memory tool {name} failed: {e:#}"
-                        )),
+                        Ok(None) => tools
+                            .execute(&name, args.clone())
+                            .await
+                            .unwrap_or_else(|e| {
+                                rupi_tools::ToolOutput::err(format!("tool {name} failed: {e:#}"))
+                            }),
+                        Err(e) => {
+                            rupi_tools::ToolOutput::err(format!("memory tool {name} failed: {e:#}"))
+                        }
                     }
                 };
                 on_event(AgentEvent::ToolEnd {
@@ -651,7 +656,8 @@ mod tests {
     async fn skill_tools_visible_and_executable_end_to_end() {
         use rupi_core::ContentBlock;
         // 磁盘 skill：全文 + references 资源
-        let base = std::env::temp_dir().join(format!("rupi-agent-skilltools-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("rupi-agent-skilltools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("ops");
         std::fs::create_dir_all(dir.join("references")).unwrap();
@@ -660,7 +666,11 @@ mod tests {
             "---\nname: ops-skill\ndescription: ops runbook\n---\n\n# Ops\nFollow runbook.\n",
         )
         .unwrap();
-        std::fs::write(dir.join("references").join("runbook.md"), "RUNBOOK-SECRET-SAUCE").unwrap();
+        std::fs::write(
+            dir.join("references").join("runbook.md"),
+            "RUNBOOK-SECRET-SAUCE",
+        )
+        .unwrap();
         let skills = SkillRegistry::discover(&[base.clone()]);
         // 模型能看见两个工具 schema
         let defs = skills.tool_definitions();

@@ -472,10 +472,9 @@ impl McpManager {
                         registered.push(name);
                     }
                 }
-                Err(e) => tracing::warn!(
-                    "MCP tools/list failed for '{}': {e:#}",
-                    entry.config.name
-                ),
+                Err(e) => {
+                    tracing::warn!("MCP tools/list failed for '{}': {e:#}", entry.config.name)
+                }
             }
         }
         registered

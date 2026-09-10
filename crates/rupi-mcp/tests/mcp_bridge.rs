@@ -123,7 +123,10 @@ fn server_request_response_covers_roots_ping_unknown() {
     }];
     let r = rupi_mcp::server_request_response("roots/list", Some(7), &roots).unwrap();
     assert_eq!(r["id"], serde_json::json!(7));
-    assert_eq!(r["result"]["roots"][0]["uri"], serde_json::json!("file:///proj"));
+    assert_eq!(
+        r["result"]["roots"][0]["uri"],
+        serde_json::json!("file:///proj")
+    );
     let p = rupi_mcp::server_request_response("ping", Some(8), &roots).unwrap();
     assert_eq!(p["result"], serde_json::json!({}));
     let e = rupi_mcp::server_request_response("sampling/createMessage", Some(9), &roots).unwrap();

@@ -116,15 +116,26 @@ impl SessionApprovalCache {
     }
 
     pub fn is_approved(&self, tool: &str, reason: &str) -> bool {
-        self.approved.lock().unwrap().contains(&Self::key(tool, reason))
+        self.approved
+            .lock()
+            .unwrap()
+            .contains(&Self::key(tool, reason))
     }
 
     pub fn approve_session(&self, tool: &str, reason: &str) {
-        self.approved.lock().unwrap().insert(Self::key(tool, reason));
+        self.approved
+            .lock()
+            .unwrap()
+            .insert(Self::key(tool, reason));
     }
 
     /// 交互式审批器共用入口：先查记忆，未命中则调 `ask` 问用户并按三态处理。
-    pub fn decide_with(&self, tool: &str, reason: &str, ask: impl FnOnce() -> ApprovalAnswer) -> bool {
+    pub fn decide_with(
+        &self,
+        tool: &str,
+        reason: &str,
+        ask: impl FnOnce() -> ApprovalAnswer,
+    ) -> bool {
         if self.is_approved(tool, reason) {
             return true;
         }

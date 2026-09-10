@@ -227,10 +227,7 @@ impl SkillAccumulator {
         steps: &[String],
     ) -> anyhow::Result<PathBuf> {
         validate_name(name)?;
-        let description: String = description
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let description: String = description.split_whitespace().collect::<Vec<_>>().join(" ");
         if description.is_empty() || description.len() > 1024 {
             anyhow::bail!("skill description must be 1..=1024 chars");
         }
@@ -244,8 +241,12 @@ impl SkillAccumulator {
         std::fs::create_dir_all(dir.join("references"))?;
         // description 进 YAML frontmatter：转义反斜杠/引号并消除 `---`，
         // 否则模型输出的特殊字符会让下次 refresh 解析失败、skill 静默丢失。
-        let safe_description = description.replace("---", "—").replace('\\', "\\\\").replace('"', "\\\"");
-        let mut body = format!("---\nname: {name}\ndescription: \"{safe_description}\"\n---\n\n# {name}\n\n");
+        let safe_description = description
+            .replace("---", "—")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let mut body =
+            format!("---\nname: {name}\ndescription: \"{safe_description}\"\n---\n\n# {name}\n\n");
         body.push_str(" distilled from a successful session. Follow these steps:\n\n");
         for (i, st) in steps.iter().take(50).enumerate() {
             body.push_str(&format!("{}. {}\n", i + 1, st));
@@ -322,7 +323,9 @@ mod tests {
         // 空步骤 / 空描述 / 超长描述拒绝
         assert!(acc.propose("s1", "ok", &[]).is_err());
         assert!(acc.propose("s2", "  \n ", &["step".into()]).is_err());
-        assert!(acc.propose("s3", &"x".repeat(2000), &["step".into()]).is_err());
+        assert!(acc
+            .propose("s3", &"x".repeat(2000), &["step".into()])
+            .is_err());
         // 换行描述压单行，落盘后可被重新发现
         let dir = acc
             .propose("multiline-desc", "line one\nline two", &["do it".into()])

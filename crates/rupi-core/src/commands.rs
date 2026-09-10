@@ -202,7 +202,10 @@ mod tests {
             expand(&dirs, "review", "all").unwrap(),
             "Review the diff carefully.\n\nall"
         );
-        assert_eq!(expand(&dirs, "review", "").unwrap(), "Review the diff carefully.");
+        assert_eq!(
+            expand(&dirs, "review", "").unwrap(),
+            "Review the diff carefully."
+        );
         assert!(expand(&dirs, "empty", "").is_none());
         assert!(expand(&dirs, "missing", "").is_none());
         // 非法文件名不收录

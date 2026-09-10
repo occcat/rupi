@@ -390,12 +390,18 @@ mod tests {
             .map(|(id, _)| id.clone())
             .unwrap();
         assert!(s.goto_node(&abandoned));
-        assert!(s.history().iter().any(|m| m.full_text().contains("follow A")));
-        assert!(!s.history().iter().any(|m| m.full_text().contains("follow B")));
+        assert!(s
+            .history()
+            .iter()
+            .any(|m| m.full_text().contains("follow A")));
+        assert!(!s
+            .history()
+            .iter()
+            .any(|m| m.full_text().contains("follow B")));
         // 短 id 解析往返
         let short = &b[..8];
         assert_eq!(s.resolve_short_id(short), Some(b.clone()));
-        assert!(s.resolve_short_id("ab") .is_none());
+        assert!(s.resolve_short_id("ab").is_none());
         assert!(s.goto_node("no-such-node") == false);
     }
 

@@ -106,10 +106,9 @@ impl MemoryStore {
 
     /// 项目名（目录名），注入 prompt 做分区标注。
     pub fn project_name(&self) -> Option<String> {
-        self.project_root.as_ref().and_then(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        self.project_root
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
     }
 
     fn project_memory_path(&self) -> Option<PathBuf> {
@@ -199,7 +198,9 @@ impl MemoryStore {
     /// 同样过密钥扫描；失败记录只追加，由 review 纠正检测或 agent 显式写入。
     pub fn record_failure(&self, entry: &str) -> anyhow::Result<()> {
         if contains_secret(entry) {
-            anyhow::bail!("refused: failure entry looks like a secret; describe it without the credential");
+            anyhow::bail!(
+                "refused: failure entry looks like a secret; describe it without the credential"
+            );
         }
         std::fs::create_dir_all(self.memories_dir())?;
         let path = self.memories_dir().join(FAILURES_FILE);
@@ -216,7 +217,10 @@ impl MemoryStore {
     }
 
     pub fn failures_text(&self) -> String {
-        self.read_limited(&self.memories_dir().join(FAILURES_FILE), self.memory_char_limit)
+        self.read_limited(
+            &self.memories_dir().join(FAILURES_FILE),
+            self.memory_char_limit,
+        )
     }
 
     /// agent 经 `memory` 工具写入：即时落盘，返回实时状态（但不改变已冻结快照）。
@@ -226,12 +230,7 @@ impl MemoryStore {
         self.apply_write_scoped("global", op, entry)
     }
 
-    pub fn apply_write_scoped(
-        &self,
-        scope: &str,
-        op: &str,
-        entry: &str,
-    ) -> anyhow::Result<String> {
+    pub fn apply_write_scoped(&self, scope: &str, op: &str, entry: &str) -> anyhow::Result<String> {
         if contains_secret(entry) {
             anyhow::bail!("refused: entry looks like a secret (api key/token/private key); store a reference instead");
         }
@@ -522,7 +521,10 @@ impl MemoryManager {
         if name == "memory" {
             let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("add");
             let entry = args.get("entry").and_then(|v| v.as_str()).unwrap_or("");
-            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
+            let scope = args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("global");
             let live = self.store.apply_write_scoped(scope, op, entry)?;
             if let Some(e) = &self.external {
                 let _ = e.on_memory_write(op, entry).await;
@@ -752,12 +754,7 @@ impl SessionStore {
     }
 
     pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
-        self.add_message_with_id(
-            &uuid::Uuid::new_v4().to_string(),
-            session_id,
-            role,
-            content,
-        )
+        self.add_message_with_id(&uuid::Uuid::new_v4().to_string(), session_id, role, content)
     }
 
     /// 指定行 id 写入（回合落盘时沿用树节点 id，resume 后短 id 稳定可 /goto）。
@@ -770,7 +767,13 @@ impl SessionStore {
     ) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO messages(id, session_id, role, content, created_at) VALUES(?,?,?,?,?)",
-            rusqlite::params![id, session_id, role, content, chrono::Utc::now().to_rfc3339()],
+            rusqlite::params![
+                id,
+                session_id,
+                role,
+                content,
+                chrono::Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -824,7 +827,11 @@ impl SessionStore {
 
     /// memory_search：查 markdown 记忆镜像（MEMORY.md / failures.md 的成功写入）。
     /// 与 session_search 分开：记忆是“学到的”，会话是“聊过的”。
-    pub fn memory_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+    pub fn memory_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.target, snippet(memory_fts, 0, '<b>', '</b>', '...', 20)
              FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
@@ -964,7 +971,9 @@ mod tests {
         let home = std::env::temp_dir().join(format!("rupi-mem-sec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        assert!(store.apply_write("add", "my api_key = sk-abcdef1234567890").is_err());
+        assert!(store
+            .apply_write("add", "my api_key = sk-abcdef1234567890")
+            .is_err());
         assert!(store
             .apply_write("add", "token: ghp_deadbeefcafe1234")
             .is_err());
@@ -986,7 +995,9 @@ mod tests {
         let home = std::env::temp_dir().join(format!("rupi-mem-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.record_failure("rm -rf deleted worktree; use trash instead").unwrap();
+        store
+            .record_failure("rm -rf deleted worktree; use trash instead")
+            .unwrap();
         let frozen = store.frozen_snapshot();
         assert!(frozen.failures.contains("trash"));
         assert!(frozen.system_block().contains("FailureMemory"));
@@ -998,8 +1009,12 @@ mod tests {
         let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.apply_write("add", "prefers oolong tea over coffee").unwrap();
-        store.record_failure("used bash pipe wrong; check exit codes").unwrap();
+        store
+            .apply_write("add", "prefers oolong tea over coffee")
+            .unwrap();
+        store
+            .record_failure("used bash pipe wrong; check exit codes")
+            .unwrap();
         let db = SessionStore::open(&home).unwrap();
         let hits = db.memory_search("oolong", 5).unwrap();
         assert_eq!(hits.len(), 1);
@@ -1033,7 +1048,10 @@ mod tests {
             .unwrap();
         assert!(hit.contains("gondolin"));
         let miss = mgr
-            .handle_tool_call("memory_search", serde_json::json!({"query": "zzz-no-match"}))
+            .handle_tool_call(
+                "memory_search",
+                serde_json::json!({"query": "zzz-no-match"}),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1058,14 +1076,16 @@ mod tests {
         assert!(plain.apply_write_scoped("project", "add", "x").is_err());
         // 有项目根：项目写入独立文件，全局不受影响
         let store = MemoryStore::new(home.clone()).with_project(root.clone());
-        store.apply_write_scoped("project", "add", "uses pixi envs").unwrap();
+        store
+            .apply_write_scoped("project", "add", "uses pixi envs")
+            .unwrap();
         assert!(root.join(".rupi").join("MEMORY.md").exists());
         assert!(!store.memory_text().is_empty());
         assert!(store.memory_text().contains("[project:demo]"));
         assert!(store.memory_text().contains("pixi"));
         // 全局文件里没有项目内容
-        let global = std::fs::read_to_string(home.join("memories").join("MEMORY.md"))
-            .unwrap_or_default();
+        let global =
+            std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap_or_default();
         assert!(!global.contains("pixi"));
         // 快照带项目分区
         assert!(store.frozen_snapshot().memory.contains("[project:demo]"));
@@ -1102,7 +1122,9 @@ mod tests {
         let mut store = MemoryStore::new(home.clone());
         store.memory_char_limit = 200;
         for i in 0..30 {
-            store.apply_write("add", &format!("fact number {i}")).unwrap();
+            store
+                .apply_write("add", &format!("fact number {i}"))
+                .unwrap();
         }
         // 磁盘文件有界，保最新、丢最旧，且按整行切（无半截行）
         let raw = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();

@@ -130,10 +130,12 @@ impl rupi_tools::Tool for ExternalTool {
         match out {
             Ok(Ok(out)) => {
                 // 外部进程输出同样有界：与内置 bash 同口径折叠，保上下文窗口
-                let text =
-                    rupi_tools::truncate_middle(&String::from_utf8_lossy(&out.stdout), rupi_tools::MAX_TOOL_OUTPUT)
-                        .trim()
-                        .to_string();
+                let text = rupi_tools::truncate_middle(
+                    &String::from_utf8_lossy(&out.stdout),
+                    rupi_tools::MAX_TOOL_OUTPUT,
+                )
+                .trim()
+                .to_string();
                 if out.status.success() {
                     Ok(rupi_tools::ToolOutput::ok(text))
                 } else {
@@ -204,7 +206,8 @@ impl ExtensionSet {
 
     /// 增量重载：返回 (新增/修改 manifests, 删除的工具名)。无变化返回空。
     /// manifest 改名视为“删旧名 + 加新名”，调用方先注销再注册，无 stale 工具。
-    pub fn refresh(&mut self) -> (Vec<ExtensionManifest>, Vec<String>) {        let current = self.manifests();
+    pub fn refresh(&mut self) -> (Vec<ExtensionManifest>, Vec<String>) {
+        let current = self.manifests();
         let mut current_map = HashMap::new();
         for (key, path, mtime) in &current {
             current_map.insert(key.clone(), (*mtime, path.clone()));
@@ -352,7 +355,11 @@ mod tests {
         assert_eq!(set.load_all().len(), 1);
         // 同文件改名：旧工具名必须出现在 removed，否则 registry 残留 stale 工具
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write(&dir, "a.json", &ECHO_MANIFEST.replace("\"upper\"", "\"shout\""));
+        write(
+            &dir,
+            "a.json",
+            &ECHO_MANIFEST.replace("\"upper\"", "\"shout\""),
+        );
         let (changed, removed) = set.refresh();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].name, "shout");

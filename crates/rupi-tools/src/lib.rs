@@ -78,13 +78,20 @@ impl ToolRegistry {
 
     /// 沙箱四件套：read/write/edit 的 `path` 约束在 `root` 内（bash/mcp/扩展进程不在此层约束）。
     pub fn with_sandboxed_builtins(root: &std::path::Path) -> Self {
-        let root = root
-            .canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf());
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut r = Self::new();
-        r.register(Arc::new(SandboxedTool::new(Arc::new(ReadTool), root.clone())));
-        r.register(Arc::new(SandboxedTool::new(Arc::new(WriteTool), root.clone())));
-        r.register(Arc::new(SandboxedTool::new(Arc::new(EditTool), root.clone())));
+        r.register(Arc::new(SandboxedTool::new(
+            Arc::new(ReadTool),
+            root.clone(),
+        )));
+        r.register(Arc::new(SandboxedTool::new(
+            Arc::new(WriteTool),
+            root.clone(),
+        )));
+        r.register(Arc::new(SandboxedTool::new(
+            Arc::new(EditTool),
+            root.clone(),
+        )));
         r.register(Arc::new(BashTool));
         r
     }
@@ -132,7 +139,10 @@ impl Tool for SandboxedTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
         let mut arguments = arguments;
-        if let Some(path) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+        if let Some(path) = arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
         {
             match self.resolve(&path) {
                 // 放行并改写为绝对路径：内层不再依赖进程 cwd，结果稳定
@@ -413,7 +423,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let r = ToolRegistry::with_builtins();
         let path = dir.join("big.txt").to_string_lossy().to_string();
-        let body: String = (1..=50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let body: String = (1..=50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         r.execute("write", serde_json::json!({"path": path, "content": body}))
             .await
             .unwrap();
@@ -428,7 +441,10 @@ mod tests {
         assert!(p1.content.contains("offset=10"));
         // 第二页：offset 翻页，末页带 end-of-file
         let p2 = r
-            .execute("read", serde_json::json!({"path": path, "offset": 40, "limit": 20}))
+            .execute(
+                "read",
+                serde_json::json!({"path": path, "offset": 40, "limit": 20}),
+            )
             .await
             .unwrap();
         assert!(p2.content.starts_with("line41"));

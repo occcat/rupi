@@ -311,7 +311,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("== summary ==\n{summary}");
             }
             for (id, role, content, created) in store.session_messages(&id, 200)? {
-                println!("== {role} @ {created} [{}] ==\n{content}", &id[..8.min(id.len())]);
+                println!(
+                    "== {role} @ {created} [{}] ==\n{content}",
+                    &id[..8.min(id.len())]
+                );
             }
         }
         Some(Cmd::McpList { command, args }) => {
@@ -614,14 +617,11 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         refresh_extensions(&mut tools, &mut ext_set);
         skills.refresh(&skill_dirs(home));
         // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
-        let slash = rupi_core::commands::split(&input)
-            .map(|(n, a)| (n.to_owned(), a.to_owned()));
+        let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
         if let Some((name, args)) = slash.as_ref() {
-            if let Some(expanded) = rupi_core::commands::expand(
-                &rupi_core::commands::command_dirs(home),
-                name,
-                args,
-            ) {
+            if let Some(expanded) =
+                rupi_core::commands::expand(&rupi_core::commands::command_dirs(home), name, args)
+            {
                 println!("[command /{name}]");
                 input = expanded;
             }

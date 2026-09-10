@@ -196,12 +196,10 @@ async fn run_loop(
                     continue;
                 }
                 // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
-                let slash =
-                    commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
+                let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
                 let mut send_text = text.clone();
                 if let Some((name, args)) = slash.as_ref() {
-                    if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args)
-                    {
+                    if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args) {
                         view.push_system(format!("[command /{name}]"));
                         send_text = expanded;
                     }
@@ -391,7 +389,12 @@ fn draw(
                 let shown: Vec<RLine> = completion
                     .iter()
                     .take(8)
-                    .map(|c| RLine::from(vec![Span::styled(format!("/{c}"), Style::default().fg(Color::Yellow))]))
+                    .map(|c| {
+                        RLine::from(vec![Span::styled(
+                            format!("/{c}"),
+                            Style::default().fg(Color::Yellow),
+                        )])
+                    })
                     .collect();
                 let extra = completion.len().saturating_sub(8);
                 let mut items = shown;
@@ -407,7 +410,8 @@ fn draw(
                 };
                 f.render_widget(Clear, area);
                 f.render_widget(
-                    Paragraph::new(items).block(Block::default().borders(Borders::ALL).title("Tab 补全")),
+                    Paragraph::new(items)
+                        .block(Block::default().borders(Borders::ALL).title("Tab 补全")),
                     area,
                 );
             }

@@ -331,7 +331,9 @@ pub fn extract_text(content: &serde_json::Value) -> String {
                 }
                 let t = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if t == "text" {
-                    p.get("text").and_then(|x| x.as_str()).map(|s| s.to_string())
+                    p.get("text")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -346,9 +348,7 @@ pub fn extract_text(content: &serde_json::Value) -> String {
 /// 字符串解析失败回 `{}`（调用方报未知参数而非崩溃）。
 pub fn parse_arguments(raw: &serde_json::Value) -> serde_json::Value {
     match raw {
-        serde_json::Value::String(s) => {
-            serde_json::from_str(s).unwrap_or(serde_json::json!({}))
-        }
+        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or(serde_json::json!({})),
         serde_json::Value::Object(_) => raw.clone(),
         _ => serde_json::json!({}),
     }
@@ -360,10 +360,7 @@ fn parse_openai_response(v: serde_json::Value) -> anyhow::Result<ChatResponse> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("bad openai response: {v}"))?;
     let mut blocks = vec![];
-    let text = choice
-        .get("content")
-        .map(extract_text)
-        .unwrap_or_default();
+    let text = choice.get("content").map(extract_text).unwrap_or_default();
     if !text.is_empty() {
         blocks.push(ContentBlock::Text { text });
     }
@@ -603,9 +600,9 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| match b {
-                rupi_core::ContentBlock::ToolCall { name, arguments, .. } => {
-                    Some((name.clone(), arguments.clone()))
-                }
+                rupi_core::ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => Some((name.clone(), arguments.clone())),
                 _ => None,
             })
             .expect("tool call rebuilt");
