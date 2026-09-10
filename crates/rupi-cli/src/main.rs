@@ -16,7 +16,7 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
     if suggestions.is_empty() {
         return;
     }
-    let store = MemoryStore::new(home.clone());
+    let store = memory_store(home);
     let acc = SkillAccumulator::new(home.join("skills"));
     for s in suggestions {
         for m in &s.memory_ops {
@@ -94,8 +94,13 @@ enum Cmd {
     Tui,
     /// 显示记忆快照
     MemoryShow,
-    /// 写入记忆
-    MemoryWrite { op: String, entry: String },
+    /// 写入记忆（op: add/replace/remove/failure；scope: global/project）
+    MemoryWrite {
+        op: String,
+        entry: String,
+        #[arg(long, default_value = "global")]
+        scope: String,
+    },
     /// 列出 skills
     SkillsList,
     /// 加载 skill 全文
@@ -130,6 +135,17 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+/// 内建记忆 store：全局 `~/.rupi/memories` + 从 cwd 上溯 `.git` 的项目层（Hermes two-tier）。
+fn memory_store(home: &PathBuf) -> MemoryStore {
+    let mut s = MemoryStore::new(home.clone());
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(root) = MemoryStore::discover_project(&cwd) {
+            s = s.with_project(root);
+        }
+    }
+    s
 }
 
 fn skill_dirs(home: &PathBuf) -> Vec<PathBuf> {
@@ -200,21 +216,21 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Some(Cmd::MemoryShow) => {
-            let store = MemoryStore::new(home);
+            let store = memory_store(&home);
             let frozen = store.frozen_snapshot();
             println!(
                 "--- MEMORY.md ---\n{}\n--- USER.md ---\n{}\n--- failures.md ---\n{}",
                 frozen.memory, frozen.user, frozen.failures
             );
         }
-        Some(Cmd::MemoryWrite { op, entry }) => {
-            let store = MemoryStore::new(home);
+        Some(Cmd::MemoryWrite { op, entry, scope }) => {
+            let store = memory_store(&home);
             if op == "failure" {
                 store.record_failure(&entry)?;
                 println!("failure recorded.");
             } else {
-                let live = store.apply_write(&op, &entry)?;
-                println!("updated. live state:\n{live}");
+                let live = store.apply_write_scoped(&scope, &op, &entry)?;
+                println!("updated [{scope}]. live state:\n{live}");
             }
         }
         Some(Cmd::SkillsList) => {
@@ -434,7 +450,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
     let ext_path = ext_dir(home, cli);
     let mut ext_set = load_extensions(&mut tools, &ext_path);
-    let store = MemoryStore::new(home.clone());
+    let store = memory_store(home);
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
@@ -558,7 +574,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         None
     };
     let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
-    let store = MemoryStore::new(home.clone());
+    let store = memory_store(home);
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
@@ -615,7 +631,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                     ));
                 }
                 if apply {
-                    let store = MemoryStore::new(home_clone.clone());
+                    let store = memory_store(&home_clone);
                     for m in &s.memory_ops {
                         match store.apply_write("add", &m.entry) {
                             Ok(_) => lines.push("[review] memory saved".into()),

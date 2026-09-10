@@ -62,6 +62,7 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 密钥扫描：`memory` 写入 / `failures.md` 记录含疑似密钥（api key / token / 私钥）一律拒绝落盘。
 - 失败记忆：review 纠正检测（用户纠正 / 助手自认失败）→ `failures.md`，随快照注入 `<FailureMemory>`。
 - 成功写入即镜像到 `sessions.db`（memories 表 + FTS5），`memory-search` / `memory_search` 工具按需查，不进每轮 prompt。
+- 双层记忆：从 cwd 上溯 `.git` 定项目根，`<root>/.rupi/MEMORY.md` 独立限额、分区注入；`memory` 工具与 `memory-write` 支持 `scope=project`。
 - `MemoryManager` 只允许一个外部 provider，第二个拒绝并 warning；
   `prefetch` 超时/失败只记 debug，`sync` 失败记 warning，主循环不崩。
 - `SessionStore`（SQLite + FTS5）提供 `session-search` 跨会话回忆。

@@ -66,6 +66,8 @@ pub struct MemoryStore {
     pub user_profile_enabled: bool,
     pub memory_char_limit: usize,
     pub user_char_limit: usize,
+    /// 项目根（`discover_project` 从 cwd 上溯 `.git` 得到）；项目记忆存 `<root>/.rupi/MEMORY.md`。
+    pub project_root: Option<PathBuf>,
 }
 
 impl MemoryStore {
@@ -76,7 +78,44 @@ impl MemoryStore {
             user_profile_enabled: true,
             memory_char_limit: 5000,
             user_char_limit: 5000,
+            project_root: None,
         }
+    }
+
+    pub fn with_project(mut self, root: PathBuf) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+
+    /// 从 `start` 上溯找 `.git`（或已有 `.rupi/MEMORY.md` 的目录）定项目根；找不到返回 None。
+    pub fn discover_project(start: &Path) -> Option<PathBuf> {
+        let mut dir = if start.is_file() {
+            start.parent()?.to_path_buf()
+        } else {
+            start.to_path_buf()
+        };
+        loop {
+            if dir.join(".git").exists() || dir.join(".rupi").join("MEMORY.md").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    /// 项目名（目录名），注入 prompt 做分区标注。
+    pub fn project_name(&self) -> Option<String> {
+        self.project_root.as_ref().and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+
+    fn project_memory_path(&self) -> Option<PathBuf> {
+        self.project_root
+            .as_ref()
+            .map(|r| r.join(".rupi").join(MEMORY_FILE))
     }
 
     fn memories_dir(&self) -> PathBuf {
@@ -97,10 +136,21 @@ impl MemoryStore {
         if !self.memory_enabled {
             return String::new();
         }
-        self.read_limited(
+        let mut out = self.read_limited(
             &self.memories_dir().join(MEMORY_FILE),
             self.memory_char_limit,
-        )
+        );
+        // 项目层独立限额、分区标注（Hermes two-tier 对齐：全局 + 项目都搜得到）。
+        if let (Some(path), Some(name)) = (self.project_memory_path(), self.project_name()) {
+            let proj = self.read_limited(&path, self.memory_char_limit);
+            if !proj.trim().is_empty() {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&format!("\n[project:{name}]\n{proj}"));
+            }
+        }
+        out
     }
 
     pub fn user_text(&self) -> String {
@@ -144,12 +194,37 @@ impl MemoryStore {
 
     /// agent 经 `memory` 工具写入：即时落盘，返回实时状态（但不改变已冻结快照）。
     /// 含疑似密钥一律拒绝（不落盘，调用方可改写脱敏后再存）。
+    /// scope: "global"（默认）| "project"（无项目根则报错提示）。
     pub fn apply_write(&self, op: &str, entry: &str) -> anyhow::Result<String> {
+        self.apply_write_scoped("global", op, entry)
+    }
+
+    pub fn apply_write_scoped(
+        &self,
+        scope: &str,
+        op: &str,
+        entry: &str,
+    ) -> anyhow::Result<String> {
         if contains_secret(entry) {
             anyhow::bail!("refused: entry looks like a secret (api key/token/private key); store a reference instead");
         }
-        std::fs::create_dir_all(self.memories_dir())?;
-        let path = self.memories_dir().join(MEMORY_FILE);
+        let (dir, mirror_target) = match scope {
+            "project" => {
+                let path = self.project_memory_path().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no project detected (no .git above cwd); write scope=global instead"
+                    )
+                })?;
+                let dir = path.parent().unwrap().to_path_buf();
+                std::fs::create_dir_all(&dir)?;
+                (dir, "project")
+            }
+            _ => {
+                std::fs::create_dir_all(self.memories_dir())?;
+                (self.memories_dir(), "memory")
+            }
+        };
+        let path = dir.join(MEMORY_FILE);
         let mut content = std::fs::read_to_string(&path).unwrap_or_default();
         match op {
             "add" => {
@@ -172,7 +247,7 @@ impl MemoryStore {
             _ => anyhow::bail!("unknown memory op: {op}"),
         }
         std::fs::write(&path, &content)?;
-        self.mirror_memory("memory", entry);
+        self.mirror_memory(mirror_target, entry);
         Ok(content)
     }
 
@@ -182,16 +257,17 @@ impl MemoryStore {
         }
         Some(ToolDefinition {
             name: "memory".into(),
-            description: "Manage long-term memory (MEMORY.md): add/replace/remove entries".into(),
+            description: "Manage long-term memory (MEMORY.md): add/replace/remove entries; scope=project writes to the project's .rupi/MEMORY.md".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "op": {"type": "string", "enum": ["add", "replace", "remove"]},
-                    "entry": {"type": "string"}
+                    "entry": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["global", "project"], "default": "global"}
                 },
                 "required": ["op", "entry"]
             }),
-            prompt_snippet: Some("memory(op, entry): persist durable facts across sessions".into()),
+            prompt_snippet: Some("memory(op, entry, scope=global): persist durable facts across sessions".into()),
         })
     }
 
@@ -403,7 +479,8 @@ impl MemoryManager {
         if name == "memory" {
             let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("add");
             let entry = args.get("entry").and_then(|v| v.as_str()).unwrap_or("");
-            let live = self.store.apply_write(op, entry)?;
+            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
+            let live = self.store.apply_write_scoped(scope, op, entry)?;
             if let Some(e) = &self.external {
                 let _ = e.on_memory_write(op, entry).await;
             }
@@ -897,6 +974,60 @@ mod tests {
             .unwrap();
         assert_eq!(miss, "no matching memories");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn project_tier_discovery_read_write() {
+        let base = std::env::temp_dir().join(format!("rupi-mem-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("demo");
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // 上溯发现
+        let found = MemoryStore::discover_project(&root.join("sub").join("deep")).unwrap();
+        assert_eq!(found, root);
+        assert!(MemoryStore::discover_project(&base.join("orphan")).is_none());
+        // 无项目根写 project 报错
+        let home = base.join("home");
+        let plain = MemoryStore::new(home.clone());
+        assert!(plain.apply_write_scoped("project", "add", "x").is_err());
+        // 有项目根：项目写入独立文件，全局不受影响
+        let store = MemoryStore::new(home.clone()).with_project(root.clone());
+        store.apply_write_scoped("project", "add", "uses pixi envs").unwrap();
+        assert!(root.join(".rupi").join("MEMORY.md").exists());
+        assert!(!store.memory_text().is_empty());
+        assert!(store.memory_text().contains("[project:demo]"));
+        assert!(store.memory_text().contains("pixi"));
+        // 全局文件里没有项目内容
+        let global = std::fs::read_to_string(home.join("memories").join("MEMORY.md"))
+            .unwrap_or_default();
+        assert!(!global.contains("pixi"));
+        // 快照带项目分区
+        assert!(store.frozen_snapshot().memory.contains("[project:demo]"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn manager_routes_project_scope_and_search() {
+        let base = std::env::temp_dir().join(format!("rupi-mem-proj-mgr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("site");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let home = base.join("home");
+        let mgr = MemoryManager::new(MemoryStore::new(home.clone()).with_project(root));
+        mgr.handle_tool_call(
+            "memory",
+            serde_json::json!({"op": "add", "entry": "staging deploys on fridays", "scope": "project"}),
+        )
+        .await
+        .unwrap();
+        let hit = mgr
+            .handle_tool_call("memory_search", serde_json::json!({"query": "fridays"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("[project]"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
