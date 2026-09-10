@@ -73,7 +73,7 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 目录 + `SKILL.md`（frontmatter 必含 `name`/`description`），约束与官方规范一致
   （name 小写-数字-连字符 ≤64，description ≤1024，body 建议 <5000 tokens / <500 行）。
 - 渐进披露：`skills-list`（metadata 索引）→ `skill-load`（全文）→ `read_resource` 按需读
-  `references/`/`assets/`；agent 内以 `load_skill` 工具激活。
+  `references/`/`assets/`；agent 内以 `load_skill` / `read_resource` 工具激活（schema 随工具表发给模型，空注册表时不挂载）。
 - 自积累：`skill-distill <name> <description> [steps...]` 生成新 `SKILL.md` 草稿到
   `~/.rupi/skills/<name>/`，落盘前校验（name 规范 + description 压单行 1..=1024 + steps 非空 + 重名拒绝）。
   REPL/TUI 每轮发送前热刷新注册表，会话内新蒸馏 skill 下一轮即对模型可见，无需重启。

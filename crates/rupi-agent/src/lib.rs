@@ -144,9 +144,11 @@ impl AgentLoop {
         session.push(Message::text(Role::User, user_input));
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
         self.maybe_compress(provider, session, mem).await;
-        // 记忆 + 外部 provider 工具全部暴露给模型（memory/recall 走 mem 路由执行）
+        // 记忆 + 外部 provider + skill 工具全部暴露给模型
+        // （memory/recall 走 mem 路由执行，load_skill/read_resource 走 skills 路由执行）
         let mut all_tools = tools.definitions();
         all_tools.extend(mem.all_tool_definitions());
+        all_tools.extend(skills.tool_definitions());
         // 记忆 prefetch：注入到本轮（不污染冻结快照）
         let recalled = mem.prefetch_all().await;
         let mut system = self
@@ -287,6 +289,20 @@ impl AgentLoop {
                     match skills.load_skill(sk) {
                         Some(body) => rupi_tools::ToolOutput::ok(body),
                         None => rupi_tools::ToolOutput::err(format!("unknown skill {sk}")),
+                    }
+                } else if name == "read_resource" {
+                    let sk = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    match skills.read_resource(sk, rel) {
+                        Ok(body) => {
+                            // 资源文件可能很大：截断保窗口
+                            let mut capped = body.chars().take(20_000).collect::<String>();
+                            if body.chars().count() > 20_000 {
+                                capped.push_str("\n...[truncated: file larger than 20k chars]");
+                            }
+                            rupi_tools::ToolOutput::ok(capped)
+                        }
+                        Err(e) => rupi_tools::ToolOutput::err(format!("read_resource failed: {e:#}")),
                     }
                 } else if let Some(routed) = mem.handle_tool_call(&name, args.clone()).await? {
                     rupi_tools::ToolOutput::ok(routed)
@@ -619,6 +635,78 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(all.contains("plan mode"));
+    }
+
+    #[tokio::test]
+    async fn skill_tools_visible_and_executable_end_to_end() {
+        use rupi_core::ContentBlock;
+        // 磁盘 skill：全文 + references 资源
+        let base = std::env::temp_dir().join(format!("rupi-agent-skilltools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("ops");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: ops-skill\ndescription: ops runbook\n---\n\n# Ops\nFollow runbook.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("references").join("runbook.md"), "RUNBOOK-SECRET-SAUCE").unwrap();
+        let skills = SkillRegistry::discover(&[base.clone()]);
+        // 模型能看见两个工具 schema
+        let defs = skills.tool_definitions();
+        assert!(defs.iter().any(|d| d.name == "load_skill"));
+        assert!(defs.iter().any(|d| d.name == "read_resource"));
+        // 剧本：先 load_skill 全文，再 read_resource 读 references，最后文本收尾
+        let mk_call = |name: &str, args: serde_json::Value| ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: name.into(),
+                    arguments: args,
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let provider = MockProvider::new(vec![
+            mk_call("load_skill", serde_json::json!({"name": "ops-skill"})),
+            mk_call(
+                "read_resource",
+                serde_json::json!({"name": "ops-skill", "path": "references/runbook.md"}),
+            ),
+            MockProvider::text_response("used the skill"),
+        ]);
+        let agent = AgentLoop::new(5);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join("rupi-agent-skilltools-mem");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "do ops",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &skills,
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let all: String = session
+            .history()
+            .iter()
+            .map(|m| m.full_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("Follow runbook"));
+        assert!(all.contains("RUNBOOK-SECRET-SAUCE"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

@@ -164,9 +164,45 @@ impl SkillRegistry {
         Ok(std::fs::read_to_string(&p)?)
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.skills.read().unwrap().len()
+    }
+
+    /// 模型可见的工具 schema（阶段 2 + 3）：没有它们，执行分支再完备模型也调不到。
+    /// 只在注册表非空时由调用方挂载，避免空 skill 环境污染工具表。
+    pub fn tool_definitions(&self) -> Vec<rupi_core::ToolDefinition> {
+        if self.len() == 0 {
+            return vec![];
+        }
+        vec![
+            rupi_core::ToolDefinition {
+                name: "load_skill".into(),
+                description: "Load a skill's full instructions by name (progressive disclosure stage 2)".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }),
+                prompt_snippet: Some(
+                    "load_skill(name): read full skill instructions when a task matches".into(),
+                ),
+            },
+            rupi_core::ToolDefinition {
+                name: "read_resource".into(),
+                description: "Read a file inside a skill dir (references/, scripts/, assets/); path must stay inside the skill".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "path": {"type": "string"}
+                    },
+                    "required": ["name", "path"]
+                }),
+                prompt_snippet: Some(
+                    "read_resource(name, path): fetch skill resources on demand (stage 3)".into(),
+                ),
+            },
+        ]
     }
 }
 
@@ -237,6 +273,36 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.index_block().contains("demo-skill"));
         assert!(reg.load_skill("demo-skill").unwrap().contains("Do X"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tool_definitions_visible_only_when_skills_exist() {
+        let base = std::env::temp_dir().join(format!("rupi-skill-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let empty = SkillRegistry::discover(&[base.clone()]);
+        assert!(empty.tool_definitions().is_empty());
+        let dir = base.join("res");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: res-skill\ndescription: has refs\n---\n\n# Res\nSee references.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("references").join("deep.md"), "DEEP-KNOWLEDGE").unwrap();
+        let reg = SkillRegistry::discover(&[base.clone()]);
+        let defs = reg.tool_definitions();
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().all(|d| d.prompt_snippet.is_some()));
+        assert!(defs.iter().any(|d| d.name == "load_skill"));
+        assert!(defs.iter().any(|d| d.name == "read_resource"));
+        // 越界读拒绝
+        assert!(reg.read_resource("res-skill", "../SKILL.md").is_err());
+        assert!(reg
+            .read_resource("res-skill", "references/deep.md")
+            .unwrap()
+            .contains("DEEP-KNOWLEDGE"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

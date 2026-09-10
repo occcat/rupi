@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { workspace = true }
+rupi-core = { path = "../rupi-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
