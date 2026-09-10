@@ -126,6 +126,99 @@ pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
     run_loop(&mut terminal, ctx).await
 }
 
+/// 内建斜杠派发结果：Quit 退出主循环；Done 顯示一行系统消息并等下一输入；
+/// Pass 非内建，调用方走自定义展开/发送。纯逻辑（无终端依赖），可单测。
+enum Builtin {
+    Quit,
+    Done(String),
+    Pass,
+}
+
+fn dispatch_builtin(
+    text: &str,
+    agent: &mut AgentLoop,
+    session: &mut SessionTree,
+    provider: &mut Arc<dyn LlmProvider>,
+    skills: &SkillRegistry,
+    command_dirs: &[std::path::PathBuf],
+) -> Builtin {
+    let t = text.trim();
+    if t == "/quit" {
+        return Builtin::Quit;
+    }
+    if t == "/skills" {
+        return Builtin::Done(skills.index_block());
+    }
+    if t == "/commands" {
+        return Builtin::Done(commands::index_block(command_dirs));
+    }
+    if t == "/tree" {
+        return Builtin::Done(session.tree_view());
+    }
+    if let Some(prefix) = t.strip_prefix("/goto ") {
+        let prefix = prefix.trim();
+        return match session.resolve_short_id(prefix) {
+            Some(id) if session.goto_node(&id) => {
+                Builtin::Done(format!("[goto {}]", &id[..8.min(id.len())]))
+            }
+            _ => Builtin::Done(format!("[goto] unknown or ambiguous node prefix: {prefix}")),
+        };
+    }
+    // 以下内建与 REPL 同语义：拦截在先，绝不把命令文本发给模型
+    if t == "/rewind" {
+        return if session.current_path.len() >= 2 {
+            let target = session.current_path[session.current_path.len() - 2].clone();
+            session.rewind_to(&target);
+            Builtin::Done("[rewound]".into())
+        } else {
+            Builtin::Done("[rewind] nothing to undo".into())
+        };
+    }
+    if t == "/plan" {
+        agent.plan_mode = !agent.plan_mode;
+        return Builtin::Done(format!(
+            "[plan mode {}]",
+            if agent.plan_mode { "on" } else { "off" }
+        ));
+    }
+    if t == "/thinking" || t.starts_with("/thinking ") {
+        let arg = t.strip_prefix("/thinking").unwrap().trim();
+        if arg.is_empty() {
+            return match agent.thinking {
+                Some(l) => Builtin::Done(format!("[thinking {l:?}]")),
+                None => Builtin::Done("[thinking default (provider default)]".into()),
+            };
+        }
+        return match arg.parse::<rupi_llm::ThinkingLevel>() {
+            Ok(l) => {
+                agent.thinking = Some(l);
+                Builtin::Done(format!("[thinking switched to {l:?}]"))
+            }
+            Err(e) => Builtin::Done(format!("[thinking] {e:#}; staying on current")),
+        };
+    }
+    if t == "/model" || t.starts_with("/model ") {
+        let arg = t.strip_prefix("/model").unwrap().trim();
+        if arg.is_empty() {
+            return Builtin::Done(format!("[model {}]", provider.name()));
+        }
+        return match rupi_llm::provider_for_model(arg) {
+            Ok(p) => {
+                *provider = p.into();
+                Builtin::Done(format!("[model switched to {arg}]"))
+            }
+            Err(e) => Builtin::Done(format!("[model] switch failed ({e:#})")),
+        };
+    }
+    if t == "/reload" {
+        // 热重载要 ExtensionSet 所有权 + 可变工具表（REPL 专属路径），TUI 只读装配
+        return Builtin::Done(
+            "[reload] hot reload is REPL-only; restart TUI to pick up extension changes".into(),
+        );
+    }
+    Builtin::Pass
+}
+
 enum Control {
     Continue,
     Quit,
@@ -170,97 +263,20 @@ async fn run_loop(
             }
             KeyCode::Enter if !input.is_empty() => {
                 let text = input.take();
-                if text.trim() == "/quit" {
-                    break;
-                }
-                if text.trim() == "/skills" {
-                    view.push_system(ctx.skills.index_block());
-                    continue;
-                }
-                if text.trim() == "/commands" {
-                    view.push_system(commands::index_block(&ctx.command_dirs));
-                    continue;
-                }
-                if text.trim() == "/tree" {
-                    view.push_system(ctx.session.tree_view());
-                    continue;
-                }
-                if let Some(prefix) = text.trim().strip_prefix("/goto ") {
-                    let prefix = prefix.trim();
-                    match ctx.session.resolve_short_id(prefix) {
-                        Some(id) if ctx.session.goto_node(&id) => {
-                            view.push_system(format!("[goto {}]", &id[..8.min(id.len())]));
-                        }
-                        _ => view.push_system(format!(
-                            "[goto] unknown or ambiguous node prefix: {prefix}"
-                        )),
+                match dispatch_builtin(
+                    &text,
+                    ctx.agent,
+                    ctx.session,
+                    ctx.provider,
+                    ctx.skills,
+                    &ctx.command_dirs,
+                ) {
+                    Builtin::Quit => break,
+                    Builtin::Done(msg) => {
+                        view.push_system(msg);
+                        continue;
                     }
-                    continue;
-                }
-                // 内建命令（与 REPL 同语义）：拦截在先，绝不把命令文本发给模型
-                if text.trim() == "/rewind" {
-                    if ctx.session.current_path.len() >= 2 {
-                        let target =
-                            ctx.session.current_path[ctx.session.current_path.len() - 2].clone();
-                        ctx.session.rewind_to(&target);
-                        view.push_system("[rewound]".into());
-                    } else {
-                        view.push_system("[rewind] nothing to undo".into());
-                    }
-                    continue;
-                }
-                if text.trim() == "/plan" {
-                    ctx.agent.plan_mode = !ctx.agent.plan_mode;
-                    view.push_system(format!(
-                        "[plan mode {}]",
-                        if ctx.agent.plan_mode { "on" } else { "off" }
-                    ));
-                    continue;
-                }
-                if text.trim() == "/thinking" || text.trim().starts_with("/thinking ") {
-                    let arg = text.trim().strip_prefix("/thinking").unwrap().trim();
-                    if arg.is_empty() {
-                        match ctx.agent.thinking {
-                            Some(t) => view.push_system(format!("[thinking {t:?}]")),
-                            None => {
-                                view.push_system("[thinking default (provider default)]".into())
-                            }
-                        }
-                    } else {
-                        match arg.parse::<rupi_llm::ThinkingLevel>() {
-                            Ok(t) => {
-                                ctx.agent.thinking = Some(t);
-                                view.push_system(format!("[thinking switched to {t:?}]"));
-                            }
-                            Err(e) => {
-                                view.push_system(format!("[thinking] {e:#}; staying on current"))
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if text.trim() == "/model" || text.trim().starts_with("/model ") {
-                    let arg = text.trim().strip_prefix("/model").unwrap().trim();
-                    if arg.is_empty() {
-                        view.push_system(format!("[model {}]", ctx.provider.name()));
-                    } else {
-                        match rupi_llm::provider_for_model(arg) {
-                            Ok(p) => {
-                                *ctx.provider = p.into();
-                                view.push_system(format!("[model switched to {arg}]"));
-                            }
-                            Err(e) => view.push_system(format!("[model] switch failed ({e:#})")),
-                        }
-                    }
-                    continue;
-                }
-                if text.trim() == "/reload" {
-                    // 热重载要 ExtensionSet 所有权 + 可变工具表（REPL 专属路径），TUI 只读装配
-                    view.push_system(
-                        "[reload] hot reload is REPL-only; restart TUI to pick up extension changes"
-                            .into(),
-                    );
-                    continue;
+                    Builtin::Pass => {}
                 }
                 // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
                 let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
@@ -514,5 +530,236 @@ fn render_line(l: &Line) -> RLine<'static> {
             t.clone(),
             Style::default().fg(Color::DarkGray),
         )]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rupi_core::{Message, Role};
+
+    fn harness() -> (AgentLoop, SessionTree, Arc<dyn LlmProvider>, SkillRegistry) {
+        (
+            AgentLoop::new(3),
+            SessionTree::new(),
+            Arc::new(rupi_llm::MockProvider::new(vec![])),
+            SkillRegistry::default(),
+        )
+    }
+
+    fn done_text(b: Builtin) -> String {
+        match b {
+            Builtin::Done(s) => s,
+            _ => panic!("expected Done, got other"),
+        }
+    }
+
+    #[test]
+    fn quit_pass_and_plain_text() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert!(matches!(
+            dispatch_builtin(
+                "/quit",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            ),
+            Builtin::Quit
+        ));
+        assert!(matches!(
+            dispatch_builtin(
+                "hello",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            ),
+            Builtin::Pass
+        ));
+        // 内建前缀但无参数的 /goto 走 Pass（与 REPL 一致，不拦截）
+        assert!(matches!(
+            dispatch_builtin(
+                "/goto",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            ),
+            Builtin::Pass
+        ));
+    }
+
+    #[test]
+    fn plan_toggles_and_persists_on_agent() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/plan",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[plan mode on]"
+        );
+        assert!(agent.plan_mode);
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/plan",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[plan mode off]"
+        );
+        assert!(!agent.plan_mode);
+    }
+
+    #[test]
+    fn thinking_show_set_and_reject() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/thinking",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[thinking default (provider default)]"
+        );
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/thinking high",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[thinking switched to High]"
+        );
+        assert_eq!(agent.thinking, Some(rupi_llm::ThinkingLevel::High));
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/thinking",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[thinking High]"
+        );
+        let msg = done_text(dispatch_builtin(
+            "/thinking ultra",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(msg.contains("staying on current"), "{msg}");
+        assert_eq!(agent.thinking, Some(rupi_llm::ThinkingLevel::High));
+    }
+
+    #[test]
+    fn model_show_and_failed_switch_stays() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/model",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[model mock]"
+        );
+        // hermetic：清空 key，保证 gpt 路由走缺 key 失败分支
+        let saved: Vec<(&str, Option<String>)> = ["RUPI_API_KEY", "OPENAI_API_KEY"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+        let msg = done_text(dispatch_builtin(
+            "/model gpt-4o-mini",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        for (k, v) in saved {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val) };
+            }
+        }
+        assert!(msg.contains("switch failed"), "{msg}");
+        assert_eq!(provider.name(), "mock");
+    }
+
+    #[test]
+    fn rewind_needs_two_nodes() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/rewind",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[rewind] nothing to undo"
+        );
+        session.push(Message::text(Role::User, "one"));
+        session.push(Message::text(Role::Assistant, "two"));
+        assert_eq!(
+            done_text(dispatch_builtin(
+                "/rewind",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[]
+            )),
+            "[rewound]"
+        );
+        assert!(session.current_path.len() < 3);
+    }
+
+    #[test]
+    fn reload_is_explicitly_unsupported_and_goto_unknown() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        let msg = done_text(dispatch_builtin(
+            "/reload",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(msg.contains("REPL-only"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/goto zzz",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+        ));
+        assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
 }
