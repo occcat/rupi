@@ -13,8 +13,9 @@
 | sessions are trees（branch/rewind/summary） | `SessionTree::branch_from` / `rewind_to` / `prompt_history` 压缩窗口 + `AgentLoop::maybe_compress` |
 | 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + `sanitize_params` + `mcp_tool_to_definition`） |
 | Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill` 工具） |
-| Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（`MemoryStore::frozen_snapshot` + `MemoryProvider` trait + `MemoryManager` + `SessionStore`） |
+| Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + provider/manager + `SessionStore` 触发器同步 FTS + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
 | Skill 自积累（后台 review 沉淀） | `SkillAccumulator::propose` + `rupi skill-distill` |
+| 会话持久化 | 每轮落盘 `sessions.db`，`sessions` / `session-show` / `session-search`（REPL + TUI 通用） |
 | Extension 热重载（自写工具-重载-自测） | `rupi-ext`（manifest + 外部进程契约 stdin JSON→stdout，`ExtensionSet::refresh` mtime 增量重载，`--ext-dir`/`ext-list`，REPL `/reload` + 每轮自动检查） |
 | 权限门与计划模式 | `rupi-agent::policy`（`AllowAll`/`RulePolicy`/`ChainPolicy` + `Approver`，拒绝转 tool error；`--plan` + REPL `/plan` 只读侦察；bash 高危子串转人工审批） |
 | 子任务分发 | `rupi-agent::subagent`（`run_subagents` 分叉会话并发扇出 + `subagent` 委托工具，深度 guard 断递归；`--subagents` 开启） |

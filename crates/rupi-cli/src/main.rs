@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::SessionTree;
 use rupi_llm::{LlmProvider, MockProvider, OpenAiCompatProvider};
-use rupi_memory::{MemoryManager, MemoryStore, SessionStore};
+use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
 use rupi_tools::ToolRegistry;
 use std::path::PathBuf;
@@ -72,6 +72,9 @@ struct Cli {
     /// 启用 subagent 委托工具（模型可把子任务派给子会话，深度 guard 防递归）
     #[arg(long, default_value_t = false)]
     subagents: bool,
+    /// 外部记忆 provider（jsonl：turns.jsonl 回放 + recall 工具）
+    #[arg(long)]
+    memory_provider: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +101,10 @@ enum Cmd {
     SessionSearch { query: String },
     /// 列出外部扩展工具
     ExtList,
+    /// 列出最近会话
+    Sessions,
+    /// 查看会话明细
+    SessionShow { id: String },
     /// MCP tools/list 探活
     McpList { command: String, args: Vec<String> },
 }
@@ -227,6 +234,18 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} — {}", m.name, m.description);
             }
         }
+        Some(Cmd::Sessions) => {
+            let store = SessionStore::open(&home)?;
+            for (id, profile, created, count) in store.list_sessions(20)? {
+                println!("[{profile}] {id} {created} ({count} msgs)");
+            }
+        }
+        Some(Cmd::SessionShow { id }) => {
+            let store = SessionStore::open(&home)?;
+            for (role, content, created) in store.session_messages(&id, 200)? {
+                println!("== {role} @ {created} ==\n{content}");
+            }
+        }
         Some(Cmd::McpList { command, args }) => {
             let cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
             let bridge = rupi_mcp::McpBridge::spawn(cfg).await?;
@@ -263,6 +282,38 @@ fn default_policy() -> rupi_agent::RulePolicy {
     rupi_agent::RulePolicy {
         bash_block: vec!["rm -rf /".into(), "mkfs".into(), "dd if=".into()],
         ..Default::default()
+    }
+}
+
+/// 可选的外部记忆 provider（当前支持 jsonl）。
+async fn maybe_external_memory(
+    cli: &Cli,
+    home: &PathBuf,
+    mem: &mut MemoryManager,
+) -> anyhow::Result<()> {
+    if cli.memory_provider.as_deref() == Some("jsonl") {
+        let mut p = rupi_memory::JsonlProvider::new(10);
+        p.initialize(home).await?;
+        mem.register_external("jsonl".into(), Box::new(p))?;
+        eprintln!("[memory] external provider: jsonl (+recall tool)");
+    }
+    Ok(())
+}
+
+/// 回合落盘：user 原文 + 本轮最后一条助手答复。失败只 warning，不断聊天。
+fn persist_turn(store: &SessionStore, sid: &str, user: &str, session: &SessionTree) {
+    if let Err(e) = store.add_message(sid, "user", user) {
+        tracing::warn!("persist user msg failed: {e:#}");
+    }
+    let assistant = session
+        .history()
+        .iter()
+        .rev()
+        .find(|m| m.role == rupi_core::Role::Assistant)
+        .map(|m| m.full_text())
+        .unwrap_or_default();
+    if let Err(e) = store.add_message(sid, "assistant", &assistant) {
+        tracing::warn!("persist assistant msg failed: {e:#}");
     }
 }
 
@@ -318,7 +369,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut ext_set = load_extensions(&mut tools, &ext_path);
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
-    let mem = Arc::new(MemoryManager::new(store));
+    let mut mem_mgr = MemoryManager::new(store);
+    maybe_external_memory(cli, home, &mut mem_mgr).await?;
+    let mem = Arc::new(mem_mgr);
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
     let mut session = SessionTree::new();
     if cli.subagents {
@@ -336,6 +389,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
 
     println!("rupi v0.1.0 — 输入 /quit 退出，/rewind 回退，/reload 重载扩展，/plan 切换计划模式，/skills 看技能");
+    let sess_db = SessionStore::open(home)?;
+    let sid = sess_db.create_session("default")?;
+    eprintln!("[session {sid}] turns persist to sessions.db");
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -404,6 +460,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 },
             )
             .await?;
+        persist_turn(&sess_db, &sid, &input, &session);
         if cli.review_apply {
             apply_suggestions(home, &pending);
         }
@@ -427,8 +484,13 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
     let store = MemoryStore::new(home.clone());
     let frozen = store.frozen_snapshot();
-    let mem = Arc::new(MemoryManager::new(store));
+    let mut mem_mgr = MemoryManager::new(store);
+    maybe_external_memory(cli, home, &mut mem_mgr).await?;
+    let mem = Arc::new(mem_mgr);
     let skills = Arc::new(SkillRegistry::discover(&skill_dirs(home)));
+    let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(home)?));
+    let sid = sess_db.lock().unwrap().create_session("default")?;
+    eprintln!("[session {sid}] turns persist to sessions.db");
     let mut session = SessionTree::new();
     let mut agent =
         AgentLoop::new(cli.max_turns).with_compression(cli.compress_threshold, cli.compress_keep);
@@ -501,6 +563,15 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         frozen: &frozen,
         skills: &*skills,
         review_lines,
+        on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
+            let db = sess_db.lock().unwrap();
+            if let Err(e) = db.add_message(&sid, "user", &t.user) {
+                tracing::warn!("persist user msg failed: {e:#}");
+            }
+            if let Err(e) = db.add_message(&sid, "assistant", &t.assistant) {
+                tracing::warn!("persist assistant msg failed: {e:#}");
+            }
+        })),
     };
     rupi_tui::launch(ctx).await
 }

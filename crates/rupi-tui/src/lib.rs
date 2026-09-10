@@ -4,4 +4,4 @@
 pub mod app;
 pub mod view;
 
-pub use app::{launch, TuiContext};
+pub use app::{launch, TuiContext, TurnRecord};

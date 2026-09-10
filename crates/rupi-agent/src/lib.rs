@@ -142,11 +142,14 @@ impl AgentLoop {
         session.push(Message::text(Role::User, user_input));
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
         self.maybe_compress(provider, session, mem).await;
+        // 记忆 + 外部 provider 工具全部暴露给模型（memory/recall 走 mem 路由执行）
+        let mut all_tools = tools.definitions();
+        all_tools.extend(mem.all_tool_definitions());
         // 记忆 prefetch：注入到本轮（不污染冻结快照）
         let recalled = mem.prefetch_all().await;
         let mut system = self
             .builder
-            .build(frozen, mem, skills, &tools.definitions(), extensions);
+            .build(frozen, mem, skills, &all_tools, extensions);
         if !recalled.is_empty() {
             system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
         }
@@ -161,7 +164,7 @@ impl AgentLoop {
             let req = ChatRequest {
                 system: system.clone(),
                 messages: history,
-                tools: tools.definitions(),
+                tools: all_tools.clone(),
                 max_tokens: None,
                 temperature: Some(0.2),
             };

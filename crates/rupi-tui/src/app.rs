@@ -38,6 +38,15 @@ pub struct TuiContext<'a> {
     pub skills: &'a SkillRegistry,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
+    pub on_turn: Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
+}
+
+/// 一轮问答记录（传给 `on_turn`）。
+#[derive(Debug, Clone, Default)]
+pub struct TurnRecord {
+    pub user: String,
+    pub assistant: String,
 }
 
 struct Guard;
@@ -104,7 +113,23 @@ async fn run_loop(
                 }
                 view.push_user(text.clone());
                 scroll = 0;
-                match drive_turn(terminal, &mut ctx, &mut view, &mut reader, text).await? {
+                match drive_turn(
+                    terminal,
+                    ctx.agent,
+                    ctx.provider,
+                    ctx.session,
+                    ctx.tools,
+                    ctx.mem,
+                    ctx.frozen,
+                    ctx.skills,
+                    &ctx.review_lines,
+                    &ctx.on_turn,
+                    &mut reader,
+                    &mut view,
+                    text,
+                )
+                .await?
+                {
                     Control::Continue => {}
                     Control::Quit => break,
                 }
@@ -116,35 +141,50 @@ async fn run_loop(
 }
 
 /// 回合内循环：agent future 与键盘事件同场 `select!`，delta 到达即画。
+#[allow(clippy::too_many_arguments)]
 async fn drive_turn(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ctx: &mut TuiContext<'_>,
-    view: &mut ChatView,
+    agent: &AgentLoop,
+    provider: &dyn LlmProvider,
+    session: &mut SessionTree,
+    tools: &ToolRegistry,
+    mem: &MemoryManager,
+    frozen: &FrozenMemory,
+    skills: &SkillRegistry,
+    review_lines: &Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    on_turn: &Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
     reader: &mut EventStream,
+    view: &mut ChatView,
     text: String,
 ) -> anyhow::Result<Control> {
     let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
     let on_event = |e: AgentEvent| {
         let _ = tx.send(e);
     };
-    let fut = ctx.agent.run(
-        ctx.provider,
-        ctx.session,
+    let fut = agent.run(
+        provider,
+        session,
         &text,
-        ctx.tools,
-        ctx.mem,
-        ctx.frozen,
-        ctx.skills,
+        tools,
+        mem,
+        frozen,
+        skills,
         &[],
         &on_event,
     );
-    tokio::pin!(fut);
     let mut scroll: u16 = 0;
-    loop {
+    // 内循环只负责驱动 + 渲染；pin 守卫连同 fut 一起终结于块内，之后才能再读 session
+    enum End {
+        Finished(anyhow::Result<rupi_core::StopReason>),
+        Quit,
+    }
+    let end: End = {
+        tokio::pin!(fut);
+        loop {
         while let Ok(e) = rx.try_recv() {
             view.push_event(&e);
         }
-        if let Some(buf) = &ctx.review_lines {
+        if let Some(buf) = review_lines {
             for line in buf.lock().unwrap().drain(..) {
                 view.push_system(line);
             }
@@ -155,21 +195,18 @@ async fn drive_turn(
                 while let Ok(e) = rx.try_recv() {
                     view.push_event(&e);
                 }
-                if let Some(buf) = &ctx.review_lines {
+                if let Some(buf) = review_lines {
                     for line in buf.lock().unwrap().drain(..) {
                         view.push_system(line);
                     }
                 }
-                if let Err(e) = res {
-                    view.push_system(format!("turn failed: {e:#}"));
-                }
-                return Ok(Control::Continue);
+                break End::Finished(res);
             }
             maybe_key = reader.next() => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) => match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(Control::Quit);
+                            break End::Quit;
                         }
                         KeyCode::PageUp => scroll = scroll.saturating_add(5),
                         KeyCode::PageDown => scroll = scroll.saturating_sub(5),
@@ -178,6 +215,30 @@ async fn drive_turn(
                     _ => {}
                 }
             }
+        }
+        }
+    };
+    match end {
+        End::Quit => Ok(Control::Quit),
+        End::Finished(res) => {
+            match res {
+                Ok(_) => {
+                    let assistant = session
+                        .history()
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == rupi_core::Role::Assistant)
+                        .map(|m| m.full_text())
+                        .unwrap_or_default();
+                    if let Some(cb) = on_turn {
+                        cb(TurnRecord { user: text.clone(), assistant });
+                    }
+                }
+                Err(e) => {
+                    view.push_system(format!("turn failed: {e:#}"));
+                }
+            }
+            Ok(Control::Continue)
         }
     }
 }

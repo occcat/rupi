@@ -435,7 +435,18 @@ impl SessionStore {
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
              CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT);
-             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid');",
+             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid');
+             -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
+             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+               INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+               INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+             END;
+             -- 存量补索引（老库升级路径）
+             INSERT INTO messages_fts(rowid, content)
+               SELECT rowid, content FROM messages
+               WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
         )?;
         Ok(Self { conn })
     }
@@ -464,15 +475,60 @@ impl SessionStore {
     }
 
     /// session_search：跨会话全文检索（FTS5），供 agent 回忆历史上下文。
+    /// FTS 表只存 content，session_id 回 join messages 取。
     pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, snippet(messages_fts, 0, '<b>', '</b>', '...', 20) FROM messages_fts WHERE messages_fts MATCH ? LIMIT ?",
+            "SELECT m.session_id, snippet(messages_fts, 0, '<b>', '</b>', '...', 20)
+             FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+             WHERE messages_fts MATCH ? LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![query, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
             .collect::<Result<Vec<(String, String)>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 最近会话：id / profile / 创建时间 / 消息数（倒序）。
+    pub fn list_sessions(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.profile, s.created_at, COUNT(m.id)
+             FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
+             GROUP BY s.id ORDER BY s.created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |r| {
+                let id: String = r.get(0)?;
+                let profile: String = r.get(1)?;
+                let created: String = r.get(2)?;
+                let count: i64 = r.get(3)?;
+                Ok((id, profile, created, count))
+            })?
+            .collect::<Result<Vec<(String, String, String, i64)>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 会话明细：按时间正序。
+    pub fn session_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_id, limit as i64], |r| {
+                let role: String = r.get(0)?;
+                let content: String = r.get(1)?;
+                let created: String = r.get(2)?;
+                Ok((role, content, created))
+            })?
+            .collect::<Result<Vec<(String, String, String)>, _>>()?;
         Ok(rows)
     }
 }
@@ -538,6 +594,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(miss, "no matches");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn manager_routes_external_recall_tool() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-mgr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut mgr = MemoryManager::new(MemoryStore::new(home.clone()));
+        let mut p = JsonlProvider::new(10);
+        p.initialize(&home).await.unwrap();
+        mgr.register_external("jsonl".into(), Box::new(p)).unwrap();
+        // recall 工具对模型可见
+        assert!(mgr
+            .all_tool_definitions()
+            .iter()
+            .any(|d| d.name == "recall"));
+        // sync 后经 manager 路由可查到
+        mgr.sync_all("buy oolong tea", "noted").await;
+        let hit = mgr
+            .handle_tool_call("recall", serde_json::json!({"query": "oolong"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("oolong"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn session_store_roundtrip_with_fts() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = SessionStore::open(&home).unwrap();
+        let sid = store.create_session("default").unwrap();
+        store
+            .add_message(&sid, "user", "brewing oolong tea")
+            .unwrap();
+        store
+            .add_message(&sid, "assistant", "enjoy your tea")
+            .unwrap();
+        // FTS 真能查到（触发器同步）
+        let hits = store.search("oolong", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, sid);
+        // 列表与明细
+        let list = store.list_sessions(10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].3, 2);
+        let msgs = store.session_messages(&sid, 10).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].0, "user");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
