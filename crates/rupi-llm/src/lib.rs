@@ -20,6 +20,7 @@ pub struct ChatRequest {
     /// 思考强度（对标上游 `/thinking`）：None = 不干预（provider/模型默认）；
     /// Some(Off) = 显式关闭（能关的 provider 省 token），Low/Medium/High 逐档加码。
     /// 压缩摘要与后台 review 请求永远为 None（内部任务不需要烧推理 token）。
+    /// Anthropic 开启后思考块（含 signature）随历史回放，多轮工具流不断签。
     #[serde(default)]
     pub thinking: Option<ThinkingLevel>,
 }

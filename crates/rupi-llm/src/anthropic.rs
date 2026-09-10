@@ -65,7 +65,7 @@ impl AnthropicProvider {
         }
         // extended thinking 开启时 temperature 必须为 1（API 硬性要求），且
         // max_tokens 必须大于 budget；不满足任一条即省略 thinking（退化为普通请求，
-        // 否则 400）。thinking 块签名回放尚未实现，多轮工具流暂不支持开启。
+        // 否则 400）。思考块签名由解析/累积器保留，多轮工具流原样回放。
         let budget = req.thinking.and_then(|t| t.anthropic_budget());
         let thinking_on = budget.is_some_and(|b| req.max_tokens.unwrap_or(4096) > b);
         if thinking_on {
@@ -130,6 +130,23 @@ pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         } => items.push(serde_json::json!({
                             "type": "tool_use", "id": id, "name": name, "input": arguments,
                         })),
+                        // 思考块按原序回放：thinking 必须排在同消息 tool_use 之前
+                        // （调用方 finish() 已保证顺序），signature 缺失即便如此也照发，
+                        // 丢签名的降级由服务端判，本地不静默吞块。
+                        ContentBlock::Thinking { text, signature } => {
+                            let mut item = serde_json::json!({
+                                "type": "thinking", "thinking": text,
+                            });
+                            if let Some(sig) = signature {
+                                item["signature"] = sig.clone().into();
+                            }
+                            items.push(item);
+                        }
+                        ContentBlock::RedactedThinking { data } => {
+                            items.push(serde_json::json!({
+                                "type": "redacted_thinking", "data": data,
+                            }));
+                        }
                         _ => {}
                     }
                 }
@@ -212,6 +229,25 @@ pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::C
                     .to_string(),
                 arguments: item.get("input").cloned().unwrap_or(serde_json::json!({})),
             }),
+            // extended-thinking：明文块留 signature 做回放凭证，加密块留 data 原样回放
+            Some("thinking") => blocks.push(ContentBlock::Thinking {
+                text: item
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                signature: item
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned),
+            }),
+            Some("redacted_thinking") => blocks.push(ContentBlock::RedactedThinking {
+                data: item
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
             _ => {}
         }
     }
@@ -236,7 +272,8 @@ pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::C
     })
 }
 
-/// Anthropic SSE 累积器（纯逻辑，可单测）：text 增量直推，tool_use 按 index 拼 input_json。
+/// Anthropic SSE 累积器（纯逻辑，可单测）：text 增量直推，tool_use 按 index 拼 input_json，
+/// thinking 按 index 攒明文 + signature（静默累积，不进 TextDelta 通道）。
 #[derive(Debug, Default)]
 pub struct AnthropicAccumulator {
     text: String,
@@ -247,6 +284,9 @@ pub struct AnthropicAccumulator {
 #[derive(Debug, Default, Clone)]
 struct Frag {
     is_tool: bool,
+    is_thinking: bool,
+    redacted_data: Option<String>,
+    signature: String,
     id: String,
     name: String,
     buf: String,
@@ -287,6 +327,15 @@ impl AnthropicAccumulator {
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_string();
+                } else if kind == "thinking" {
+                    slot.is_thinking = true;
+                } else if kind == "redacted_thinking" {
+                    // 加密块流式只在 start 里给全量 data，无后续 delta
+                    slot.is_thinking = true;
+                    slot.redacted_data = block
+                        .and_then(|b| b.get("data"))
+                        .and_then(|d| d.as_str())
+                        .map(str::to_owned);
                 }
             }
             "content_block_delta" => {
@@ -311,6 +360,22 @@ impl AnthropicAccumulator {
                             .unwrap_or("");
                         self.slot(index).buf.push_str(p);
                     }
+                    // thinking 明文静默攒块（不进回答文本通道），signature 另攒做回放凭证
+                    Some("thinking_delta") => {
+                        let t = delta.get("thinking").and_then(|s| s.as_str()).unwrap_or("");
+                        let slot = self.slot(index);
+                        slot.is_thinking = true;
+                        slot.buf.push_str(t);
+                    }
+                    Some("signature_delta") => {
+                        let s = delta
+                            .get("signature")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        let slot = self.slot(index);
+                        slot.is_thinking = true;
+                        slot.signature.push_str(s);
+                    }
                     _ => {}
                 }
             }
@@ -325,6 +390,24 @@ impl AnthropicAccumulator {
 
     pub fn finish(self, default_stop: &str) -> super::ChatResponse {
         let mut blocks = vec![];
+        // 思考块排最前：同消息内 thinking 必须先于 tool_use（API 硬性顺序），文本位置自由
+        for f in &self.frags {
+            if !f.is_thinking {
+                continue;
+            }
+            if let Some(data) = &f.redacted_data {
+                blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
+            } else if !f.buf.is_empty() || !f.signature.is_empty() {
+                blocks.push(ContentBlock::Thinking {
+                    text: f.buf.clone(),
+                    signature: if f.signature.is_empty() {
+                        None
+                    } else {
+                        Some(f.signature.clone())
+                    },
+                });
+            }
+        }
         if !self.text.is_empty() {
             blocks.push(ContentBlock::Text { text: self.text });
         }
@@ -584,6 +667,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_thinking_and_redacted_blocks() {
+        let v = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "let me reason", "signature": "sig1"},
+                {"type": "redacted_thinking", "data": "enc9"},
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu9", "name": "bash",
+                 "input": {"command": "ls"}},
+            ],
+            "stop_reason": "tool_use",
+        });
+        let r = parse_anthropic_response(v).unwrap();
+        assert_eq!(r.message.blocks.len(), 4);
+        match &r.message.blocks[0] {
+            ContentBlock::Thinking { text, signature } => {
+                assert_eq!(text, "let me reason");
+                assert_eq!(signature.as_deref(), Some("sig1"));
+            }
+            _ => panic!("expected thinking"),
+        }
+        match &r.message.blocks[1] {
+            ContentBlock::RedactedThinking { data } => assert_eq!(data, "enc9"),
+            _ => panic!("expected redacted"),
+        }
+    }
+
+    #[test]
+    fn replays_thinking_before_tool_use() {
+        let msgs = vec![Message {
+            id: "a".into(),
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Thinking {
+                    text: "hmm".into(),
+                    signature: Some("sig1".into()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "enc9".into(),
+                },
+                ContentBlock::ToolCall {
+                    id: "tu1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        }];
+        let out = to_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig1");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[1]["data"], "enc9");
+        assert_eq!(content[2]["type"], "tool_use");
+    }
+
+    #[test]
     fn parses_text_and_tool_use() {
         let v = serde_json::json!({
             "id": "msg_1",
@@ -694,5 +837,90 @@ mod tests {
             }
             _ => panic!("expected tool call"),
         }
+    }
+
+    #[tokio::test]
+    async fn accumulator_assembles_thinking_with_signature_first() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut acc = AnthropicAccumulator::default();
+        async fn feed(
+            acc: &mut AnthropicAccumulator,
+            tx: &tokio::sync::mpsc::Sender<super::super::StreamEvent>,
+            e: &str,
+            d: serde_json::Value,
+        ) {
+            acc.apply_event(e, &d, tx).await;
+        }
+        // 加密块 start 自带全量 data
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_start",
+            serde_json::json!({"index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "enc0"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_start",
+            serde_json::json!({"index": 1,
+            "content_block": {"type": "thinking"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "reason "}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "more"}}),
+        )
+        .await;
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 1,
+            "delta": {"type": "signature_delta", "signature": "sigX"}}),
+        )
+        .await;
+        // 回答文本照常走 delta 通道，思考文本不进
+        feed(
+            &mut acc,
+            &tx,
+            "content_block_delta",
+            serde_json::json!({"index": 2,
+            "delta": {"type": "text_delta", "text": "hi"}}),
+        )
+        .await;
+        drop(tx);
+        let mut deltas = vec![];
+        while let Some(d) = rx.recv().await {
+            deltas.push(d);
+        }
+        assert_eq!(deltas.len(), 1);
+        let r = acc.finish("end_turn");
+        assert_eq!(r.message.blocks.len(), 3);
+        match &r.message.blocks[0] {
+            ContentBlock::RedactedThinking { data } => assert_eq!(data, "enc0"),
+            _ => panic!("expected redacted first"),
+        }
+        match &r.message.blocks[1] {
+            ContentBlock::Thinking { text, signature } => {
+                assert_eq!(text, "reason more");
+                assert_eq!(signature.as_deref(), Some("sigX"));
+            }
+            _ => panic!("expected thinking"),
+        }
+        // 思考文本不污染回答与 transcript 文本口径
+        assert!(r.message.full_text().contains("[thinking] reason more"));
     }
 }
