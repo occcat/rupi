@@ -63,6 +63,9 @@ struct Cli {
     /// 把 review 建议直接落盘（memory add + skill 草稿）
     #[arg(long, default_value_t = false)]
     review_apply: bool,
+    /// 用模型做后台复盘（默认启发式离线 review；LLM 版烧 token 但提炼质量更高）
+    #[arg(long, default_value_t = false)]
+    review_llm: bool,
     /// 会话压缩阈值（历史字符数，超限摘要最旧部分）
     #[arg(long, default_value_t = 60_000)]
     compress_threshold: usize,
@@ -439,8 +442,14 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
     if cli.review || cli.review_apply {
         let pending_clone = pending.clone();
+        // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
+        let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
+            Arc::new(rupi_agent::LlmReviewer::new(provider.clone()))
+        } else {
+            Arc::new(HeuristicReviewer::default())
+        };
         agent = agent.with_reviewer(
-            Arc::new(HeuristicReviewer::default()),
+            reviewer,
             Arc::new(move |s: ReviewSuggestion| {
                 println!(
                     "\n[review] memory_ops={} failures={} skill={}",
@@ -675,8 +684,13 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     if let Some(buf) = review_lines.clone() {
         let home_clone = home.clone();
         let apply = cli.review_apply;
+        let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
+            Arc::new(rupi_agent::LlmReviewer::new(provider.clone()))
+        } else {
+            Arc::new(HeuristicReviewer::default())
+        };
         agent = agent.with_reviewer(
-            Arc::new(HeuristicReviewer::default()),
+            reviewer,
             Arc::new(move |s: ReviewSuggestion| {
                 let mut lines = buf.lock().unwrap();
                 for m in &s.memory_ops {

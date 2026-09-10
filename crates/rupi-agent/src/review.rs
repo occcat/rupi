@@ -176,6 +176,133 @@ impl Reviewer for HeuristicReviewer {
     }
 }
 
+/// LLM 复盘器（Hermes background_review 完整形态）：把 transcript 喂给模型，
+/// 要求只回 JSON，由调用方按 `--review-apply` 落盘。解析失败/超时一律返回空建议。
+pub struct LlmReviewer {
+    provider: Arc<dyn rupi_llm::LlmProvider>,
+}
+
+impl LlmReviewer {
+    pub fn new(provider: Arc<dyn rupi_llm::LlmProvider>) -> Self {
+        Self { provider }
+    }
+
+    fn prompt(t: &TurnTranscript) -> String {
+        format!(
+            "You are a background learning reviewer for a coding agent. \
+             From this turn, extract durable knowledge worth persisting.\n\
+             User: {}\nAssistant: {}\nTools used: {}\n\n\
+             Reply with ONLY a JSON object, no fences, no prose:\n\
+             {{\"memory_ops\": [{{\"entry\": \"...\"}}], \
+               \"failures\": [\"...\"], \
+               \"skill_draft\": {{\"name\": \"...\", \"description\": \"...\", \"steps\": [\"...\"]}} | null}}\n\
+             Rules: memory_ops only for durable facts/preferences (max 3, each <= 200 chars); \
+             failures only for real mistakes/corrections (max 3); \
+             skill_draft only if >= 2 distinct tools formed a reusable workflow, \
+             name lowercase-alnum-hyphen <= 64 chars. Empty arrays and null when nothing qualifies.",
+            t.user.chars().take(2000).collect::<String>(),
+            t.assistant.chars().take(4000).collect::<String>(),
+            t.tool_names.join(", "),
+        )
+    }
+
+    /// 剥 code fence 后解析模型回包；失败返回 default（调用方视为无建议）。
+    fn parse(text: &str) -> ReviewSuggestion {
+        let t = text.trim();
+        let inner = t
+            .strip_prefix("```json")
+            .or_else(|| t.strip_prefix("```"))
+            .and_then(|s| s.strip_suffix("```"))
+            .map(str::trim)
+            .unwrap_or(t);
+        // 容忍前后杂文本：截首个 { 到末个 }
+        let json = match (inner.find('{'), inner.rfind('}')) {
+            (Some(a), Some(b)) if a <= b => &inner[a..=b],
+            _ => return ReviewSuggestion::default(),
+        };
+        let v: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => return ReviewSuggestion::default(),
+        };
+        let memory_ops = v
+            .get("memory_ops")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| {
+                        o.get("entry")
+                            .and_then(|e| e.as_str())
+                            .map(|e| MemoryOpSuggestion {
+                                entry: e.chars().take(300).collect(),
+                            })
+                    })
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let failures = v
+            .get("failures")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.chars().take(300).collect()))
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let skill_draft = v.get("skill_draft").and_then(|d| {
+            if d.is_null() {
+                return None;
+            }
+            Some(SkillDraftSuggestion {
+                name: d
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("auto-draft")
+                    .to_string(),
+                description: d
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                steps: d
+                    .get("steps")
+                    .and_then(|s| s.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                            .take(20)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        });
+        ReviewSuggestion {
+            memory_ops,
+            failures,
+            skill_draft,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Reviewer for LlmReviewer {
+    async fn review_turn(&self, t: &TurnTranscript) -> anyhow::Result<ReviewSuggestion> {
+        let req = rupi_llm::ChatRequest {
+            system: "You are a terse JSON-only reviewer.".into(),
+            messages: vec![rupi_core::Message::text(
+                rupi_core::Role::User,
+                Self::prompt(t),
+            )],
+            tools: vec![],
+            max_tokens: Some(600),
+            temperature: Some(0.0),
+        };
+        let resp = self.provider.complete(req).await?;
+        Ok(Self::parse(&resp.message.full_text()))
+    }
+}
+
 /// 带超时执行 review，超时/失败返回空建议（调用方无需处理 error）。
 pub async fn review_with_timeout(
     reviewer: &Arc<dyn Reviewer>,
@@ -286,5 +413,46 @@ mod tests {
         assert!(d.name.starts_with("auto-"));
         assert!(d.name.len() <= 64);
         assert!(d.steps.len() >= 2);
+    }
+
+    #[test]
+    fn llm_parse_accepts_fenced_json_and_caps_counts() {
+        let s = LlmReviewer::parse(
+            "```json\n{\"memory_ops\": [{\"entry\": \"a\"}, {\"entry\": \"b\"}, {\"entry\": \"c\"}, {\"entry\": \"d\"}], \
+             \"failures\": [\"f1\"], \"skill_draft\": null}\n```",
+        );
+        assert_eq!(s.memory_ops.len(), 3);
+        assert_eq!(s.failures, vec!["f1".to_string()]);
+        assert!(s.skill_draft.is_none());
+    }
+
+    #[test]
+    fn llm_parse_rejects_garbage() {
+        assert!(LlmReviewer::parse("not json at all").is_empty());
+        assert!(LlmReviewer::parse("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn llm_reviewer_end_to_end_with_mock() {
+        use rupi_llm::MockProvider;
+        let body = serde_json::json!({
+            "memory_ops": [{"entry": "uses fish shell"}],
+            "failures": [],
+            "skill_draft": {"name": "deploy-flow", "description": "deploy steps", "steps": ["read", "bash"]}
+        })
+        .to_string();
+        let r = LlmReviewer::new(Arc::new(MockProvider::new(vec![
+            MockProvider::text_response(&body),
+        ])));
+        let s = r
+            .review_turn(&TurnTranscript {
+                user: "deploy".into(),
+                assistant: "done".into(),
+                tool_names: vec!["read".into(), "bash".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.memory_ops[0].entry, "uses fish shell");
+        assert_eq!(s.skill_draft.as_ref().unwrap().name, "deploy-flow");
     }
 }

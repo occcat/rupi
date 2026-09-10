@@ -77,5 +77,6 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 自积累：`skill-distill <name> <description> [steps...]` 生成新 `SKILL.md` 草稿到
   `~/.rupi/skills/<name>/`，落盘前校验（name 规范 + description 压单行 1..=1024 + steps 非空 + 重名拒绝）。
   REPL/TUI 每轮发送前热刷新注册表，会话内新蒸馏 skill 下一轮即对模型可见，无需重启。
-- 后台 review：`chat --review` 每轮后安静复盘并打印记忆/Skill 建议，
+- 后台 review：`chat --review` 每轮后安静复盘并打印记忆/Skill 建议（默认离线启发式，`--review-llm`
+  用模型做 JSON 复盘，提炼质量更高），
   `--review-apply` 直接落盘（`MEMORY.md` add + skill 草稿；已存在 skill 跳过不覆盖）。

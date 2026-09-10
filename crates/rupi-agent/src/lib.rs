@@ -11,7 +11,7 @@ use rupi_tools::{Tool, ToolRegistry};
 use std::sync::Arc;
 
 pub mod review;
-pub use review::{HeuristicReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
+pub use review::{HeuristicReviewer, LlmReviewer, ReviewSuggestion, Reviewer, TurnTranscript};
 pub mod policy;
 pub use policy::{
     ApprovalAnswer, Approver, ChainPolicy, Decision, Policy, RulePolicy, SessionApprovalCache,
