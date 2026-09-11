@@ -214,13 +214,25 @@ fn dispatch_builtin(
         };
     }
     // 以下内建与 REPL 同语义：拦截在先，绝不把命令文本发给模型
-    if t == "/rewind" {
-        return if session.current_path.len() >= 2 {
-            let target = session.current_path[session.current_path.len() - 2].clone();
-            session.rewind_to(&target);
-            Builtin::Done("[rewound]".into())
-        } else {
-            Builtin::Done("[rewind] nothing to undo".into())
+    if t == "/rewind" || t.starts_with("/rewind ") {
+        let arg = t.strip_prefix("/rewind").unwrap().trim();
+        if arg.is_empty() {
+            return if session.current_path.len() >= 2 {
+                let target = session.current_path[session.current_path.len() - 2].clone();
+                session.rewind_to(&target);
+                Builtin::Done("[rewound]".into())
+            } else {
+                Builtin::Done("[rewind] nothing to undo".into())
+            };
+        }
+        return match session.resolve_short_id(arg) {
+            Some(id) if session.rewind_to(&id) => {
+                Builtin::Done(format!("[rewound {}]", &id[..8.min(id.len())]))
+            }
+            Some(_) => Builtin::Done("[rewind] node not on current path, use /goto".into()),
+            None => Builtin::Done(format!(
+                "[rewind] unknown or ambiguous node prefix: {arg}"
+            )),
         };
     }
     if t == "/plan" {
@@ -1044,6 +1056,36 @@ mod tests {
             "[rewound]"
         );
         assert!(session.current_path.len() < 3);
+        // 带参回退到指定节点：短 id 命中即截断；未知/歧义/跨分支各有反馈。
+        let target = session.current_path[0].clone();
+        let short = &target[..8.min(target.len())];
+        assert_eq!(
+            done_text(dispatch_builtin(
+                &format!("/rewind {short}"),
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+            )),
+            format!("[rewound {short}]")
+        );
+        assert_eq!(session.current_path.len(), 1);
+        let msg = done_text(dispatch_builtin(
+            "/rewind zzz",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+        ));
+        assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
 
     #[test]

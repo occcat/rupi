@@ -1080,14 +1080,27 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             continue;
         }
-        if input == "/rewind" {
-            if session.current_path.len() >= 2 {
-                let target = session.current_path[session.current_path.len() - 2].clone();
-                session.rewind_to(&target);
-                println!("[rewound]");
+        // `/rewind [短id]`：无参回退一步，有参回退到指定节点（与 /goto 同短 id 解析）。
+        if input == "/rewind" || input.starts_with("/rewind ") {
+            let arg = input.strip_prefix("/rewind").unwrap().trim();
+            if arg.is_empty() {
+                if session.current_path.len() >= 2 {
+                    let target = session.current_path[session.current_path.len() - 2].clone();
+                    session.rewind_to(&target);
+                    println!("[rewound]");
+                } else {
+                    // 空历史给反馈（与 TUI 同文案）；此前静默 continue，用户以为卡死。
+                    println!("[rewind] nothing to undo");
+                }
             } else {
-                // 空历史给反馈（与 TUI 同文案）；此前静默 continue，用户以为卡死。
-                println!("[rewind] nothing to undo");
+                match session.resolve_short_id(arg) {
+                    Some(id) if session.rewind_to(&id) => {
+                        println!("[rewound {}]", &id[..8.min(id.len())])
+                    }
+                    // 解析到但不在当前路径（废弃分支节点）：rewind 只回退游标，跨分支用 /goto。
+                    Some(_) => println!("[rewind] node not on current path, use /goto"),
+                    None => println!("[rewind] unknown or ambiguous node prefix: {arg}"),
+                }
             }
             continue;
         }
