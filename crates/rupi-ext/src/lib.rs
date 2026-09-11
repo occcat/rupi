@@ -234,7 +234,7 @@ impl ExternalTool {
             Ok(Ok(out)) => {
                 // 外部进程输出同样有界：与内置 bash 同口径折叠，保上下文窗口
                 let text = rupi_tools::truncate_middle(
-                    &String::from_utf8_lossy(&out.stdout),
+                    &rupi_tools::decode_utf8(&out.stdout),
                     rupi_tools::MAX_TOOL_OUTPUT,
                 )
                 .trim()
@@ -242,7 +242,7 @@ impl ExternalTool {
                 if out.status.success() {
                     rupi_tools::ToolOutput::ok(text)
                 } else {
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let err = rupi_tools::decode_utf8(&out.stderr).trim().to_string();
                     rupi_tools::ToolOutput::err(format!(
                         "exit {}: {err}",
                         out.status

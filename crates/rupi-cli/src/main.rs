@@ -940,8 +940,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }
@@ -1185,8 +1184,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         println!("[subagents] subagent tool enabled");
     }
@@ -1557,8 +1555,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }

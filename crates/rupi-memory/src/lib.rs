@@ -6,8 +6,10 @@
 
 use async_trait::async_trait;
 use rupi_core::ToolDefinition;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const USER_FILE: &str = "USER.md";
@@ -962,79 +964,130 @@ fn fts_phrase(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
+/// 本进程已对哪些 sessions.db 跑过 DDL/迁移（按设备号+inode，删库重建会换 inode）。
+static MIGRATED_DBS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+
+fn migrated_dbs() -> &'static Mutex<HashSet<(u64, u64)>> {
+    MIGRATED_DBS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(unix)]
+fn db_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn db_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+fn apply_connection_pragmas(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    Ok(())
+}
+
+fn migrate_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
+         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT, blocks TEXT);
+         -- trigram 分词：中英文统一按子串可召回（unicode61 把中文整句当一个 token，
+         -- 子串永远查不到）；case_sensitive 0 保英文大小写不敏感
+         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+         -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
+         CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+           INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+         END;
+         -- 扩展记忆镜像（Hermes memories 对齐）：MEMORY.md / failures.md 写入即镜像一行，
+         -- `memory_search` 按需查，不注入每轮 prompt
+         CREATE TABLE IF NOT EXISTS memories(
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           target TEXT NOT NULL,
+           content TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+         CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+           INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+           INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+         END;
+         -- 存量补索引（老库升级路径）
+         INSERT INTO messages_fts(rowid, content)
+           SELECT rowid, content FROM messages
+           WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
+    )?;
+    // 分词器迁移（user_version<2 的 unicode61 老库）：FTS 表只是内容表的索引位，
+    // 删了按 trigram 重建再全量回填即可，触发器不受影响；新库建表即 trigram，直接标版本。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS messages_fts;
+             CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+             INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;
+             DROP TABLE IF EXISTS memory_fts;
+             CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+             INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;
+             PRAGMA user_version = 2;",
+        )?;
+    }
+    // v3：messages.blocks —— 完整消息 JSON（含工具调用/结果/思考块），`--resume` 据此
+    // 结构化回填；老库补列（content 列语义不变，FTS 只索引 content）。
+    let has_blocks = {
+        let mut st = conn.prepare_cached("PRAGMA table_info(messages)")?;
+        let cols: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        cols.iter().any(|c| c == "blocks")
+    };
+    if !has_blocks {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN blocks TEXT;")?;
+    }
+    if version < 3 {
+        conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
+    Ok(())
+}
+
 impl SessionStore {
     pub fn open(home: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(home)?;
-        let conn = rusqlite::Connection::open(home.join("sessions.db"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
-             CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT, blocks TEXT);
-             -- trigram 分词：中英文统一按子串可召回（unicode61 把中文整句当一个 token，
-             -- 子串永远查不到）；case_sensitive 0 保英文大小写不敏感
-             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-             -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
-             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-               INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-               INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-             END;
-             -- 扩展记忆镜像（Hermes memories 对齐）：MEMORY.md / failures.md 写入即镜像一行，
-             -- `memory_search` 按需查，不注入每轮 prompt
-             CREATE TABLE IF NOT EXISTS memories(
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               target TEXT NOT NULL,
-               content TEXT NOT NULL,
-               created_at TEXT NOT NULL
-             );
-             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-             CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-               INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-               INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-             END;
-             -- 存量补索引（老库升级路径）
-             INSERT INTO messages_fts(rowid, content)
-               SELECT rowid, content FROM messages
-               WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
-        )?;
-        // 分词器迁移（user_version<2 的 unicode61 老库）：FTS 表只是内容表的索引位，
-        // 删了按 trigram 重建再全量回填即可，触发器不受影响；新库建表即 trigram，直接标版本。
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 2 {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS messages_fts;
-                 CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-                 INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;
-                 DROP TABLE IF EXISTS memory_fts;
-                 CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-                 INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;
-                 PRAGMA user_version = 2;",
-            )?;
-        }
-        // v3：messages.blocks —— 完整消息 JSON（含工具调用/结果/思考块），`--resume` 据此
-        // 结构化回填；老库补列（content 列语义不变，FTS 只索引 content）。
-        let has_blocks = {
-            let mut st = conn.prepare("PRAGMA table_info(messages)")?;
-            let cols: Vec<String> = st
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            cols.iter().any(|c| c == "blocks")
-        };
-        if !has_blocks {
-            conn.execute_batch("ALTER TABLE messages ADD COLUMN blocks TEXT;")?;
-        }
-        if version < 3 {
-            conn.execute_batch("PRAGMA user_version = 3;")?;
+        let db_path = home.join("sessions.db");
+        let conn = rusqlite::Connection::open(&db_path)?;
+        // 每条连接都要设：WAL / 同步级别 / 忙等。DDL 按 inode 进程内只跑一次。
+        apply_connection_pragmas(&conn)?;
+        let id = db_identity(&db_path);
+        {
+            let mut done = migrated_dbs().lock().expect("migrated db set poisoned");
+            let skip = id.map(|i| done.contains(&i)).unwrap_or(false);
+            if !skip {
+                migrate_schema(&conn)?;
+                if let Some(i) = id.or_else(|| db_identity(&db_path)) {
+                    done.insert(i);
+                }
+            }
         }
         Ok(Self { conn })
     }
 
+    fn execute_cached(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> anyhow::Result<usize> {
+        Ok(self.conn.prepare_cached(sql)?.execute(params)?)
+    }
+
     pub fn create_session(&self, profile: &str) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO sessions(id, profile, created_at, summary) VALUES(?,?,?,?)",
             rusqlite::params![id, profile, chrono::Utc::now().to_rfc3339(), String::new()],
         )?;
@@ -1043,7 +1096,7 @@ impl SessionStore {
 
     /// 写回压缩摘要（`sessions.summary`）。
     pub fn set_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "UPDATE sessions SET summary = ? WHERE id = ?",
             rusqlite::params![summary, session_id],
         )?;
@@ -1052,20 +1105,18 @@ impl SessionStore {
 
     /// 会话是否存在（`session-show` 未知 id 给提示，不与空会话混淆）。
     pub fn has_session(&self, session_id: &str) -> anyhow::Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE id = ?",
-            rusqlite::params![session_id],
-            |r| r.get::<_, i64>(0),
-        )? > 0)
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM sessions WHERE id = ?")?;
+        Ok(stmt.query_row(rusqlite::params![session_id], |r| r.get::<_, i64>(0))? > 0)
     }
 
     /// 读回压缩摘要（resume 时可预热窗口；当前 CLI 只展示）。
     pub fn get_summary(&self, session_id: &str) -> anyhow::Result<String> {
-        Ok(self.conn.query_row(
-            "SELECT summary FROM sessions WHERE id = ?",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )?)
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT summary FROM sessions WHERE id = ?")?;
+        Ok(stmt.query_row(rusqlite::params![session_id], |r| r.get(0))?)
     }
 
     pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
@@ -1093,7 +1144,7 @@ impl SessionStore {
         content: &str,
         blocks: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO messages(id, session_id, role, content, created_at, blocks) VALUES(?,?,?,?,?,?)",
             rusqlite::params![
                 id,
@@ -1110,7 +1161,7 @@ impl SessionStore {
     /// session_search：跨会话全文检索（FTS5），供 agent 回忆历史上下文。
     /// FTS 表只存 content，session_id 回 join messages 取。
     pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT m.session_id, snippet(messages_fts, 0, '<b>', '</b>', '...', 20)
              FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
@@ -1128,7 +1179,7 @@ impl SessionStore {
         &self,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT s.id, s.profile, s.created_at, COUNT(m.id)
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
              GROUP BY s.id ORDER BY s.created_at DESC LIMIT ?",
@@ -1147,7 +1198,7 @@ impl SessionStore {
 
     /// 扩展记忆镜像写入（target: 'memory' | 'failure'），供 `memory_search` 查询。
     pub fn mirror_memory_entry(&self, target: &str, content: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO memories(target, content, created_at) VALUES(?,?,?)",
             rusqlite::params![target, content, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -1161,7 +1212,7 @@ impl SessionStore {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT m.target, snippet(memory_fts, 0, '<b>', '</b>', '...', 20)
              FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
              WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
@@ -1181,7 +1232,7 @@ impl SessionStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
@@ -1203,7 +1254,7 @@ impl SessionStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<SessionRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, role, content, created_at, blocks FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
@@ -1837,6 +1888,43 @@ mod tests {
         // 摘要写回与读回
         store.set_summary(&sid, "talked tea").unwrap();
         assert_eq!(store.get_summary(&sid).unwrap(), "talked tea");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn session_store_pragmas_reopen_and_recreate() {
+        let home = std::env::temp_dir().join(format!(
+            "rupi-mem-pragma-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let db = SessionStore::open(&home).unwrap();
+        let sync: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous should be NORMAL");
+        let busy: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
+        let sid = db.create_session("p").unwrap();
+        drop(db);
+        // 同进程再开：跳过 DDL，pragma 仍要落到新连接上
+        let db2 = SessionStore::open(&home).unwrap();
+        assert!(db2.has_session(&sid).unwrap());
+        let sync2: i64 = db2
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync2, 1);
+        drop(db2);
+        let _ = std::fs::remove_dir_all(&home);
+        // 同路径删库再建：inode 变了必须重跑 DDL
+        let db3 = SessionStore::open(&home).unwrap();
+        assert!(db3.create_session("q").is_ok());
         let _ = std::fs::remove_dir_all(&home);
     }
 }
