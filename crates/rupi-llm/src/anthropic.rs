@@ -27,7 +27,7 @@ impl AnthropicProvider {
             model,
             session_id: uuid::Uuid::new_v4().to_string(),
             session_affinity: None,
-            client: reqwest::Client::new(),
+            client: crate::shared_http_client(),
         }
     }
 

@@ -22,7 +22,7 @@ impl GeminiProvider {
             base_url,
             api_key,
             model,
-            client: reqwest::Client::new(),
+            client: crate::shared_http_client(),
         }
     }
 

@@ -274,6 +274,20 @@ pub fn provider_for_model(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
     Ok(Box::new(OpenAiCompatProvider::from_env(model.to_string())?))
 }
 
+/// 进程内共享的 reqwest Client（rustls + webpki 根证书）。`clone` 只增 Arc；
+/// `/model` 切换不再各建一个 Client。
+pub(crate) fn shared_http_client() -> reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .expect("build rustls HTTP client")
+        })
+        .clone()
+}
+
 /// OpenAI-compatible provider：覆盖 OpenAI / DeepSeek / Moonshot / 本地 Ollama 等。
 /// 通过 `base_url + api_key + model` 配置，默认 `https://api.openai.com/v1`。
 /// OpenRouter 会话亲和（对标上游 bbb61e3）：base_url 含 `openrouter.ai` 时默认
@@ -296,7 +310,7 @@ impl OpenAiCompatProvider {
             model,
             session_id: uuid::Uuid::new_v4().to_string(),
             session_affinity: None,
-            client: reqwest::Client::new(),
+            client: crate::shared_http_client(),
         }
     }
 
@@ -860,6 +874,11 @@ mod teststub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rustls_shared_client_builds() {
+        let _ = shared_http_client();
+    }
 
     #[test]
     fn retryable_status_covers_429_and_5xx() {
