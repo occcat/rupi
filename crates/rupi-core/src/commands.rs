@@ -95,6 +95,72 @@ pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
     vec![home.join("commands"), PathBuf::from(".rupi/commands")]
 }
 
+/// `@path` 引用展开：用户消息里的 `@相对路径` 内联文件内容（对标 Pi 的 @ 附件）。
+/// 规则：`@` 前须是行首/空白（邮件地址不误伤）；路径取到空白或行尾，剥尾部标点
+/// `,.;:)]}!?`；只收 root 内的普通文件（canonical 校验，与 read 沙箱同口径），
+/// 目录/越界/不存在/读失败一律保留原文（静默，用户可改走 read 工具）。
+/// 超 `AT_MAX_BYTES`（64K）截断并标注；展开为围栏块，模型可定位来源。
+pub const AT_MAX_BYTES: u64 = 64 * 1024;
+
+pub fn expand_at_mentions(text: &str, root: &Path) -> String {
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@'
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && i + 1 < bytes.len()
+            && !bytes[i + 1].is_ascii_whitespace()
+        {
+            let mut j = i + 1;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let mut raw = &text[i + 1..j];
+            raw = raw.trim_end_matches([',', '.', ';', ':', ')', ']', '}', '!', '?']);
+            let tail = &text[i + 1 + raw.len()..j];
+            if let Some(block) = read_at_file(raw, &root_canon) {
+                out.push_str(&block);
+                out.push_str(tail);
+                i = j;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().expect("非空剩余必有字符");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn read_at_file(rel: &str, root_canon: &Path) -> Option<String> {
+    if rel.is_empty() || rel.contains('\0') {
+        return None;
+    }
+    let p = Path::new(rel);
+    if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+        return None;
+    }
+    let full = root_canon.join(p);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let canon = full.canonicalize().ok()?;
+    if !canon.starts_with(root_canon) {
+        return None;
+    }
+    let content = std::fs::read_to_string(&canon).ok()?;
+    let truncated = meta.len() > AT_MAX_BYTES;
+    let body: String = content.chars().take(AT_MAX_BYTES as usize).collect();
+    Some(if truncated {
+        format!("`@{rel}` 的内容（已截断前 64K）：\n```\n{body}\n```")
+    } else {
+        format!("`@{rel}` 的内容：\n```\n{body}\n```")
+    })
+}
+
 /// 列出命令：按名称排序的 (name, description)。
 /// description 取 frontmatter `description:`，无则取正文首个非空行（压单行、截 80 字符）。
 pub fn list(dirs: &[PathBuf]) -> Vec<(String, String)> {
@@ -242,5 +308,66 @@ mod tests {
     fn index_block_empty_dirs_hints_paths() {
         let block = index_block(&[PathBuf::from("/nonexistent-rupi-cmd")]);
         assert!(block.contains("no custom commands"));
+    }
+
+    fn at_root(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("rupi-at-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn at_mention_expands_file_content() {
+        let base = at_root("hit");
+        write(&base, "hello.txt", "world");
+        let out = expand_at_mentions("看下 @hello.txt", &base);
+        assert!(out.contains("`@hello.txt` 的内容"), "展开块缺来源：{out}");
+        assert!(out.contains("world"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn at_mention_ignores_email_and_keeps_unresolvable() {
+        let base = at_root("miss");
+        write(&base, "hello.txt", "world");
+        // 邮件地址 @ 前非空白，不误伤
+        assert_eq!(
+            expand_at_mentions("联系 foo@bar.com", &base),
+            "联系 foo@bar.com"
+        );
+        // 不存在 / 越界 / 绝对路径 / 目录一律保留原文
+        assert_eq!(
+            expand_at_mentions("读 @missing.txt", &base),
+            "读 @missing.txt"
+        );
+        assert_eq!(
+            expand_at_mentions("读 @../secret", &base),
+            "读 @../secret"
+        );
+        assert_eq!(expand_at_mentions("读 @/abs", &base), "读 @/abs");
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        assert_eq!(expand_at_mentions("读 @sub", &base), "读 @sub");
+        // 中文透传不损坏
+        assert_eq!(
+            expand_at_mentions("你好世界", &base),
+            "你好世界"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn at_mention_strips_trailing_punct_and_truncates_large() {
+        let base = at_root("edge");
+        write(&base, "hello.txt", "world");
+        // 尾标点剥离后展开，标点保留原文位置
+        let out = expand_at_mentions("看 @hello.txt, 好", &base);
+        assert!(out.contains("world") && out.ends_with(", 好"), "{out}");
+        // 超 64K 截断并标注
+        let big = "x".repeat(AT_MAX_BYTES as usize + 10);
+        write(&base, "big.txt", &big);
+        let out = expand_at_mentions("@big.txt", &base);
+        assert!(out.contains("已截断前 64K"), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -842,6 +842,12 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
         );
     }
     let before_len = session.current_path.len();
+    // @path 引用展开（与 REPL 同语义，root 取 current_dir）：-p 也可内联文件。
+    let prompt_expanded = rupi_core::commands::expand_at_mentions(
+        prompt,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
+    let prompt: &str = &prompt_expanded;
     use std::io::Write as _;
     agent
         .run(
@@ -1180,6 +1186,11 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 input = expanded;
             }
         }
+        // @path 引用展开：斜杠展开之后、发送之前内联文件内容（root 取 current_dir）。
+        input = rupi_core::commands::expand_at_mentions(
+            &input,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
         let before_len = session.current_path.len();
         // 协作取消：Ctrl-C 只在 run 期间捕获（select 存活时），置位后循环在检查点
         // 优雅中止；空闲输入时无监听器，按默认行为杀进程（与现状一致）。

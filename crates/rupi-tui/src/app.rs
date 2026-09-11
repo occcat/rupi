@@ -422,6 +422,10 @@ async fn run_loop(
                             send_text = expanded;
                         }
                     }
+                    // @path 引用展开：斜杠展开之后、发送之前内联文件内容（root 取 current_dir）。
+                    if let Ok(cwd) = std::env::current_dir() {
+                        send_text = commands::expand_at_mentions(&send_text, &cwd);
+                    }
                     view.push_user(send_text.clone());
                     scroll = 0;
                     // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
