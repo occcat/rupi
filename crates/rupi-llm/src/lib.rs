@@ -11,6 +11,8 @@ pub mod gemini;
 pub use gemini::GeminiProvider;
 pub mod overflow;
 pub use overflow::is_overflow_error;
+pub mod sse;
+pub use sse::{SseEvent, SseParser};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -90,11 +92,14 @@ pub struct ChatResponse {
     pub stop_reason: String,
 }
 
-/// 流式事件：目前只透文本增量；工具调用增量由各 provider 在内部累积，
+/// 流式事件：文本增量即时透出；工具调用增量由各 provider 在内部累积，
 /// 随最终 `ChatResponse` 一次返回（与 OpenAI `tool_calls` 流式语义对齐）。
-#[derive(Debug, Clone)]
+/// `Usage` 在流末尾给出（OpenAI `stream_options.include_usage` / Anthropic
+/// `message_delta.usage` / Gemini `usageMetadata`），多次给出以最后一次为准。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
+    Usage { input: u64, output: u64 },
 }
 
 #[async_trait]
@@ -212,6 +217,11 @@ fn openai_body(model: &str, req: &ChatRequest, stream: bool) -> serde_json::Valu
     m.insert("temperature".into(), req.temperature.unwrap_or(0.2).into());
     if stream {
         m.insert("stream".into(), true.into());
+        // 对标 pi-ai：让兼容网关在流末尾附带 usage（不支持的网关忽略该字段）
+        m.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
     }
     if let Some(effort) = req.thinking.and_then(|t| t.openai_effort()) {
         m.insert("reasoning_effort".into(), effort.into());
@@ -349,14 +359,15 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = openai_body(&self.model, &req, false);
         let client = self.client.clone();
-        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3)
-            .await?
-            .error_for_status()?;
+        let resp =
+            post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
+        let resp = ensure_success("openai-compat", resp).await?;
         let v: serde_json::Value = resp.json().await?;
         parse_openai_response(v)
     }
 
-    /// 真 SSE 流：`stream: true`，逐 `data:` 行累积文本与 `tool_calls` 片段。
+    /// 真 SSE 流：`stream: true` + `stream_options.include_usage`，共用 [`SseParser`]
+    /// （跨 chunk UTF-8、多行 `data:`），累积文本与 `tool_calls` 片段，末尾推 Usage。
     async fn complete_streaming(
         &self,
         req: ChatRequest,
@@ -366,31 +377,38 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = openai_body(&self.model, &req, true);
         let client = self.client.clone();
-        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3)
-                .await?
-                .error_for_status()?;
+        let resp =
+            post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
+        let resp = ensure_success("openai-compat", resp).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut parser = SseParser::default();
         let mut acc = SseAccumulator::default();
         let mut stop_reason = "stop".to_string();
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                    continue;
-                };
+            for ev in parser.push_bytes(&chunk) {
                 // [DONE] 是流终结符：必须跳出外层字节循环，否则
                 // 连接复用的网关会让 next() 永远等待，整轮卡死。
-                if data == "[DONE]" {
+                if ev.data.trim() == "[DONE]" {
                     break 'stream;
                 }
-                let v: serde_json::Value = serde_json::from_str(data)?;
+                let v: serde_json::Value = match serde_json::from_str(&ev.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 非 JSON 的 data（网关心跳/注释）跳过，不再让整轮失败
+                        tracing::debug!("openai-compat: skip non-JSON sse data ({e})");
+                        continue;
+                    }
+                };
+                // 流中错误对象（网关限流/上游故障常以 data 形式下发）：转错误而非静默空回
+                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| err.to_string());
+                    anyhow::bail!("openai-compat stream error: {msg}");
+                }
                 acc.apply_chunk(&v, &tx).await;
                 if let Some(fr) = v
                     .pointer("/choices/0/finish_reason")
@@ -424,6 +442,17 @@ impl SseAccumulator {
         v: &serde_json::Value,
         tx: &tokio::sync::mpsc::Sender<StreamEvent>,
     ) {
+        // usage 块（include_usage 时最后一个 chunk，choices 为空）：先于 delta 判定处理
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            let input = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            let output = u
+                .get("completion_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            if input > 0 || output > 0 {
+                let _ = tx.send(StreamEvent::Usage { input, output }).await;
+            }
+        }
         let delta = match v.pointer("/choices/0/delta") {
             Some(d) => d,
             None => return,
@@ -602,6 +631,41 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     v.trim().parse::<u64>().ok().map(|s| s.saturating_mul(1000))
 }
 
+/// 非 2xx 回包转错误：状态码 + 响应体里的错误文案（JSON `error.message` / `error` /
+/// `message`，否则原文，截 2000 字）。此前走 `error_for_status()` 只留状态码：用户
+/// 看不到网关原因（如“无权访问该模型”），`is_overflow_error` 也永远匹配不到 body 里的
+/// 溢出文案，溢出恢复对 OpenAI-compat 形同失效。
+pub async fn ensure_success(
+    provider: &str,
+    resp: reqwest::Response,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let detail = extract_error_message(&body);
+    if detail.is_empty() {
+        anyhow::bail!("{provider} HTTP {status} (no body)");
+    }
+    anyhow::bail!("{provider} HTTP {status}: {detail}");
+}
+
+/// 从错误回包里挑可读文案：JSON 的 `error.message` / `error`（字符串）/ `message`，否则原文。
+pub fn extract_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    let picked = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .map(str::to_owned)
+                .or_else(|| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+                .or_else(|| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    picked.chars().take(2000).collect()
+}
 /// 带重试的 JSON POST：传输错误与 429/5xx 按 `Retry-After`（无则指数退避）
 /// 重试 `max_retries` 次；非重试状态直接返回 Response 由调用方解析错误回包。
 pub async fn post_json_with_retry(
@@ -1183,6 +1247,73 @@ mod tests {
         assert_eq!(
             headers.get("x-session-id").map(String::as_str),
             Some("sess-9")
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::*;
+
+    fn req() -> ChatRequest {
+        ChatRequest {
+            system: "s".into(),
+            messages: vec![Message::text(Role::User, "hi")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn non_2xx_error_surfaces_body_message_in_both_paths() {
+        let (base, _seen) = teststub::start_with_status(
+            serde_json::json!({"error": {"message": "This token has no access to model x", "type": "new_api_error"}}),
+            400,
+        )
+        .await;
+        let p = OpenAiCompatProvider::new(base, "k".into(), "x".into());
+        let err = p.complete(req()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("no access to model x"), "{err:#}");
+        assert!(format!("{err:#}").contains("400"), "{err:#}");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = p.complete_streaming(req(), tx).await.unwrap_err();
+        assert!(format!("{err:#}").contains("no access to model x"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn overflow_body_is_detected_by_is_overflow_error() {
+        let (base, _seen) = teststub::start_with_status(
+            serde_json::json!({"error": {"message": "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens."}}),
+            400,
+        )
+        .await;
+        let p = OpenAiCompatProvider::new(base, "k".into(), "x".into());
+        let err = p.complete(req()).await.unwrap_err();
+        assert!(is_overflow_error(&format!("{err:#}")), "{err:#}");
+    }
+
+    #[test]
+    fn extract_error_message_prefers_json_error_message() {
+        assert_eq!(extract_error_message(r#"{"error":{"message":"boom"}}"#), "boom");
+        assert_eq!(extract_error_message(r#"{"error":"plain"}"#), "plain");
+        assert_eq!(extract_error_message(r#"{"message":"m"}"#), "m");
+        assert_eq!(extract_error_message("  raw text "), "raw text");
+    }
+
+    #[tokio::test]
+    async fn usage_chunk_emits_usage_event() {
+        let mut acc = SseAccumulator::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        acc.apply_chunk(
+            &serde_json::json!({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3}}),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Usage { input: 12, output: 3 }
         );
     }
 }

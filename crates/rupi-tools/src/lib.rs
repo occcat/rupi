@@ -5,6 +5,12 @@ use rupi_core::{CancelFlag, ToolDefinition};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod truncate;
+pub use truncate::{
+    format_size, truncate_head, truncate_tail, TruncationResult, DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES,
+};
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -383,46 +389,201 @@ impl Tool for WriteTool {
 }
 
 pub struct EditTool;
+
+/// 一条替换（`old` 必须非空，且按原文唯一——`replace_all` 例外）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditSpec {
+    pub old: String,
+    pub new: String,
+}
+
+/// 解析 edit 参数：单条 `old_string`/`new_string`（+`replace_all`），或多条 `edits[]`
+/// （每项 `old_string`/`new_string`，兼容 Pi 的 `oldText`/`newText`）。两者可同时给。
+pub fn parse_edit_args(arguments: &serde_json::Value) -> Result<(Vec<EditSpec>, bool), String> {
+    let get = |v: &serde_json::Value, a: &str, b: &str| -> Option<String> {
+        v.get(a)
+            .or_else(|| v.get(b))
+            .and_then(|x| x.as_str())
+            .map(str::to_owned)
+    };
+    let mut edits = vec![];
+    if let Some(list) = arguments.get("edits") {
+        // 部分模型把数组当字符串发；容错解析一层
+        let items: Vec<serde_json::Value> = match list {
+            serde_json::Value::Array(a) => a.clone(),
+            serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(serde_json::Value::Array(a)) => a,
+                Ok(v) => vec![v],
+                Err(e) => return Err(format!("edits is not valid JSON: {e}")),
+            },
+            serde_json::Value::Null => vec![],
+            other => vec![other.clone()],
+        };
+        for (i, item) in items.iter().enumerate() {
+            let (Some(old), Some(new)) = (
+                get(item, "old_string", "oldText"),
+                get(item, "new_string", "newText"),
+            ) else {
+                return Err(format!(
+                    "edits[{i}] must have old_string and new_string (or oldText/newText)"
+                ));
+            };
+            edits.push(EditSpec { old, new });
+        }
+    }
+    if let (Some(old), Some(new)) = (
+        get(arguments, "old_string", "oldText"),
+        get(arguments, "new_string", "newText"),
+    ) {
+        edits.push(EditSpec { old, new });
+    }
+    let replace_all = arguments
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if edits.is_empty() {
+        return Err("edit needs old_string/new_string or a non-empty edits[] list".into());
+    }
+    if replace_all && edits.len() > 1 {
+        return Err("replace_all only applies to a single old_string/new_string edit".into());
+    }
+    Ok((edits, replace_all))
+}
+
+/// 对原文一次性应用全部替换（对标 Pi edit：每条 old 都按**原文**匹配而非逐条累积；
+/// 必须命中且唯一，区间不得重叠）。`replace_all=true` 时单条替换全部命中。
+/// 此前实现是 `replacen(old, new, 1)`：多处命中静默改第一处、空 old 把新文本插到文件头。
+pub fn apply_edits(original: &str, edits: &[EditSpec], replace_all: bool) -> Result<String, String> {
+    if replace_all {
+        let e = &edits[0];
+        if e.old.is_empty() {
+            return Err("old_string must not be empty".into());
+        }
+        let n = original.matches(e.old.as_str()).count();
+        if n == 0 {
+            return Err(
+                "old_string not found in file. It must match exactly, including whitespace."
+                    .into(),
+            );
+        }
+        return Ok(original.replace(e.old.as_str(), &e.new));
+    }
+    struct Span<'a> {
+        start: usize,
+        end: usize,
+        new: &'a str,
+    }
+    let mut spans: Vec<Span> = Vec::with_capacity(edits.len());
+    for (i, e) in edits.iter().enumerate() {
+        if e.old.is_empty() {
+            return Err(format!("edit[{i}]: old_string must not be empty"));
+        }
+        let hits: Vec<usize> = original.match_indices(e.old.as_str()).map(|(p, _)| p).collect();
+        match hits.len() {
+            0 => {
+                return Err(format!(
+                    "edit[{i}]: old_string not found in file. It must match exactly, including whitespace."
+                ))
+            }
+            1 => {}
+            n => {
+                return Err(format!(
+                    "edit[{i}]: old_string matched {n} times. It must be unique — add surrounding context, or set replace_all=true to change every occurrence."
+                ))
+            }
+        }
+        spans.push(Span {
+            start: hits[0],
+            end: hits[0] + e.old.len(),
+            new: &e.new,
+        });
+    }
+    spans.sort_by_key(|s| s.start);
+    for pair in spans.windows(2) {
+        if pair[0].end > pair[1].start {
+            return Err(
+                "edits overlap or are nested. Each old_string is matched against the original file; merge nearby changes into one edit."
+                    .into(),
+            );
+        }
+    }
+    let mut out = String::with_capacity(original.len());
+    let mut cursor = 0usize;
+    for s in spans {
+        out.push_str(&original[cursor..s.start]);
+        out.push_str(s.new);
+        cursor = s.end;
+    }
+    out.push_str(&original[cursor..]);
+    Ok(out)
+}
+
+/// 统一 diff（3 行上下文），供工具回包与 UI 展示；超长折叠保窗口。
+pub fn line_diff(old: &str, new: &str, path: &str) -> String {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let text = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    truncate_middle(&text, 8_000)
+}
 #[async_trait]
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit".into(),
-            description: "Exact string replacement in a file".into(),
+            description: "Exact string replacement in a file. old_string must match exactly once (add surrounding context to disambiguate, or set replace_all). For several disjoint changes in one file pass edits=[{old_string,new_string},...] — each is matched against the original file and must not overlap. Returns a unified diff.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"}
+                    "old_string": {"type": "string", "description": "exact text to replace; must be unique in the file"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean", "description": "replace every occurrence of old_string (default false)"},
+                    "edits": {
+                        "type": "array",
+                        "description": "multiple disjoint replacements, each matched against the original file",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"}
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
                 },
-                "required": ["path", "old_string", "new_string"]
+                "required": ["path"]
             }),
-            prompt_snippet: Some("edit(path, old_string, new_string): exact replacement".into()),
+            prompt_snippet: Some(
+                "edit(path, old_string, new_string | edits[]): exact, unique-match replacement (multi-edit supported)".into(),
+            ),
         }
     }
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
         let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let old = arguments
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let new = arguments
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let (edits, replace_all) = match parse_edit_args(&arguments) {
+            Ok(x) => x,
+            Err(e) => return Ok(ToolOutput::err(e)),
+        };
         let key = mutation_key(path);
         global_mutation_queue()
             .with_queued(key, || async {
                 let content = tokio::fs::read_to_string(path)
                     .await
                     .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
-                if !content.contains(old) {
-                    return Ok(ToolOutput::err("old_string not found"));
-                }
-                let updated = content.replacen(old, new, 1);
-                tokio::fs::write(path, updated).await?;
-                Ok(ToolOutput::ok(format!("edited {path}")))
+                let updated = match apply_edits(&content, &edits, replace_all) {
+                    Ok(u) => u,
+                    Err(e) => return Ok(ToolOutput::err(e)),
+                };
+                tokio::fs::write(path, &updated).await?;
+                let diff = line_diff(&content, &updated, path);
+                Ok(ToolOutput::ok(format!(
+                    "edited {path} ({} replacement{})\n{diff}",
+                    edits.len(),
+                    if edits.len() == 1 { "" } else { "s" }
+                )))
             })
             .await
     }
@@ -461,7 +622,7 @@ impl Tool for BashTool {
                         String::from_utf8_lossy(&out.stderr)
                     ));
                 }
-                s = truncate_middle(&s, MAX_TOOL_OUTPUT);
+                s = bound_bash_output(&s);
                 if out.status.success() {
                     Ok(ToolOutput::ok(s))
                 } else {
@@ -519,7 +680,7 @@ impl Tool for BashTool {
                 if !err_text.is_empty() {
                     s.push_str(&format!("\n[stderr]\n{err_text}"));
                 }
-                s = truncate_middle(&s, MAX_TOOL_OUTPUT);
+                s = bound_bash_output(&s);
                 if status.success() {
                     Ok(ToolOutput::ok(s))
                 } else {
@@ -832,6 +993,23 @@ pub fn truncate_middle(s: &str, limit: usize) -> String {
     )
 }
 
+/// bash 输出有界化（对标 Pi coding-agent 默认：保留尾部 2000 行 / 50KB，先到先截）：
+/// 命令末尾通常是错误与总结，尾部比头部更有信息量；截断时标注保留比例。
+pub fn bound_bash_output(s: &str) -> String {
+    let t = truncate_tail(s, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if !t.truncated {
+        return t.content;
+    }
+    format!(
+        "{}\n\n[truncated: kept last {} / {} lines, {} / {}]",
+        t.content,
+        t.output_lines,
+        t.total_lines,
+        format_size(t.output_bytes),
+        format_size(t.total_bytes)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,15 +1086,16 @@ mod tests {
     #[tokio::test]
     async fn bash_truncates_huge_output_and_honors_timeout() {
         let r = ToolRegistry::with_builtins();
-        // 大输出折叠：保留首尾 + 标注截掉字符数，总长有界
+        // 大输出有界（对标 Pi：保留尾部 2000 行 / 50KB）：末尾在、头部被截、总长有界
         let big = r
             .execute("bash", serde_json::json!({"command": "seq 1 200000"}))
             .await
             .unwrap();
         assert!(!big.is_error);
-        assert!(big.content.contains("[truncated "));
-        assert!(big.content.len() <= MAX_TOOL_OUTPUT + 256);
-        assert!(big.content.starts_with("1\n2\n"));
+        assert!(big.content.contains("[truncated: kept last "));
+        assert!(big.content.len() <= DEFAULT_MAX_BYTES + 256);
+        assert!(big.content.contains("\n200000\n"), "tail must be kept");
+        assert!(!big.content.starts_with("1\n2\n"), "head must be dropped");
         // 超时参数生效（1s 杀掉 sleep 5）
         let slow = r
             .execute(
@@ -1300,6 +1479,97 @@ mod tests {
         for i in 0..20 {
             assert!(final_body.contains(&format!("slot-{i}:1")), "slot-{i} 更新丢失");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn spec(old: &str, new: &str) -> EditSpec {
+        EditSpec {
+            old: old.into(),
+            new: new.into(),
+        }
+    }
+
+    #[test]
+    fn rejects_non_unique_and_empty_and_missing() {
+        let err = apply_edits("foo foo", &[spec("foo", "bar")], false).unwrap_err();
+        assert!(err.contains("matched 2 times"), "{err}");
+        let err = apply_edits("foo", &[spec("", "bar")], false).unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+        let err = apply_edits("foo", &[spec("zzz", "bar")], false).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn replace_all_changes_every_occurrence() {
+        assert_eq!(
+            apply_edits("a-a-a", &[spec("a", "b")], true).unwrap(),
+            "b-b-b"
+        );
+    }
+
+    #[test]
+    fn multi_edit_matches_against_original_and_rejects_overlap() {
+        let src = "aaa\nbbb\nccc\n";
+        let out = apply_edits(src, &[spec("aaa", "AAA"), spec("ccc", "CCC")], false).unwrap();
+        assert_eq!(out, "AAA\nbbb\nCCC\n");
+        // 后一条的 old 落在前一条区间内 → 重叠拒绝
+        let err = apply_edits("abcdef", &[spec("abcd", "X"), spec("cd", "Y")], false).unwrap_err();
+        assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn parses_single_multi_and_pi_aliases() {
+        let (e, all) = parse_edit_args(&serde_json::json!({
+            "path": "f", "old_string": "a", "new_string": "b", "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!((e.len(), all), (1, true));
+        let (e, _) = parse_edit_args(&serde_json::json!({
+            "path": "f", "edits": [{"oldText": "a", "newText": "b"}, {"old_string": "c", "new_string": "d"}]
+        }))
+        .unwrap();
+        assert_eq!(e.len(), 2);
+        assert!(parse_edit_args(&serde_json::json!({"path": "f"})).is_err());
+        assert!(parse_edit_args(&serde_json::json!({
+            "path": "f", "replace_all": true, "edits": [{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_tool_end_to_end_reports_diff_and_refuses_ambiguity() {
+        let dir = std::env::temp_dir().join(format!("rupi-edit-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.txt");
+        std::fs::write(&p, "hello world\nhello again\n").unwrap();
+        let r = ToolRegistry::with_builtins();
+        let path = p.to_string_lossy().to_string();
+        let amb = r
+            .execute(
+                "edit",
+                serde_json::json!({"path": path, "old_string": "hello", "new_string": "bye"}),
+            )
+            .await
+            .unwrap();
+        assert!(amb.is_error, "{}", amb.content);
+        assert!(amb.content.contains("matched 2 times"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world\nhello again\n");
+        let ok = r
+            .execute(
+                "edit",
+                serde_json::json!({"path": path, "old_string": "hello world", "new_string": "bye world"}),
+            )
+            .await
+            .unwrap();
+        assert!(!ok.is_error, "{}", ok.content);
+        assert!(ok.content.contains("-hello world") && ok.content.contains("+bye world"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "bye world\nhello again\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

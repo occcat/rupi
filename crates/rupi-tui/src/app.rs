@@ -20,7 +20,7 @@ use ratatui::{
     Terminal,
 };
 use rupi_agent::AgentLoop;
-use rupi_core::{commands, AgentEvent, Message, Role, SessionTree};
+use rupi_core::{commands, AgentEvent, Message, SessionTree};
 use rupi_llm::LlmProvider;
 use rupi_mcp::McpManager;
 use rupi_memory::{FrozenMemory, MemoryManager, SessionStore};
@@ -72,6 +72,9 @@ pub struct TurnRecord {
     /// 树节点 id（落盘沿用，resume 后短 id 稳定）；缺失时调用方回退随机 id。
     pub user_node: Option<String>,
     pub assistant_node: Option<String>,
+    /// 本轮新增的全部节点（id + 完整消息）：user、含工具调用的 assistant、工具结果、
+    /// 最终答复。调用方逐条落盘（blocks JSON），`/resume` 才能结构化回填工具上下文。
+    pub messages: Vec<(String, Message)>,
 }
 
 struct Guard;
@@ -225,21 +228,17 @@ pub(crate) fn resolve_session_arg(
     }
 }
 
-/// 会话重建：按序回填 user/assistant 文本 + 压缩摘要预热（与 CLI `restore_or_new`
-/// 同语义：工具中间态不落盘，恢复的是 transcript；行 id 沿用库行 id，短 id 稳定）。
+/// 会话重建：按库行顺序回填全部节点 + 压缩摘要预热（与 CLI `restore_or_new` 同语义：
+/// 有 `blocks` 的行按结构回填工具调用/结果，老库纯文本行退回文本；行 id 沿用库行 id）。
 /// 返回 (树, 消息数)；空会话（存在但零消息）返回空树，调用方提示后可直接续聊。
 pub(crate) fn replay_session(
     store: &SessionStore,
     id: &str,
 ) -> anyhow::Result<(SessionTree, usize)> {
-    let msgs = store.session_messages(id, 500)?;
+    let msgs = store.session_records(id, 500)?;
     let mut s = SessionTree::new();
-    for (mid, role, content, _) in msgs {
-        let msg = match role.as_str() {
-            "assistant" => Message::text(Role::Assistant, content),
-            _ => Message::text(Role::User, content),
-        };
-        s.push_with_id(mid, msg);
+    for rec in msgs {
+        s.push_with_id(rec.id.clone(), rec.to_message());
     }
     let n = s.history().len();
     let stored = store.get_summary(id).unwrap_or_default();
@@ -776,6 +775,13 @@ async fn drive_turn(
                         .map(|n| (n.message.full_text(), Some(n.id.clone())))
                         .unwrap_or_default();
                     let user_node = session.current_path.get(before).cloned();
+                    let messages: Vec<(String, Message)> = session
+                        .current_path
+                        .iter()
+                        .skip(before)
+                        .filter_map(|id| session.nodes.get(id))
+                        .map(|n| (n.id.clone(), n.message.clone()))
+                        .collect();
                     if let Some(cb) = on_turn {
                         cb(TurnRecord {
                             user: text.clone(),
@@ -783,10 +789,15 @@ async fn drive_turn(
                             summary: session.summary.clone(),
                             user_node,
                             assistant_node,
+                            messages,
                         });
                     }
                 }
                 Err(e) => {
+                    // 回滚本轮已入树节点（与 REPL 同语义）：失败的一轮不留半截历史
+                    for id in session.current_path.split_off(before) {
+                        session.nodes.remove(&id);
+                    }
                     view.push_system(format!("turn failed: {e:#}"));
                 }
             }

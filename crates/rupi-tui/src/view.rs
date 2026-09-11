@@ -135,6 +135,14 @@ impl ChatView {
                     "✓ compacted: summarized {summarized}, kept {kept}"
                 )));
             }
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                self.lines.push(Line::Tool(format!(
+                    "· usage in={input_tokens} out={output_tokens}"
+                )));
+            }
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }

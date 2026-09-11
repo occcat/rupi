@@ -440,24 +440,41 @@ impl super::LlmProvider for GeminiProvider {
             anyhow::bail!("gemini {status}: {msg}");
         }
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut parser = super::SseParser::default();
         let mut acc = GeminiAccumulator::default();
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                    continue;
-                };
-                if data == "[DONE]" {
+            for ev in parser.push_bytes(&chunk) {
+                if ev.data.trim() == "[DONE]" {
                     break 'stream;
                 }
-                let v: serde_json::Value = serde_json::from_str(data)?;
+                let v: serde_json::Value = match serde_json::from_str(&ev.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("gemini: skip non-JSON sse data ({e})");
+                        continue;
+                    }
+                };
+                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                    anyhow::bail!(
+                        "gemini stream error: {}",
+                        error_text(&v).unwrap_or(&err.to_string())
+                    );
+                }
+                // usageMetadata 每块都可能带（累计值），以最后一次为准
+                if let Some(u) = v.get("usageMetadata") {
+                    let input = u
+                        .get("promptTokenCount")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let output = u
+                        .get("candidatesTokenCount")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    if input > 0 || output > 0 {
+                        let _ = tx.send(super::StreamEvent::Usage { input, output }).await;
+                    }
+                }
                 acc.apply_response(&v, &tx).await;
             }
         }

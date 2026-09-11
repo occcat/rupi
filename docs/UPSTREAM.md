@@ -1,0 +1,98 @@
+# 上游对照（Upstream alignment）
+
+目标：**earendil-works/pi `@earendil-works/pi-coding-agent` 0.85.x** 的 Rust 复刻，外加 Pi 刻意留给扩展层、
+但现代 agent harness 常见的三块：MCP、Hermes 风格记忆、Skill 自积累。
+本文说明每个子系统对应上游哪一部分、哪些是有意偏离、哪些明确不移植。（形式借鉴 `rupi-pi-agent-9492` 分支的 `docs/UPSTREAM.md`。）
+
+参考：
+- Pi 源码：https://github.com/earendil-works/pi （`packages/agent`、`packages/coding-agent`、`packages/ai`）
+- Hermes 记忆与 skills：https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
+
+## Agent loop（`packages/agent/src/agent-loop.ts` → `crates/rupi-agent/src/lib.rs`）
+
+| 上游 | rupi | 说明 |
+|---|---|---|
+| `runLoop`：流式助手消息 → 工具 → 循环直到无工具调用 | `AgentLoop::run` | 事件：`TurnStart/TextDelta/ToolStart/ToolEnd/TurnEnd/RunEnd/Usage/CompactionStart/End/UiPromptStart/End` |
+| `beforeToolCall` / `afterToolCall` | `ToolHook::before/after`（`hooks.rs`） | before 可改写参数或拒绝；after 包住一切结果（含拒绝路径） |
+| `toolExecution: parallel \| sequential` | `--parallel-tools`，默认串行 | 并行 `join_all`，事件与结果保原序；审批问询永远串行发生在执行前 |
+| 取消（effect gate） | `CancelFlag`（Atomic + Notify） | turn 边界、流中、串行工具间隙三处检查点；bash 进程组 SIGKILL |
+| 溢出恢复（`isContextOverflow` → 强制压实重发） | `overflow.rs` + `MAX_OVERFLOW_RECOVERIES=2` | 现在对 OpenAI-compat 也生效：非 2xx 回包读出 body 后再匹配（见"本次合并"） |
+| steering / follow-up 队列 | 部分：TUI 运行中输入自动排队为下一轮 | 未实现 Pi 的运行中注入（mid-run steering） |
+| `stopReason=error` 转助手消息 | 直接返回 `Err`，调用方决定 | REPL 打印错误并回滚本轮；`run` 非零退出；错误轮**不落盘**（对比 2c40 分支会污染会话） |
+
+## Compaction（`packages/agent/src/harness/compaction` → `AgentLoop::compress_inner`）
+
+- 上游按 token（`reserveTokens=16384`、`keepRecentTokens=20000`）；rupi 按**字符阈值**（默认 60k）+ **保留条数**（默认 20），`RUPI_COMPRESSION_OVERRIDES` 按 `provider/model` 覆盖，对标 `compaction.modelOverrides`。
+- 摘要由模型生成，失败退回首行拼接；`<read-files>/<modified-files>` 文件足迹跨轮合并（对标上游 file-ops 追踪）。
+- `/compact [指令]` 手动压实，对标 `compaction.customInstructions`。
+- 有意偏离：摘要不写回会话树节点，只存 `sessions.summary` 一列，resume 时预热窗口。
+
+## 会话（Pi "sessions are trees" → `rupi_core::SessionTree` + `sessions.db`）
+
+- 树：`branch_from` / `rewind_to` / `goto_node` / `tree_view`，节点 id 即库行 id，`/goto 短id` 跨进程稳定。
+- 持久化：SQLite（WAL）而非上游 JSONL。**本次合并后每个节点完整落盘**：`content` 列存纯文本（FTS/展示），
+  `blocks` 列存整条 `Message` JSON（工具调用、工具结果、思考块），`--resume` / TUI `/resume` 按结构回填，模型续聊时看到完整工具上下文。老库自动补列（`user_version=3`）。
+- 不移植：上游 JSONL v3 文件格式、`--session <path>`。
+
+## 工具（`packages/coding-agent/src/core/tools` → `crates/rupi-tools`）
+
+| 上游 | rupi |
+|---|---|
+| `read`（`offset/limit`，头截 2000 行/50KB） | `read` 分页 offset/limit；单行超长中部折叠 |
+| `edit`（`edits[]` 按原文匹配、必须唯一、不得重叠、返回 diff） | **同语义**：`old_string/new_string`（+`replace_all`）或 `edits[]`（兼容 `oldText/newText`），唯一性校验、重叠拒绝、统一 diff 回包。此前是 `replacen(...,1)` 静默改首个匹配 |
+| `bash`（尾截 2000 行/50KB、超时、进程组 kill） | 同默认（`truncate.rs` 自 2c40 分支搬运），默认 30s 超时可调，`execute_with_cancel` 进程组 SIGKILL、取消返回部分输出 |
+| `grep` / `find` / `ls` | `grep` / `glob`；`ls` 用 bash |
+| — | `think`（Anthropic 风格）、`load_skill` / `read_resource`、`memory` / `memory_search` / `session_search`、`search_tools`（渐进式发现） |
+| 无路径沙箱 | `SandboxedTool`：read/write/edit/glob/grep 约束在启动 cwd 内（canonicalize，拒绝 `..`/绝对路径/符号链接逃逸）；bash 不受限（与上游一致） |
+| 同文件写串行化（`withFileMutationQueue`） | `FileMutationQueue` |
+
+## Provider 层（`packages/ai` → `crates/rupi-llm`）
+
+- OpenAI 兼容 / Anthropic Messages / Gemini `generateContent`，按模型名前缀路由（`claude-*` / `gemini-*` / 其余）。
+- 真 SSE 流式。**本次合并后三家共用 `sse.rs`**（自 2c40 搬运并加强）：跨 chunk UTF-8 增量解码、多行 `data:`、`event:`、CRLF；流中 `error` 事件/对象转错误而非静默空回。
+- `usage`：OpenAI `stream_options.include_usage`、Anthropic `message_start/message_delta.usage`、Gemini `usageMetadata` → `StreamEvent::Usage` → `AgentEvent::Usage`（REPL/TUI/`run` 显示，`--json` 输出为事件）。
+- 重试：429/5xx + `Retry-After`，指数退避 500ms·2ⁿ 上限 8s，3 次。
+- thinking 四档映射 `reasoning_effort` / `thinkingLevel` / `thinking.budget_tokens`；Anthropic 签名回放、prompt caching 断点。已知限制：Anthropic `medium/high` 需要 `max_tokens > budget`，默认 4096 下只有 `low` 生效。
+- 不移植：OAuth provider、pi-ai 的模型目录/定价表、图片输入。
+
+## MCP（Pi 生态 `pi-mcp-adapter` / 官方规范 2024-11-05 + Streamable HTTP）
+
+- stdio：换行 JSON-RPC，按 id 路由 oneshot，30s 超时，server→client `roots/list` / `ping` 应答，`notifications/tools/list_changed` 差量刷新。
+- Streamable HTTP：POST 单 JSON / SSE 回包，`mcp-session-id` 保持，独立 GET 常驻流，反向请求当场 POST 应答。
+- `tools/list`（cursor 分页）→ `{server}_{tool}`；`resources/list→read` / `prompts/list→get` 各生成一个 per-server 工具；`sanitize_params` 按 schema 把 string 纠回 boolean/number。
+- 不移植：legacy HTTP+SSE 双端点、JSON-RPC batch、sampling。
+
+## 记忆（Hermes）
+
+- `MEMORY.md` / `USER.md` / `failures.md`，各 5000 字符，超限按行丢最旧；启动冻结快照（保 prefix cache），会话内写盘即时、下个 session 可见。
+- 项目域：从 cwd 上溯 `.git`，`<root>/.rupi/MEMORY.md` 独立限额分区注入；`scope=project`。
+- **`[core]` 分层（本次合并，借鉴 9492 分支 / Hermes core-extended）**：任一行带 `[core]` 时只注入标记行，其余为 extended 层，`memory_search` 按需召回（FTS 镜像 + 文件子串兜底）；无标记全量注入，向后兼容。
+- 密钥扫描拒写；`MemoryProvider` 外部接口（单 provider）+ `JsonlProvider` 示例；prefetch 3s 超时 + 寒暄门。
+
+## Skills（Agent Skills 开放标准 + Hermes 自积累）
+
+- 递归发现（honor `.gitignore/.ignore`），`SKILL.md` frontmatter 校验，三阶段渐进披露，`/skillname args` 即斜杠命令，每轮热刷新。
+- 自积累：默认启发式复盘只建议不落盘，`--review-apply` 落盘，`--review-llm` 用模型复盘；`skill-distill` 手工蒸馏。
+
+## CLI / TUI（`packages/coding-agent` CLI）
+
+| 上游 | rupi |
+|---|---|
+| `pi` 交互 | `rupi chat`（REPL）与 `rupi tui`（ratatui：Tab 补全、`@path`、`/sessions` `/resume`、运行中排队） |
+| `pi -p` | `rupi run "..."` |
+| `pi --mode json` | `rupi run --json "..."`（本次合并）：stdout 每行一个 `AgentEvent`（`{"type":"text_delta",...}`），末行 `run_result`，出错 `error` 行 + 非零退出 |
+| `pi --continue/--resume` | `--resume <id>`，`rupi sessions` / `session-show` |
+| `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
+| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`，`$ARGUMENTS` |
+| 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题/差分渲染器 |
+
+## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复
+
+1. REPL 遇 provider 错误不再退出进程：回滚本轮节点、打印原因、回到提示符（TUI 同步回滚）。
+2. `edit` 唯一匹配校验 + `replace_all` + `edits[]` 多处编辑 + 统一 diff（对标 Pi，搬运 2c40 的 `apply_edits` 语义）。
+3. OpenAI-compat 非 2xx 回包读出 body：用户看到网关原因，溢出恢复对该 provider 生效。
+4. 会话落盘完整节点（`blocks` JSON），`--resume` 恢复工具上下文；老库自动迁移。
+5. 搬运：`truncate.rs`（bash 尾截 2000 行/50KB）、`sse.rs`（多行 data、跨 chunk UTF-8）、`run --json`、usage 统计。
+6. 借鉴：`[core]` 记忆分层、本文档。
+
+已知未做：`spawn_blocking` 包裹 `std::fs`/rusqlite 阻塞调用；Anthropic thinking 预算与 `max_tokens` 联动；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱。

@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
-use rupi_core::{Message, SessionTree};
+use rupi_core::SessionTree;
 use rupi_llm::{LlmProvider, MockProvider};
 use rupi_memory::{MemoryManager, MemoryProvider, MemoryStore, SessionStore};
 use rupi_skills::{SkillAccumulator, SkillRegistry};
@@ -137,6 +137,10 @@ enum Cmd {
     Run {
         /// 任务描述（多词自动拼接，无需引号）
         prompt: Vec<String>,
+        /// JSONL 事件流（对标 pi --mode json）：stdout 每行一个 AgentEvent，
+        /// 末行 `run_result`（session_id / stop_reason / 最终文本）；出错时 `error` 行 + 非零退出
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// 显示记忆快照
     MemoryShow,
@@ -333,7 +337,8 @@ fn sandbox_root() -> PathBuf {
 /// 沙箱工具表：文件工具约束在工作区内，相对路径按 root 解析（subagent 克隆继承）。
 fn sandboxed_tools() -> ToolRegistry {
     let root = sandbox_root();
-    println!("[sandbox workspace: {}]", root.display());
+    // 诊断走 stderr：`run --json` 的 stdout 必须是纯 JSONL
+    eprintln!("[sandbox workspace: {}]", root.display());
     ToolRegistry::with_sandboxed_builtins(&root)
 }
 
@@ -541,8 +546,8 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("[mcp-list] prompts unsupported: {e:#}"),
             }
         }
-        Some(Cmd::Run { ref prompt }) => {
-            run_once(&cli, &home, &prompt.join(" ")).await?;
+        Some(Cmd::Run { ref prompt, json }) => {
+            run_once(&cli, &home, &prompt.join(" "), json).await?;
         }
         Some(Cmd::Chat) | None => {
             run_chat(&cli, &home).await?;
@@ -654,11 +659,11 @@ async fn maybe_external_memory(
     Ok(())
 }
 
-/// 恢复历史会话：按序回填 user/assistant 文本继续聊。
-/// 工具中间态不落盘，恢复的是 transcript（对应行数可能少于原树节点数）。
+/// 恢复历史会话：按库行顺序回填全部节点（user、含工具调用的 assistant、工具结果）——
+/// 有 `blocks` 的行按结构回填，老库纯文本行退回文本，模型续聊时看到完整工具上下文。
 fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionTree, String)> {
     if let Some(id) = &cli.resume {
-        let msgs = sess_db.session_messages(id, 500)?;
+        let msgs = sess_db.session_records(id, 500)?;
         if msgs.is_empty() {
             // 存在但零消息（建完即退）与完全未知要区分：前者续进同 id 空树，后者 bail
             if sess_db.has_session(id)? {
@@ -672,13 +677,9 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
             anyhow::bail!("unknown session: {id} (see `rupi sessions`)");
         }
         let mut s = SessionTree::new();
-        for (id, role, content, _) in msgs {
-            let msg = match role.as_str() {
-                "assistant" => Message::text(rupi_core::Role::Assistant, content),
-                _ => Message::text(rupi_core::Role::User, content),
-            };
+        for rec in msgs {
             // 沿用库行 id：跨进程短 id 稳定，/tree 所见即 /goto 可达
-            s.push_with_id(id, msg);
+            s.push_with_id(rec.id.clone(), rec.to_message());
         }
         eprintln!("[resume {}] restored {} msgs", id, s.history().len());
         rupi_tools::export_session_id(id);
@@ -700,42 +701,38 @@ fn restore_or_new(cli: &Cli, sess_db: &SessionStore) -> anyhow::Result<(SessionT
     }
 }
 
-/// 回合落盘：user 原文 + 本轮最后一条助手答复。失败只 warning，不断聊天。
-/// 行 id 沿用树节点 id（`before_len` 为本轮前路径长度，用户节点即 `current_path[before_len]`），
-/// resume 回填后短 id 跨进程稳定，`/goto` 可用；找不到则回退随机 id。
-fn persist_turn(
-    store: &SessionStore,
-    sid: &str,
-    user: &str,
-    session: &SessionTree,
-    before_len: usize,
-) {
-    let user_id = session
-        .current_path
-        .get(before_len)
-        .cloned()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if let Err(e) = store.add_message_with_id(&user_id, sid, "user", user) {
-        tracing::warn!("persist user msg failed: {e:#}");
+/// 回合落盘：本轮新增的全部节点（user、含工具调用的 assistant、工具结果、最终答复）
+/// 逐条落 sessions.db —— `content` 存纯文本供 FTS/展示，`blocks` 存完整消息 JSON 供
+/// `--resume` 结构化回填（此前只存 user 原文 + 最后一条助手文本，恢复后丢全部工具上下文）。
+/// 行 id 沿用树节点 id，resume 后短 id 跨进程稳定，`/goto` 可用。失败只 warning，不断聊天。
+fn persist_turn(store: &SessionStore, sid: &str, session: &SessionTree, before_len: usize) {
+    for id in session.current_path.iter().skip(before_len) {
+        let Some(node) = session.nodes.get(id) else {
+            continue;
+        };
+        let role = role_label(&node.message.role);
+        let blocks = serde_json::to_string(&node.message).ok();
+        if let Err(e) =
+            store.add_message_full(id, sid, role, &node.message.full_text(), blocks.as_deref())
+        {
+            tracing::warn!("persist {role} msg failed: {e:#}");
+        }
     }
-    let (asst_id, assistant) = session
-        .current_path
-        .iter()
-        .skip(before_len)
-        .filter_map(|id| session.nodes.get(id))
-        .filter(|n| n.message.role == rupi_core::Role::Assistant)
-        .last()
-        .map(|n| (n.id.clone(), n.message.full_text()))
-        .unwrap_or_else(|| (uuid::Uuid::new_v4().to_string(), String::new()));
-    if let Err(e) = store.add_message_with_id(&asst_id, sid, "assistant", &assistant) {
-        tracing::warn!("persist assistant msg failed: {e:#}");
+}
+
+fn role_label(role: &rupi_core::Role) -> &'static str {
+    match role {
+        rupi_core::Role::System => "system",
+        rupi_core::Role::User => "user",
+        rupi_core::Role::Assistant => "assistant",
+        rupi_core::Role::Tool => "tool",
     }
 }
 
 /// 非交互执行一次（对标 pi -p）：跑完即退出，回合落盘进会话库。
 /// 无问询：Ask 无审批器即拒绝（除非 --approve）；项目资源默认跳过（除非 --trust-project）。
 /// stdout 只走模型正文（可管道），诊断走 stderr。
-async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()> {
+async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow::Result<()> {
     // 审批档位 + thinking 档位先验（错配直接 bail，不建会话不落盘）
     let approver = approver_for(cli, None)?;
     let thinking = thinking_for(cli)?;
@@ -849,7 +846,14 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
     );
     let prompt: &str = &prompt_expanded;
     use std::io::Write as _;
-    agent
+    // --json：stdout 只走 JSONL 事件（AgentEvent 的 serde 形状，`type` 区分），人读诊断仍走 stderr
+    let emit_json = |e: &rupi_core::AgentEvent| {
+        if let Ok(line) = serde_json::to_string(e) {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
+    };
+    let res = agent
         .run(
             &*provider,
             &mut session,
@@ -859,34 +863,79 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str) -> anyhow::Result<()>
             &frozen,
             &*skills,
             &[],
-            &|e| match e {
-                rupi_core::AgentEvent::TextDelta { delta } => {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
+            &|e| {
+                if json {
+                    emit_json(&e);
+                    return;
                 }
-                rupi_core::AgentEvent::ToolStart { name, .. } => {
-                    eprintln!("\n[tool {name}]…")
+                match e {
+                    rupi_core::AgentEvent::TextDelta { delta } => {
+                        print!("{delta}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    rupi_core::AgentEvent::ToolStart { name, .. } => {
+                        eprintln!("\n[tool {name}]…")
+                    }
+                    rupi_core::AgentEvent::ToolEnd { name, is_error, .. } => {
+                        eprintln!("\n[{name} {}]", if is_error { "error" } else { "ok" })
+                    }
+                    rupi_core::AgentEvent::MemoryRecall { detail } => {
+                        eprintln!("{detail}")
+                    }
+                    rupi_core::AgentEvent::CompactionStart => {
+                        eprintln!("\n[compacting]…")
+                    }
+                    rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                        eprintln!("\n[compacted: summarized {summarized}, kept {kept}]")
+                    }
+                    rupi_core::AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } => {
+                        eprintln!("\n[usage in={input_tokens} out={output_tokens}]")
+                    }
+                    _ => {}
                 }
-                rupi_core::AgentEvent::ToolEnd { name, is_error, .. } => {
-                    eprintln!("\n[{name} {}]", if is_error { "error" } else { "ok" })
-                }
-                rupi_core::AgentEvent::MemoryRecall { detail } => {
-                    eprintln!("{detail}")
-                }
-                rupi_core::AgentEvent::CompactionStart => {
-                    eprintln!("\n[compacting]…")
-                }
-                rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
-                    eprintln!("\n[compacted: summarized {summarized}, kept {kept}]")
-                }
-                _ => {}
             },
             // 非交互 run：Ctrl-C 直接杀进程（现状），不做优雅中止
             &rupi_core::CancelFlag::new(),
         )
-        .await?;
-    println!();
-    persist_turn(&sess_db, &sid, prompt, &session, before_len);
+        .await;
+    let stop = match res {
+        Ok(s) => s,
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "error", "message": format!("{e:#}")})
+                );
+            }
+            return Err(e);
+        }
+    };
+    if json {
+        let text = session
+            .current_path
+            .iter()
+            .skip(before_len)
+            .filter_map(|id| session.nodes.get(id))
+            .filter(|n| n.message.role == rupi_core::Role::Assistant)
+            .last()
+            .map(|n| n.message.full_text())
+            .unwrap_or_default();
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "run_result",
+                "session_id": sid,
+                "stop_reason": stop,
+                "text": text,
+            })
+        );
+    } else {
+        println!();
+    }
+    persist_turn(&sess_db, &sid, &session, before_len);
     if cli.review_apply {
         apply_suggestions(home, &pending);
     }
@@ -1228,6 +1277,12 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
                     println!("\n[compacted: summarized {summarized}, kept {kept}]")
                 }
+                rupi_core::AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    println!("\n[usage in={input_tokens} out={output_tokens}]")
+                }
                 rupi_core::AgentEvent::RunEnd {
                     stop_reason: rupi_core::StopReason::Aborted,
                 } => {
@@ -1246,8 +1301,17 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
         };
         drop(fut); // future（含 &mut session 借用）在此释放，后续落盘再借
-        res?;
-        persist_turn(&sess_db, &sid, &input, &session, before_len);
+        // provider/网络错误不再终结 REPL（此前 `res?` 直接退出进程）：回滚本轮已入树的
+        // 节点（user 及可能的半轮工具态），打印原因，回到提示符让用户重试或 /model 切换。
+        if let Err(e) = res {
+            for id in session.current_path.split_off(before_len) {
+                session.nodes.remove(&id);
+            }
+            eprintln!("\n[error] {e:#}");
+            println!();
+            continue;
+        }
+        persist_turn(&sess_db, &sid, &session, before_len);
         // 压缩摘要落盘（变化才写）
         if let Some(sum) = &session.summary {
             if *sum != saved_summary {
@@ -1426,17 +1490,19 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
             let sid = sid_for_turn.lock().unwrap().clone();
-            let persist = |node: &Option<String>, role: &str, content: &str| {
-                let res = match node {
-                    Some(id) => db.add_message_with_id(id, &sid, role, content),
-                    None => db.add_message(&sid, role, content),
-                };
-                if let Err(e) = res {
-                    tracing::warn!("persist {role} msg failed: {e:#}");
+            // 全部新增节点落盘（含工具调用/结果，blocks 存完整 JSON），与 REPL persist_turn 同语义
+            for (id, msg) in &t.messages {
+                let blocks = serde_json::to_string(msg).ok();
+                if let Err(e) = db.add_message_full(
+                    id,
+                    &sid,
+                    role_label(&msg.role),
+                    &msg.full_text(),
+                    blocks.as_deref(),
+                ) {
+                    tracing::warn!("persist {} msg failed: {e:#}", role_label(&msg.role));
                 }
-            };
-            persist(&t.user_node, "user", &t.user);
-            persist(&t.assistant_node, "assistant", &t.assistant);
+            }
             if let Some(sum) = &t.summary {
                 if *sum != *saved.lock().unwrap() {
                     if let Err(e) = db.set_summary(&sid, sum) {

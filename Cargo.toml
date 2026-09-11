@@ -34,3 +34,4 @@ libc = "0.2"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+similar = "2"

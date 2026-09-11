@@ -471,6 +471,8 @@ impl AgentLoop {
             let fut = provider.complete_streaming(req, tx);
             tokio::pin!(fut);
             let mut partial = String::new();
+            // 用量：provider 流末尾给出，多次以最后一次为准，本轮结束统一发一个 Usage 事件
+            let mut usage: Option<(u64, u64)> = None;
             enum StreamEnd {
                 Done(anyhow::Result<rupi_llm::ChatResponse>),
                 Cancelled,
@@ -482,6 +484,9 @@ impl AgentLoop {
                         Some(rupi_llm::StreamEvent::TextDelta(delta)) => {
                             partial.push_str(&delta);
                             on_event(AgentEvent::TextDelta { delta });
+                        }
+                        Some(rupi_llm::StreamEvent::Usage { input, output }) => {
+                            usage = Some((input, output));
                         }
                         // 发送端已关闭（provider 收尾中）：直接等完成，
                         // 否则关闭后的 recv 永远就绪空转，空烧 CPU。
@@ -528,8 +533,21 @@ impl AgentLoop {
                 anyhow::bail!("{} reported error stop reason", provider.name());
             }
             // select 竞速可能提前 break，排空残留 delta 保顺序完整
-            while let Ok(rupi_llm::StreamEvent::TextDelta(delta)) = rx.try_recv() {
-                on_event(AgentEvent::TextDelta { delta });
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    rupi_llm::StreamEvent::TextDelta(delta) => {
+                        on_event(AgentEvent::TextDelta { delta })
+                    }
+                    rupi_llm::StreamEvent::Usage { input, output } => {
+                        usage = Some((input, output))
+                    }
+                }
+            }
+            if let Some((input_tokens, output_tokens)) = usage {
+                on_event(AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                });
             }
             let has_calls = resp
                 .message

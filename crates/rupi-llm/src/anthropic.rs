@@ -340,6 +340,8 @@ pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::C
 /// thinking 按 index 攒明文 + signature（静默累积，不进 TextDelta 通道）。
 #[derive(Debug, Default)]
 pub struct AnthropicAccumulator {
+    /// `message_start` 给出的输入 token 数；`message_delta` 时与输出数一并推 Usage。
+    pub input_tokens: u64,
     text: String,
     frags: Vec<Frag>,
     pub stop_reason: Option<String>,
@@ -443,9 +445,26 @@ impl AnthropicAccumulator {
                     _ => {}
                 }
             }
+            "message_start" => {
+                if let Some(n) = data
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(|x| x.as_u64())
+                {
+                    self.input_tokens = n;
+                }
+            }
             "message_delta" => {
                 if let Some(s) = data.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
                     self.stop_reason = Some(s.to_string());
+                }
+                // usage：message_start 给 input_tokens，message_delta 给累计 output_tokens
+                if let Some(n) = data.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                    let _ = tx
+                        .send(super::StreamEvent::Usage {
+                            input: self.input_tokens,
+                            output: n,
+                        })
+                        .await;
                 }
             }
             _ => {}
@@ -605,33 +624,33 @@ impl super::LlmProvider for AnthropicProvider {
             resp
         };
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut event = String::new();
+        let mut parser = super::SseParser::default();
         let mut acc = AnthropicAccumulator::default();
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
-                if line.is_empty() || line.starts_with(':') {
+            for ev in parser.push_bytes(&chunk) {
+                if ev.event == "message_stop" {
+                    break 'stream;
+                }
+                if ev.event.is_empty() || ev.event == "ping" {
                     continue;
                 }
-                if let Some(name) = line.strip_prefix("event:").map(str::trim) {
-                    event = name.to_string();
-                    if event == "message_stop" {
-                        break 'stream;
+                let v: serde_json::Value = match serde_json::from_str(&ev.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("anthropic: skip non-JSON sse data ({e})");
+                        continue;
                     }
-                    continue;
-                }
-                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                    continue;
                 };
-                if event.is_empty() {
-                    continue;
+                // 流中 `event: error`（overloaded/rate_limit 等）：此前被忽略，得到一个
+                // “成功”的空回复；现在转错误让主循环走重试/溢出恢复路径。
+                if ev.event == "error" {
+                    anyhow::bail!(
+                        "anthropic stream error: {}",
+                        error_text(&v).unwrap_or("unknown error")
+                    );
                 }
-                let v: serde_json::Value = serde_json::from_str(data)?;
-                acc.apply_event(&event, &v, &tx).await;
+                acc.apply_event(&ev.event, &v, &tx).await;
             }
         }
         Ok(acc.finish("end_turn"))

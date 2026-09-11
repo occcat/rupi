@@ -361,6 +361,11 @@ pub enum AgentEvent {
     /// 压实结束（对标上游 `compaction_end`）：`summarized` 为被摘要的消息数，
     /// `kept` 为保留的尾部条数。
     CompactionEnd { summarized: usize, kept: usize },
+    /// 本回合模型用量（provider 在流末尾给出；未给则不发射）。对标 pi-ai usage。
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     Error {
         message: String,
     },
