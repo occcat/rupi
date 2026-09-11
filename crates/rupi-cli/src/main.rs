@@ -1166,13 +1166,17 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
         }
         skills.refresh(&skill_dirs(home, load_project));
-        // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词
+        // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词；
+        // 未命中再回退 skill 名（`/skillname args` 即调 skill）。
         let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
         if let Some((name, args)) = slash.as_ref() {
             if let Some(expanded) =
                 rupi_core::commands::expand(&command_dirs_filtered(home, load_project), name, args)
             {
                 println!("[command /{name}]");
+                input = expanded;
+            } else if let Some(expanded) = skills.expand_as_command(name, args) {
+                println!("[skill /{name}]");
                 input = expanded;
             }
         }

@@ -446,6 +446,19 @@ impl SkillRegistry {
         })
     }
 
+    /// 斜杠直调（对标上游 skill 即命令）：`/{name} {args}` 命中 skill 名时展开为
+    /// 提示词（调用块 + 用户参数），供 REPL/TUI 在自定义命令未命中时回退。
+    /// 内建与 `.md` 自定义命令优先，命中 skill 才调本方法，故无优先级参数。
+    pub fn expand_as_command(&self, name: &str, args: &str) -> Option<String> {
+        let block = self.load_skill(name)?;
+        let args = args.trim();
+        Some(if args.is_empty() {
+            format!("[skill /{name}]\n{block}")
+        } else {
+            format!("[skill /{name}]\n{block}\n\n{args}")
+        })
+    }
+
     /// 阶段 3：按需读资源文件（references/、assets/、templates/）。
     /// 符号链接消解后仍须在 skill 目录内（与工作区沙箱同口径）：skill 可由复盘自动
     /// 蒸馏，词法 `starts_with` 挡不住目录内指外的软链。
@@ -583,6 +596,30 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.index_block().contains("demo-skill"));
         assert!(reg.load_skill("demo-skill").unwrap().contains("Do X"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn expand_as_command_wraps_skill_block_with_args() {
+        // `/skillname args` 展开：调用块 + 用户参数；无参只给块；未知名回 None。
+        let base = std::env::temp_dir().join(format!("rupi-skill-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: do demo things\n---\n\n# Demo\nDo X.\n",
+        )
+        .unwrap();
+        let reg = SkillRegistry::discover(std::slice::from_ref(&base));
+        let with_args = reg.expand_as_command("demo-skill", "do it twice").unwrap();
+        assert!(with_args.contains("[skill /demo-skill]"), "{with_args}");
+        assert!(with_args.contains("Do X."), "{with_args}");
+        assert!(with_args.contains("do it twice"), "{with_args}");
+        let bare = reg.expand_as_command("demo-skill", "  ").unwrap();
+        assert!(bare.contains("Do X."), "{bare}");
+        assert!(!bare.contains("do it twice"), "{bare}");
+        assert!(reg.expand_as_command("no-such", "x").is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 
