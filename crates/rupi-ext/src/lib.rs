@@ -258,6 +258,8 @@ pub struct ExtensionSet {
     /// 文件 → (mtime, 工具名)
     snapshot: HashMap<String, (SystemTime, String)>,
     rpc_hosts: HashMap<String, Arc<rpc::RpcHost>>,
+    extra: Vec<PathBuf>,
+    discover: bool,
 }
 
 impl ExtensionSet {
@@ -266,7 +268,17 @@ impl ExtensionSet {
             dir,
             snapshot: HashMap::new(),
             rpc_hosts: HashMap::new(),
+            extra: Vec::new(),
+            discover: true,
         }
+    }
+
+    pub fn set_discover(&mut self, yes: bool) {
+        self.discover = yes;
+    }
+
+    pub fn add_extra(&mut self, path: PathBuf) {
+        self.extra.push(path);
     }
 
     pub fn extension_arcs(&self) -> Vec<Arc<dyn rupi_core::Extension>> {
@@ -357,23 +369,42 @@ impl ExtensionSet {
         }
     }
 
-    fn manifests(&self) -> Vec<(String, PathBuf, SystemTime)> {
+    fn push_manifest_file(out: &mut Vec<(String, PathBuf, SystemTime)>, p: PathBuf) {
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            return;
+        }
+        let mtime = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push((p.to_string_lossy().to_string(), p, mtime));
+    }
+
+    fn scan_dir(dir: &Path) -> Vec<(String, PathBuf, SystemTime)> {
         let mut out = vec![];
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return out;
         };
         for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
+            Self::push_manifest_file(&mut out, e.path());
+        }
+        out
+    }
+
+    fn manifests(&self) -> Vec<(String, PathBuf, SystemTime)> {
+        let mut out = if self.discover {
+            Self::scan_dir(&self.dir)
+        } else {
+            vec![]
+        };
+        for extra in &self.extra {
+            if extra.is_dir() {
+                out.extend(Self::scan_dir(extra));
+            } else {
+                Self::push_manifest_file(&mut out, extra.clone());
             }
-            let mtime = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            out.push((p.to_string_lossy().to_string(), p, mtime));
         }
         out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
         out
     }
 
@@ -562,6 +593,28 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].description, "UPPER v2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_discover_still_loads_explicit_extra() {
+        let dir = std::env::temp_dir().join(format!("rupi-ext-nodisc-{}", std::process::id()));
+        let extra_dir = std::env::temp_dir().join(format!("rupi-ext-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&extra_dir);
+        write(&dir, "hidden.json", ECHO_MANIFEST);
+        write(
+            &extra_dir,
+            "only.json",
+            &ECHO_MANIFEST.replace("upper", "only_extra"),
+        );
+        let mut set = ExtensionSet::new(dir.clone());
+        set.set_discover(false);
+        set.add_extra(extra_dir.join("only.json"));
+        let loaded = set.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "only_extra");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&extra_dir);
     }
 
     #[test]

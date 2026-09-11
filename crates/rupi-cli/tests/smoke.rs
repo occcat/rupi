@@ -462,21 +462,17 @@ fn no_memory_run_still_works() {
     assert!(out.contains("demo mode"));
 }
 
-/// chat 子进程：全局 flag 在子命令前，stdin 喂整段输入后 EOF。
+/// REPL 冒烟必须显式 `rupi chat`：无子命令默认 TUI；非 TTY 且有 rest 会走 `run`。
+/// 全局 flag 在子命令前，stdin 喂整段输入后 EOF。
 fn chat_with(home: &Path, global: &[&str], input: &[u8]) -> Output {
     let mut args: Vec<&str> = global.to_vec();
     args.push("chat");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rupi"));
-    child
-        .env("RUPI_HOME", home)
-        .current_dir(home)
-        .args(&args)
+    let mut child = rupi(home, &args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_remove("RUPI_API_KEY")
-        .env_remove("OPENAI_API_KEY");
-    let mut child = child.spawn().unwrap();
+        .spawn()
+        .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -499,6 +495,20 @@ fn settings_and_system_md_apply() {
         out.contains("system-prompt"),
         "help 缺 --system-prompt:\n{out}"
     );
+    for flag in [
+        "session",
+        "pick-session",
+        "fork",
+        "print",
+        "no-context-files",
+        "no-builtin-tools",
+        "no-extensions",
+        "no-skills",
+        "extension",
+        "skill",
+    ] {
+        assert!(out.contains(flag), "help 缺 --{flag}:\n{out}");
+    }
 }
 
 #[test]
@@ -1038,4 +1048,209 @@ fn run_sends_session_id_affinity_header() {
         got2.iter().all(|h| h == &sid),
         "续聊后亲和头仍应等于同会话 id {sid}：{got2:?}"
     );
+}
+
+#[test]
+fn stdin_print_atfile_session_fork_and_slash() {
+    let home = fresh_home();
+    std::fs::write(home.join("README.md"), "PIPEFILE unique-readme-body").unwrap();
+    std::fs::write(home.join("AGENTS.md"), "AGENTS_SHOULD_HIDE").unwrap();
+
+    let mut child = rupi(&home, &["--no-approve", "run", "summarize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"pipehi99").unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "piped run 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--no-context-files",
+            "run",
+            "@README.md",
+            "总结",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "@file run 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = rupi(&home, &["session-search", "pipehi99"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
+    assert!(
+        o.status.success() && hit.contains("pipehi99"),
+        "stdin 未进会话:\n{hit}\n{err}"
+    );
+    let o = rupi(&home, &["session-search", "PIPEFILE"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
+    assert!(
+        o.status.success() && hit.contains("PIPEFILE"),
+        "@file 未进会话:\n{hit}\n{err}"
+    );
+
+    // 无子命令位置参数：非 TTY 走 run（对标 `rupi @README.md 总结`）
+    let o = rupi(&home, &["--no-approve", "@README.md", "总结"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "positional @file 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let mut child = rupi(&home, &["--no-approve", "-p", "summarize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"printpipe99")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "-p 管道失败:\nstdout={out}\nstderr={err}"
+    );
+    let o = rupi(&home, &["session-search", "printpipe99"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
+    assert!(
+        o.status.success() && hit.contains("printpipe99"),
+        "-p stdin 未进会话:\n{hit}\n{err}"
+    );
+
+    let jsonl = home.join("pi.jsonl");
+    let mut tree_jsonl = String::from(
+        r#"{"type":"session","version":3,"id":"import-me","timestamp":"2026-01-01T00:00:00.000Z","cwd":"."}"#,
+    );
+    tree_jsonl.push('\n');
+    tree_jsonl.push_str(
+        r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"jsonl-hello"}],"timestamp":1}}"#,
+    );
+    tree_jsonl.push('\n');
+    std::fs::write(&jsonl, tree_jsonl).unwrap();
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--session",
+            jsonl.to_str().unwrap(),
+            "run",
+            "after-import",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--session jsonl 失败:\nstdout={out}\nstderr={err}"
+    );
+    let o = rupi(&home, &["session-search", "jsonl-hello"])
+        .output()
+        .unwrap();
+    let (hit, _) = out_text(&o);
+    assert!(hit.contains("jsonl-hello"), "JSONL 未装入:\n{hit}");
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--fork",
+            jsonl.to_str().unwrap(),
+            "run",
+            "forked",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--fork 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let before = rupi(&home, &["sessions"]).output().unwrap();
+    let (before_out, _) = out_text(&before);
+    let n_before = before_out.lines().count();
+    let o = rupi(&home, &["--no-approve", "-r", "run", "picked-latest"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "-r run 失败:\nstdout={out}\nstderr={err}"
+    );
+    let after = rupi(&home, &["sessions"]).output().unwrap();
+    let (after_out, _) = out_text(&after);
+    assert_eq!(
+        after_out.lines().count(),
+        n_before,
+        "-r 应续最近会话而不是新建:\n{after_out}"
+    );
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--no-builtin-tools",
+            "--no-skills",
+            "--no-extensions",
+            "-nc",
+            "run",
+            "flags-ok",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "resource flags 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = chat_with(
+        home.as_path(),
+        &["--no-approve"],
+        b"/session\n/new\n/session\n/quit\n",
+    );
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "chat /session /new 失败:\n{out}\n{err}");
+    assert!(out.contains("id:"), "/session 无 id:\n{out}");
+    assert!(out.contains("[new "), "/new 无新 id:\n{out}");
+    let ids: Vec<_> = out
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .trim_start_matches("> ")
+                .strip_prefix("id: ")
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(ids.len() >= 2, "应打印两个 /session:\n{out}");
+    assert_ne!(ids[0], ids[1], "/new 后 /session 应是新 id:\n{out}");
 }

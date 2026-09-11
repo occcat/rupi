@@ -222,6 +222,36 @@ impl SkillRegistry {
         n
     }
 
+    /// `--skill` 显式路径：文件走 `load_file`，目录走 `SKILL.md`。同名保留先发现者。
+    /// 与 `--no-skills` 组合时只收这些路径（对标 Pi：`--no-*` + 显式仍生效）。
+    pub fn ingest_paths(&self, paths: &[PathBuf]) -> usize {
+        let mut skills = self.skills.write().unwrap();
+        let mut seen: std::collections::HashSet<String> =
+            skills.iter().map(|s| s.meta.name.clone()).collect();
+        let mut added = 0;
+        for p in paths {
+            // 无 SKILL.md 的集合目录由 discover/refresh 递归扫，这里不告警。
+            if p.is_dir() && !p.join("SKILL.md").is_file() {
+                continue;
+            }
+            let loaded = if p.is_file() {
+                Skill::load_file(p)
+            } else {
+                Skill::load(p)
+            };
+            match loaded {
+                Ok(s) => {
+                    if seen.insert(s.meta.name.clone()) {
+                        skills.push(s);
+                        added += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("skip skill {}: {e:#}", p.display()),
+            }
+        }
+        added
+    }
+
     /// 递归扫描单个目录。`root` 为本次 base（算相对路径用），`include_root_files`
     /// 仅顶层为真。目录 symlink 跟随进入，但 canonical 目录去重（防环＋同一 skill
     /// 经 symlink 多路径到达只收一次）；断链 symlink 的 `is_file/is_dir` 为假，天然跳过。
@@ -834,6 +864,35 @@ mod tests {
         assert!(root.contains("Hi."));
         assert!(root.contains("standalone.md"), "{root}");
         assert!(reg.load_skill("fake-inner").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ingest_paths_loads_file_and_skill_dir() {
+        let base = std::env::temp_dir().join(format!("rupi-skill-ingest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("bundle").join("nested")).unwrap();
+        std::fs::write(
+            base.join("one.md"),
+            "---\nname: file-skill\ndescription: from file\n---\n\n# File\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("bundle").join("SKILL.md"),
+            "---\nname: dir-skill\ndescription: from dir\n---\n\n# Dir\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("bundle").join("nested").join("SKILL.md"),
+            "---\nname: nested-skill\ndescription: should not ingest via dir load\n---\n\n# Nested\n",
+        )
+        .unwrap();
+        let reg = SkillRegistry::default();
+        let n = reg.ingest_paths(&[base.join("one.md"), base.join("bundle"), base.clone()]);
+        assert_eq!(n, 2);
+        assert!(reg.load_skill("file-skill").is_some());
+        assert!(reg.load_skill("dir-skill").is_some());
+        assert!(reg.load_skill("nested-skill").is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 

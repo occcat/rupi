@@ -680,38 +680,130 @@ pub fn remap_tree(src: &SessionTree, path_only: bool) -> SessionTree {
     out
 }
 
-/// 完整 id 或唯一短前缀。
+/// 打开结果：树 + 落盘 id + 展示元数据（CLI `--session` / SDK `session_path` / `-r` 共用）。
+#[derive(Debug, Clone)]
+pub struct OpenedSession {
+    pub id: String,
+    pub tree: SessionTree,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// id（无路径分隔、非现存文件）走 resume；否则当 JSONL 路径（`/import` 同源）。
+pub fn looks_like_session_path(spec: &str) -> bool {
+    let p = std::path::Path::new(spec);
+    spec.ends_with(".jsonl")
+        || spec.contains('/')
+        || spec.contains('\\')
+        || (p.exists() && p.is_file())
+}
+
+/// 完整 id 或库内唯一前缀（RPC `switch_session` 与 CLI `--session` 共用）。
 pub fn resolve_session_ref(store: &SessionStore, arg: &str) -> anyhow::Result<String> {
-    let arg = arg.trim();
-    if arg.is_empty() {
+    let spec = arg.trim();
+    if spec.is_empty() {
         anyhow::bail!("empty session id");
     }
-    if store.has_session(arg)? {
-        return Ok(arg.to_string());
+    if store.has_session(spec)? {
+        return Ok(spec.to_string());
     }
     let rows = store.list_sessions(200)?;
     let hits: Vec<&String> = rows
         .iter()
         .map(|(id, _, _, _, _)| id)
-        .filter(|id| id.starts_with(arg))
+        .filter(|id| id.starts_with(spec))
         .collect();
     match hits.as_slice() {
         [one] => Ok((*one).clone()),
-        [] => anyhow::bail!("unknown session: {arg}"),
-        _ => anyhow::bail!("ambiguous session prefix: {arg}"),
+        [] => anyhow::bail!("unknown session: {spec} (see `rupi sessions`)"),
+        _ => anyhow::bail!(
+            "ambiguous session prefix `{spec}` ({} hits, see `rupi sessions`)",
+            hits.len()
+        ),
     }
 }
 
-/// 从库重建树（与 CLI `--resume` 同语义）。
+pub fn resolve_session_id(store: &SessionStore, spec: &str) -> anyhow::Result<String> {
+    resolve_session_ref(store, spec)
+}
+
+/// 按库行回填树（有 `blocks` 走结构，老库纯文本回退）。
 pub fn restore_tree(store: &SessionStore, id: &str) -> anyhow::Result<SessionTree> {
     if !store.has_session(id)? {
-        anyhow::bail!("unknown session: {id}");
+        anyhow::bail!("unknown session: {id} (see `rupi sessions`)");
     }
     let recs = store.session_records(id, 10_000)?;
     let summary = store.get_summary(id).unwrap_or_default();
     let mut tree = tree_from_records(recs, &summary);
     tree.id = id.to_string();
     Ok(tree)
+}
+
+/// `--session <id|jsonl>`：id 续聊；路径则导入 SQLite 并切过去。
+pub fn open_session(store: &SessionStore, spec: &str, cwd: &str) -> anyhow::Result<OpenedSession> {
+    if looks_like_session_path(spec) {
+        let raw = std::fs::read_to_string(spec)
+            .map_err(|e| anyhow::anyhow!("read session file {}: {e}", spec))?;
+        let (id, tree) = import_into_store(store, &raw, cwd)?;
+        let name = store.get_name(&id).ok().flatten();
+        Ok(OpenedSession {
+            id,
+            tree,
+            name,
+            cwd: Some(cwd.to_string()),
+        })
+    } else {
+        let id = resolve_session_id(store, spec)?;
+        let tree = restore_tree(store, &id)?;
+        Ok(OpenedSession {
+            name: store.get_name(&id).ok().flatten(),
+            cwd: store.get_cwd(&id).ok().flatten(),
+            id,
+            tree,
+        })
+    }
+}
+
+/// `--fork <id|path>`：读源（不把 JSONL 原 id 落成主会话），`/fork` 同款只带当前路径。
+pub fn fork_session(store: &SessionStore, spec: &str, cwd: &str) -> anyhow::Result<OpenedSession> {
+    let (src, parent) = if looks_like_session_path(spec) {
+        let raw = std::fs::read_to_string(spec)
+            .map_err(|e| anyhow::anyhow!("read session file {}: {e}", spec))?;
+        let imported = import_jsonl(&raw)?;
+        let parent = imported.header.as_ref().map(|h| h.id.clone());
+        (imported.tree, parent)
+    } else {
+        let id = resolve_session_id(store, spec)?;
+        (restore_tree(store, &id)?, Some(id))
+    };
+    let mut tree = remap_tree(&src, true);
+    let id = store.create_session_ex("fork", None, Some(cwd), parent.as_deref())?;
+    persist_tree(store, &id, &tree)?;
+    tree.id = id.clone();
+    Ok(OpenedSession {
+        id,
+        tree,
+        name: None,
+        cwd: Some(cwd.to_string()),
+    })
+}
+
+/// `/session` 状态块：id / name / cwd / 消息数 / 可选 token·成本行。
+pub fn format_session_status(
+    id: &str,
+    name: Option<&str>,
+    cwd: Option<&str>,
+    messages: usize,
+    usage: Option<&str>,
+) -> String {
+    let name = name.filter(|s| !s.is_empty()).unwrap_or("(unset)");
+    let cwd = cwd.filter(|s| !s.is_empty()).unwrap_or("(unknown)");
+    let mut s = format!("id: {id}\nname: {name}\ncwd: {cwd}\nmessages: {messages}");
+    if let Some(u) = usage.filter(|u| !u.is_empty()) {
+        s.push('\n');
+        s.push_str(u);
+    }
+    s
 }
 
 /// 从库记录重建树（与 CLI restore 同语义）。
@@ -794,5 +886,56 @@ mod tests {
         assert_eq!(forked.history().len(), 2);
         let cloned = remap_tree(&tree, false);
         assert_eq!(cloned.nodes.len(), 3);
+    }
+
+    #[test]
+    fn open_session_id_and_jsonl_and_fork() {
+        let home = std::env::temp_dir().join(format!(
+            "rupi-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = SessionStore::open(&home).unwrap();
+        let mut tree = SessionTree::new();
+        tree.push(Message::text(Role::User, "hello open"));
+        tree.push(Message::text(Role::Assistant, "ok"));
+        let jsonl = export_tree_jsonl(&tree, "/tmp/p", Some("opened"), None);
+        let path = home.join("pi.jsonl");
+        std::fs::write(&path, &jsonl).unwrap();
+
+        let opened = open_session(&store, path.to_str().unwrap(), "/tmp/p").unwrap();
+        assert_eq!(opened.tree.history().len(), 2);
+        assert!(opened.tree.history()[0].full_text().contains("hello open"));
+        assert_eq!(opened.name.as_deref(), Some("opened"));
+
+        let by_id = open_session(&store, &opened.id, "/tmp/p").unwrap();
+        assert_eq!(by_id.id, opened.id);
+        assert_eq!(by_id.tree.history().len(), 2);
+
+        let prefix = &opened.id[..8];
+        let by_prefix = resolve_session_id(&store, prefix).unwrap();
+        assert_eq!(by_prefix, opened.id);
+
+        let forked = fork_session(&store, path.to_str().unwrap(), "/tmp/p").unwrap();
+        assert_ne!(forked.id, opened.id);
+        assert_eq!(forked.tree.history().len(), 2);
+        assert!(looks_like_session_path(path.to_str().unwrap()));
+        assert!(!looks_like_session_path(&opened.id));
+        let status = format_session_status(
+            &opened.id,
+            opened.name.as_deref(),
+            Some("/tmp/p"),
+            2,
+            Some("↑1 ↓1 0% $0.0000"),
+        );
+        assert!(status.contains("id:"));
+        assert!(status.contains("opened"));
+        assert!(status.contains("messages: 2"));
+        assert!(status.contains('↑'));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

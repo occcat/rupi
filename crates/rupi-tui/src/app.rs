@@ -4,6 +4,7 @@
 
 use crate::complete;
 use crate::keybindings::KeyTable;
+use crate::session_nav::SessionNavigator;
 use crate::theme::Theme;
 use crate::tree_nav::TreeNavigator;
 use crate::view::{ChatView, InputBuffer};
@@ -74,6 +75,10 @@ pub struct TuiContext<'a> {
     pub settings: Option<&'a mut rupi_config::Settings>,
     pub settings_home: std::path::PathBuf,
     pub settings_cwd: std::path::PathBuf,
+    /// 启动后自动发送的首条（位置参数 / `@file`）。
+    pub initial_prompt: Option<String>,
+    /// `-r`：启动即打开会话选择器。
+    pub start_session_picker: bool,
 }
 
 /// 一轮问答记录（传给 `on_turn`）。
@@ -225,6 +230,7 @@ enum Builtin {
         note: String,
     },
     TreeNav,
+    SessionNav,
     Pass,
 }
 
@@ -349,13 +355,59 @@ fn dispatch_builtin(
         return Builtin::TreeNav;
     }
     if t == "/sessions" {
-        // 最近会话列表（与 CLI `sessions` 同列）；库不可用（单测/内嵌）给提示。
+        // 有库则打开选择器（与启动 `-r` 同款）；单测/内嵌无库给提示。
         return match sess_db {
-            Some(db) => match sessions_block(db, session_id, 20) {
-                Ok(block) => Builtin::Done(block),
-                Err(e) => Builtin::Done(format!("[sessions] list failed: {e:#}")),
-            },
+            Some(_) => Builtin::SessionNav,
             None => Builtin::Done("[sessions] no session store attached".into()),
+        };
+    }
+    if t == "/session" {
+        let name = sess_db.and_then(|db| db.get_name(session_id).ok().flatten());
+        let cwd = sess_db
+            .and_then(|db| db.get_cwd(session_id).ok().flatten())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            });
+        return Builtin::Done(rupi_memory::format_session_status(
+            session_id,
+            name.as_deref(),
+            cwd.as_deref(),
+            session.history().len(),
+            None,
+        ));
+    }
+    if t == "/new" {
+        if !persist {
+            let tree = SessionTree::new();
+            let sid = tree.id.clone();
+            return Builtin::Adopt {
+                note: format!(
+                    "[new {}] ephemeral (--no-session)",
+                    &sid[..8.min(sid.len())]
+                ),
+                id: sid,
+                tree,
+            };
+        }
+        let Some(db) = sess_db else {
+            return Builtin::Done("[new] no session store attached".into());
+        };
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        return match db.create_session_ex("default", None, Some(&cwd), None) {
+            Ok(id) => {
+                let mut tree = SessionTree::new();
+                tree.id = id.clone();
+                Builtin::Adopt {
+                    note: format!("[new {}]", &id[..8.min(id.len())]),
+                    id,
+                    tree,
+                }
+            }
+            Err(e) => Builtin::Done(format!("[new] failed: {e:#}")),
         };
     }
     if t == "/resume" || t.starts_with("/resume ") {
@@ -594,7 +646,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
+    view.push_system("rupi TUI — Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -603,6 +655,24 @@ async fn run_loop(
     let mut tree: Option<TreeNavigator> = None;
     let keys = KeyTable::load(&ctx.settings_home);
     let mut pending_images: Vec<ContentBlock> = Vec::new();
+    let mut sessions: Option<SessionNavigator> = if ctx.start_session_picker {
+        match ctx.sess_db.as_ref() {
+            Some(db) => match SessionNavigator::from_store(&db.lock().unwrap(), 50) {
+                Ok(nav) => Some(nav),
+                Err(e) => {
+                    view.push_system(format!("[sessions] {e:#}"));
+                    None
+                }
+            },
+            None => {
+                view.push_system("[sessions] no session store attached".into());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut injected = ctx.initial_prompt.take();
 
     loop {
         // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
@@ -635,10 +705,23 @@ async fn run_loop(
             completion_prefix,
             &chrome,
             tree.as_ref(),
+            sessions.as_ref(),
         )?;
-        let ev = match reader.next().await {
-            Some(Ok(ev)) => ev,
-            _ => continue,
+        let ev = if sessions.is_none() {
+            if let Some(text) = injected.take() {
+                input.set_text(&text);
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            } else {
+                match reader.next().await {
+                    Some(Ok(ev)) => ev,
+                    _ => continue,
+                }
+            }
+        } else {
+            match reader.next().await {
+                Some(Ok(ev)) => ev,
+                _ => continue,
+            }
         };
         if let Event::Mouse(m) = ev {
             match m.kind {
@@ -649,6 +732,79 @@ async fn run_loop(
             continue;
         }
         let Event::Key(key) = ev else { continue };
+        if let Some(nav) = sessions.as_mut() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') if !nav.filtering => {
+                    sessions = None;
+                    continue;
+                }
+                KeyCode::Esc if nav.filtering => {
+                    nav.filtering = false;
+                    continue;
+                }
+                KeyCode::Char('/') if !nav.filtering => {
+                    nav.filtering = true;
+                    nav.query.clear();
+                    continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') if !nav.filtering => {
+                    nav.move_by(-1);
+                    continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') if !nav.filtering => {
+                    nav.move_by(1);
+                    continue;
+                }
+                KeyCode::Enter => {
+                    if let Some(id) = nav.selected_id().map(str::to_string) {
+                        sessions = None;
+                        let db = match ctx.sess_db.as_ref() {
+                            Some(db) => db.clone(),
+                            None => {
+                                view.push_system("[sessions] no session store attached".into());
+                                continue;
+                            }
+                        };
+                        let db = db.lock().unwrap();
+                        match replay_session(&db, &id) {
+                            Ok((tree, n)) => {
+                                *ctx.session = tree;
+                                *ctx.session_id.lock().unwrap() = id.clone();
+                                export_session_id(&id);
+                                let model = ctx.provider.model_id().unwrap_or_default().to_string();
+                                if !model.is_empty() {
+                                    if let Ok(mut p) = rupi_llm::provider_for_model(&model) {
+                                        rupi_llm::apply_session_settings(&mut *p, Some(&id));
+                                        *ctx.provider = p.into();
+                                    }
+                                }
+                                view.push_system(format!(
+                                    "[resumed {} ({} msgs)]",
+                                    &id[..8.min(id.len())],
+                                    n
+                                ));
+                            }
+                            Err(e) => view.push_system(format!("[sessions] {e:#}")),
+                        }
+                    } else {
+                        sessions = None;
+                    }
+                    continue;
+                }
+                KeyCode::Char(c) if nav.filtering => {
+                    nav.type_char(c);
+                    nav.clamp_selected();
+                    continue;
+                }
+                KeyCode::Backspace if nav.filtering => {
+                    nav.backspace();
+                    nav.clamp_selected();
+                    continue;
+                }
+                _ => {}
+            }
+            continue;
+        }
         if let Some(nav) = tree.as_mut() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') if !nav.filtering => {
@@ -884,7 +1040,28 @@ async fn run_loop(
                             tree = Some(TreeNavigator::from_session(ctx.session));
                             continue;
                         }
-                        Builtin::Done(msg) => {
+                        Builtin::SessionNav => {
+                            match ctx.sess_db.as_ref() {
+                                Some(db) => {
+                                    match SessionNavigator::from_store(&db.lock().unwrap(), 50) {
+                                        Ok(nav) => sessions = Some(nav),
+                                        Err(e) => view.push_system(format!("[sessions] {e:#}")),
+                                    }
+                                }
+                                None => {
+                                    view.push_system("[sessions] no session store attached".into())
+                                }
+                            }
+                            continue;
+                        }
+                        Builtin::Done(mut msg) => {
+                            if text.trim() == "/session" {
+                                if let Some(cell) = ctx.meter.as_ref() {
+                                    let extra =
+                                        cell.lock().unwrap().footer(ctx.session.history_tokens());
+                                    msg = format!("{msg}\n{extra}");
+                                }
+                            }
                             if msg.contains("model switched") {
                                 if let (Some(cell), Some(id)) =
                                     (ctx.meter.as_ref(), ctx.provider.model_id())
@@ -1347,6 +1524,7 @@ fn paint_busy<B: Backend>(
         '/',
         chrome,
         None,
+        None,
     )
 }
 
@@ -1458,6 +1636,7 @@ fn draw<B: Backend>(
     completion_prefix: char,
     chrome: &UiChrome,
     tree: Option<&TreeNavigator>,
+    sessions: Option<&SessionNavigator>,
 ) -> anyhow::Result<()> {
     let lines = view
         .visual_lines(&chrome.theme, chrome.tools_folded, chrome.thinking_folded)
@@ -1477,12 +1656,20 @@ fn draw<B: Backend>(
                 .split(area);
             let total = lines.len() as u16;
             let start = total.saturating_sub(chunks[0].height.saturating_add(scroll)) as usize;
-            let title = if let Some(nav) = tree {
+            let title = if let Some(nav) = sessions {
+                format!(
+                    "rupi /sessions  {}/{}",
+                    nav.selected + 1,
+                    nav.visible().len()
+                )
+            } else if let Some(nav) = tree {
                 format!("rupi /tree  {}/{}", nav.selected + 1, nav.visible().len())
             } else {
                 "rupi".into()
             };
-            let body = if let Some(nav) = tree {
+            let body = if let Some(nav) = sessions {
+                session_lines(nav, &theme)
+            } else if let Some(nav) = tree {
                 tree_lines(nav, &theme)
             } else {
                 lines.get(start..).unwrap_or(&[]).to_vec()
@@ -1508,7 +1695,7 @@ fn draw<B: Backend>(
                     .border_style(Style::default().fg(theme.border)),
             );
             f.render_widget(prompt, chunks[1]);
-            if !completion.is_empty() && tree.is_none() {
+            if !completion.is_empty() && tree.is_none() && sessions.is_none() {
                 let shown: Vec<RLine> = completion
                     .iter()
                     .take(8)
@@ -1746,6 +1933,49 @@ fn clipboard_text() -> Option<String> {
     None
 }
 
+fn session_lines(nav: &SessionNavigator, theme: &Theme) -> Vec<RLine<'static>> {
+    let vis = nav.visible();
+    if vis.is_empty() {
+        return vec![RLine::from(Span::styled(
+            if nav.rows.is_empty() {
+                "no sessions yet — chat or run to create one"
+            } else {
+                "(no matches)"
+            }
+            .to_string(),
+            Style::default().fg(theme.system),
+        ))];
+    }
+    let mut out = Vec::new();
+    if nav.filtering {
+        out.push(RLine::from(Span::styled(
+            format!("/{}", nav.query),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    for (i, r) in vis.iter().enumerate() {
+        let prefix = if i == nav.selected { "▸ " } else { "  " };
+        let label = if r.name.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", r.name)
+        };
+        let line = format!(
+            "{prefix}[{}] {} ({} msgs){label}",
+            r.profile,
+            &r.id[..8.min(r.id.len())],
+            r.count
+        );
+        let style = if i == nav.selected {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.assistant)
+        };
+        out.push(RLine::from(Span::styled(line, style)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,6 +2091,7 @@ mod tests {
             '/',
             &chrome,
             None,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -1907,6 +2138,7 @@ mod tests {
             '@',
             &chrome,
             None,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -1938,6 +2170,7 @@ mod tests {
             '/',
             &chrome,
             None,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -1960,6 +2193,7 @@ mod tests {
             &[],
             '/',
             &chrome,
+            None,
             None,
         )
         .unwrap();
@@ -2816,6 +3050,81 @@ mod tests {
             true,
         ));
         assert!(msg.contains("unknown session"), "{msg}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn new_session_and_session_status_dispatch() {
+        let home = sess_home("new-status");
+        let store = SessionStore::open(&home).unwrap();
+        let id = seed_session(&store, "work");
+        let (mut agent, mut session, mut provider, skills) = harness();
+        session.push(Message::text(Role::User, "hi"));
+        let msg = done_text(dispatch_builtin(
+            "/session",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            &id,
+            &mut ToolRegistry::default(),
+            None,
+            Some(&store),
+            true,
+        ));
+        assert!(msg.contains(&id), "{msg}");
+        assert!(msg.contains("messages: 1"), "{msg}");
+        assert!(matches!(
+            dispatch_builtin(
+                "/sessions",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                &id,
+                &mut ToolRegistry::default(),
+                None,
+                Some(&store),
+                true,
+            ),
+            Builtin::SessionNav
+        ));
+        let before = store.list_sessions(20).unwrap().len();
+        assert!(matches!(
+            dispatch_builtin(
+                "/new",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                &id,
+                &mut ToolRegistry::default(),
+                None,
+                Some(&store),
+                true,
+            ),
+            Builtin::Adopt { note, .. } if note.starts_with("[new ")
+        ));
+        assert_eq!(store.list_sessions(20).unwrap().len(), before + 1);
+        assert!(matches!(
+            dispatch_builtin(
+                "/new",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                &id,
+                &mut ToolRegistry::default(),
+                None,
+                Some(&store),
+                false,
+            ),
+            Builtin::Adopt { note, .. } if note.contains("ephemeral")
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
