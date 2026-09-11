@@ -3,6 +3,9 @@
 
 pub mod app;
 pub mod complete;
+pub mod markdown;
+pub mod theme;
+pub mod tree_nav;
 pub mod view;
 
 pub use app::{launch, TuiApprover, TuiContext, TurnRecord};

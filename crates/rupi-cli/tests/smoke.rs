@@ -49,6 +49,35 @@ fn out_text(o: &Output) -> (String, String) {
 }
 
 #[test]
+fn rpc_mode_prompt_and_state() {
+    let home = fresh_home();
+    let mut child = rupi(&home, &["--mode", "rpc", "--no-approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sin = child.stdin.take().unwrap();
+        writeln!(sin, r#"{{"id":"1","type":"get_state"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"2","type":"prompt","message":"hello"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"3","type":"get_messages"}}"#).unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "rpc 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    assert!(out.contains(r#""command":"get_state""#), "{out}");
+    assert!(out.contains(r#""success":true"#), "{out}");
+    assert!(
+        out.contains("text_delta") || out.contains("demo mode") || out.contains("hello"),
+        "rpc 无事件/正文:\n{out}"
+    );
+}
+
+#[test]
 fn help_lists_key_subcommands() {
     let home = fresh_home();
     let o = rupi(&home, &["--help"]).output().unwrap();

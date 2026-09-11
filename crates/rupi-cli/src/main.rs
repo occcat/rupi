@@ -1,6 +1,12 @@
 //! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
 
+mod rpc;
+
 use clap::{Parser, Subcommand};
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 use rupi_agent::{AgentLoop, HeuristicReviewer, ReviewSuggestion, SubagentTool};
 use rupi_core::SessionTree;
 use rupi_llm::{LlmProvider, MockProvider};
@@ -150,6 +156,9 @@ struct Cli {
     /// 对标 Hermes memory_enabled=false；显式记忆子命令与外部 provider 不受影响）
     #[arg(long, default_value_t = false)]
     no_memory: bool,
+    /// 对标 pi `--mode rpc`：stdin JSONL 命令，stdout JSONL 响应与事件
+    #[arg(long)]
+    mode: Option<String>,
 }
 
 impl Cli {
@@ -573,7 +582,7 @@ fn user_turn(text: &str) -> rupi_core::Message {
     )
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -586,6 +595,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let home = home_dir();
+    if cli.mode.as_deref() == Some("rpc") {
+        run_rpc(&cli, &home).await?;
+        return Ok(());
+    }
 
     match cli.cmd {
         Some(Cmd::MemoryShow) => {
@@ -1278,6 +1291,88 @@ async fn handle_session_slash(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// `--mode rpc`：装配与 `run` 同构的会话，再走 JSONL 协议循环。
+async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
+    let _ = approver_for(cli, None)?;
+    let load_project = match project_resources() {
+        None => true,
+        Some((_root, _)) if cli.trust_project => true,
+        Some(_) => {
+            eprintln!("[trust] rpc 默认跳过项目资源（加 --trust-project 加载）");
+            false
+        }
+    };
+    let rt = Resolved::load(cli, home, load_project)?;
+    let thinking = rt.thinking;
+    let mut tools = sandboxed_tools_filtered(rt.builtin_allow.as_deref());
+    let _mcp = if let Some(path) = &cli.mcp_config {
+        let configs = rupi_mcp::load_configs(path)?;
+        let manager = rupi_mcp::McpManager::spawn_all(&configs).await?;
+        let names = manager.register_all(&mut tools).await;
+        eprintln!("[mcp] {} tools: {}", names.len(), names.join(", "));
+        Some(manager)
+    } else {
+        None
+    };
+    let ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
+    let mut store = memory_store(home, load_project);
+    if cli.no_memory {
+        store.memory_enabled = false;
+        store.user_profile_enabled = false;
+    }
+    let frozen = store.frozen_snapshot();
+    let mut mem_mgr = MemoryManager::new(store);
+    maybe_external_memory(cli, home, &mut mem_mgr).await?;
+    let skills = SkillRegistry::discover(&skill_dirs(home, load_project));
+    let sess_db = SessionStore::open(home)?;
+    let (session_tree, sid) = restore_or_new(cli, &sess_db)?;
+    let provider: Arc<dyn LlmProvider> =
+        build_provider(&rt.model, Some(&sid), &provider_options(cli))
+            .await?
+            .into();
+    let inbox = Arc::new(rupi_agent::MessageInbox::new());
+    let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt)
+        .with_inbox(inbox)
+        .with_context_dirs(context_cwd(load_project, home), home.clone())
+        .with_policy(Arc::new(default_policy()))
+        .with_plan_mode(cli.plan);
+    if cli.parallel_tools {
+        agent = agent.with_tool_execution(rupi_agent::ToolExecution::Parallel);
+    }
+    if cli.discover_tools {
+        agent = agent.with_discovery(rupi_agent::DiscoveryConfig::default());
+    }
+    if let Some(t) = thinking {
+        agent = agent.with_thinking(t);
+    }
+    apply_tool_filter(&mut tools, &rt);
+    let mut sess = rupi_agent::AgentSession::from_parts(
+        provider,
+        agent,
+        session_tree,
+        tools,
+        mem_mgr,
+        frozen,
+        skills,
+        sid.clone(),
+    );
+    sess.extensions = ext_set.extension_arcs();
+    sess.session_name = cli.name.clone();
+    eprintln!("[rpc] session {sid} — JSONL on stdin/stdout");
+    let sess = rpc::serve(sess).await?;
+    let store = Arc::new(Mutex::new(sess_db));
+    persist_turn_if(
+        rt.persist,
+        &store,
+        &sess.session_id,
+        &sess.session,
+        0,
+        sess.session.summary.as_deref(),
+    )
+    .await;
+    Ok(())
 }
 
 /// 非交互执行一次（对标 pi -p）：跑完即退出，回合落盘进会话库。
@@ -2016,7 +2111,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         build_provider(&rt.model, Some(&sid), &provider_options(cli))
             .await?
             .into();
-    let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt);
+    let inbox = std::sync::Arc::new(rupi_agent::MessageInbox::new());
+    let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt).with_inbox(inbox);
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     // 项目上下文守信任门（与 run/chat 同 helper）。
     agent = agent.with_context_dirs(context_cwd(load_project, home), home.clone());
