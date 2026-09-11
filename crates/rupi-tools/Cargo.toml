@@ -12,7 +12,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-walkdir = { workspace = true }
+ignore = { workspace = true }
 glob = { workspace = true }
 regex = { workspace = true }
 libc = { workspace = true }
