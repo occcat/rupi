@@ -19,3 +19,6 @@ anyhow = { workspace = true }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
