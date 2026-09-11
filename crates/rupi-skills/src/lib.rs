@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+mod dirs;
+pub use dirs::{
+    ancestor_project_skill_dirs, existing_project_skill_dirs, find_git_root, skill_search_dirs,
+    user_shared_skill_dirs,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -141,7 +147,7 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Skill 注册表：多目录发现（内建 / 用户 / 项目级），渐进披露加载。
+/// Skill 注册表：多目录发现（内建 / `~/.rupi` / Pi·Agent Skills 约定 / 项目级），渐进披露加载。
 /// 内部可变：`refresh` 原地热更新，会话内新蒸馏的 skill 下一轮即对模型可见。
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
@@ -278,7 +284,10 @@ impl SkillRegistry {
             }
             if is_dir {
                 Self::visit(&p, root, false, ig, out, seen_files, seen_dirs, depth + 1);
-            } else if include_root_files && p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
+            } else if include_root_files
+                && p.is_file()
+                && p.extension().and_then(|x| x.to_str()) == Some("md")
+            {
                 Self::collect(out, seen_files, root, &p, false);
             }
         }
@@ -449,7 +458,9 @@ impl SkillRegistry {
     /// 斜杠直调（对标上游 skill 即命令）：`/{name} {args}` 命中 skill 名时展开为
     /// 提示词（调用块 + 用户参数），供 REPL/TUI 在自定义命令未命中时回退。
     /// 内建与 `.md` 自定义命令优先，命中 skill 才调本方法，故无优先级参数。
+    /// 兼容 Pi `/skill:name`：前缀 `skill:` 会剥掉后再按 skill 名查找。
     pub fn expand_as_command(&self, name: &str, args: &str) -> Option<String> {
+        let name = name.strip_prefix("skill:").unwrap_or(name);
         let block = self.load_skill(name)?;
         let args = args.trim();
         Some(if args.is_empty() {
@@ -620,6 +631,13 @@ mod tests {
         assert!(bare.contains("Do X."), "{bare}");
         assert!(!bare.contains("do it twice"), "{bare}");
         assert!(reg.expand_as_command("no-such", "x").is_none());
+        // Pi `/skill:name` 小别名：剥掉前缀后与裸 `/skillname` 同展开。
+        let aliased = reg
+            .expand_as_command("skill:demo-skill", "via colon")
+            .unwrap();
+        assert!(aliased.contains("[skill /demo-skill]"), "{aliased}");
+        assert!(aliased.contains("via colon"), "{aliased}");
+        assert!(reg.expand_as_command("skill:no-such", "").is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -748,7 +766,11 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("references").join("deep.md"), "DEEP-KNOWLEDGE").unwrap();
         std::fs::write(base.join("outside.txt"), "OUTSIDE-SECRET").unwrap();
-        symlink(base.join("outside.txt"), dir.join("references").join("evil")).unwrap();
+        symlink(
+            base.join("outside.txt"),
+            dir.join("references").join("evil"),
+        )
+        .unwrap();
         symlink(
             dir.join("references").join("deep.md"),
             dir.join("references").join("ok"),
@@ -758,7 +780,10 @@ mod tests {
         let err = reg
             .read_resource("link-skill", "references/evil")
             .unwrap_err();
-        assert!(!err.to_string().contains("OUTSIDE-SECRET"), "错误信息不得回显目标内容");
+        assert!(
+            !err.to_string().contains("OUTSIDE-SECRET"),
+            "错误信息不得回显目标内容"
+        );
         assert_eq!(
             reg.read_resource("link-skill", "references/ok").unwrap(),
             "DEEP-KNOWLEDGE"
@@ -834,9 +859,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let acc = SkillAccumulator::new(base.clone());
         let desc = "中".repeat(400);
-        let dir = acc.propose("cjk-skill", &desc, &["do it".into()]).expect("CJK 400 字应通过");
+        let dir = acc
+            .propose("cjk-skill", &desc, &["do it".into()])
+            .expect("CJK 400 字应通过");
         assert!(dir.join("SKILL.md").exists());
-        assert!(acc.propose("cjk-too-long", &"中".repeat(2000), &["do it".into()]).is_err());
+        assert!(acc
+            .propose("cjk-too-long", &"中".repeat(2000), &["do it".into()])
+            .is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -847,7 +876,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let acc = SkillAccumulator::new(base.clone());
         assert!(!acc.exists("dup-skill"));
-        acc.propose("dup-skill", "first write", &["step".into()]).unwrap();
+        acc.propose("dup-skill", "first write", &["step".into()])
+            .unwrap();
         assert!(acc.exists("dup-skill"));
         assert!(!acc.exists("other-skill"));
         let _ = std::fs::remove_dir_all(&base);

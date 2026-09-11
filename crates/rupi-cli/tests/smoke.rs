@@ -21,9 +21,14 @@ fn fresh_home() -> PathBuf {
 }
 
 fn rupi(home: &Path, args: &[&str]) -> Command {
+    rupi_at(home, home, home, args)
+}
+
+fn rupi_at(rupi_home: &Path, user_home: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rupi"));
-    cmd.env("RUPI_HOME", home)
-        .current_dir(home)
+    cmd.env("RUPI_HOME", rupi_home)
+        .env("HOME", user_home)
+        .current_dir(cwd)
         .args(args)
         .stdin(Stdio::null())
         .env_remove("RUPI_API_KEY")
@@ -143,6 +148,92 @@ fn skill_distill_then_load() {
     let o = rupi(&home, &["skills-list"]).output().unwrap();
     let (out, _) = out_text(&o);
     assert!(out.contains("tea-guide"), "skills-list 无新 skill:\n{out}");
+}
+
+fn write_skill(dir: &Path, name: &str, body: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {name} skill\n---\n\n# {name}\n{body}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn skills_list_scans_pi_and_agents_standard_dirs() {
+    // 对齐 Pi：全局 ~/.pi/agent/skills、~/.agents/skills；项目 .pi/skills 与
+    // 祖先 .agents/skills（停在 git 根）。HOME 与 RUPI_HOME 隔离，避免吃到宿主技能。
+    let rupi_home = fresh_home();
+    let user_home = fresh_home();
+    let root = fresh_home();
+    let repo = root.join("repo");
+    let nested = repo.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(repo.join(".git"), "gitdir: fake\n").unwrap();
+    write_skill(
+        &user_home
+            .join(".pi")
+            .join("agent")
+            .join("skills")
+            .join("pi-global"),
+        "pi-global",
+        "from pi home",
+    );
+    write_skill(
+        &user_home
+            .join(".agents")
+            .join("skills")
+            .join("agents-global"),
+        "agents-global",
+        "from agents home",
+    );
+    write_skill(
+        &nested.join(".pi").join("skills").join("cwd-pi"),
+        "cwd-pi",
+        "from cwd pi",
+    );
+    write_skill(
+        &repo.join(".agents").join("skills").join("repo-agents"),
+        "repo-agents",
+        "from repo agents",
+    );
+    write_skill(
+        &nested.join(".rupi").join("skills").join("cwd-rupi"),
+        "cwd-rupi",
+        "from rupi project",
+    );
+    write_skill(
+        &root
+            .join("outside")
+            .join(".agents")
+            .join("skills")
+            .join("leak"),
+        "leak-skill",
+        "must stay outside git root",
+    );
+
+    let o = rupi_at(&rupi_home, &user_home, &nested, &["skills-list"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "skills-list 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    for name in [
+        "commit-helper",
+        "pi-global",
+        "agents-global",
+        "cwd-pi",
+        "repo-agents",
+        "cwd-rupi",
+    ] {
+        assert!(out.contains(name), "skills-list 缺 {name}:\n{out}");
+    }
+    assert!(
+        !out.contains("leak-skill"),
+        "仓外祖先 skill 不应被扫到:\n{out}"
+    );
 }
 
 #[test]
