@@ -13,7 +13,7 @@
 //! 热重载：`ExtensionSet::refresh()` 按 mtime 增量重载，agent 写新工具后
 //! `/reload`（或每轮自动检查）即刻可用；修工具开 side-quest branch，修完 rewind 回来。
 
-use rupi_core::{ExtensionCommand, ToolDefinition};
+use rupi_core::{Extension, ExtensionCommand, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 mod rpc;
-pub use rpc::{ExternalRpcTool, RpcHost};
+pub use rpc::{registered_keybindings, ExternalRpcTool, RegisteredKeybinding, RpcHost};
 
 /// 扩展 manifest（`extensions/*.json`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,8 @@ pub struct ExtensionManifest {
     /// JSON-RPC 扩展可在 manifest 里预注册斜杠命令。
     #[serde(default)]
     pub commands: Vec<ExtensionCommand>,
-    /// 预订阅事件名：`tool_call` / `turn_end` / `session_start` / `session_end` / `*`。
+    /// 预订阅事件名：`session_start` / `turn_start` / `turn_end` / `tool_call` /
+    /// `tool_result` / `model_change` / `session_end` / `*`。
     #[serde(default)]
     pub subscribe: Vec<String>,
 }
@@ -304,6 +305,12 @@ impl ExtensionSet {
             }
         }
         None
+    }
+
+    pub fn emit_event(&self, event: &rupi_core::AgentEvent) {
+        for h in self.rpc_hosts.values() {
+            let _ = crate::block_on_async(h.on_event(event));
+        }
     }
 
     pub fn drain_ui_hints(&self) -> Vec<(String, rupi_tools::UiHint)> {

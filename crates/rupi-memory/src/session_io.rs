@@ -680,6 +680,40 @@ pub fn remap_tree(src: &SessionTree, path_only: bool) -> SessionTree {
     out
 }
 
+/// 完整 id 或唯一短前缀。
+pub fn resolve_session_ref(store: &SessionStore, arg: &str) -> anyhow::Result<String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        anyhow::bail!("empty session id");
+    }
+    if store.has_session(arg)? {
+        return Ok(arg.to_string());
+    }
+    let rows = store.list_sessions(200)?;
+    let hits: Vec<&String> = rows
+        .iter()
+        .map(|(id, _, _, _, _)| id)
+        .filter(|id| id.starts_with(arg))
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => anyhow::bail!("unknown session: {arg}"),
+        _ => anyhow::bail!("ambiguous session prefix: {arg}"),
+    }
+}
+
+/// 从库重建树（与 CLI `--resume` 同语义）。
+pub fn restore_tree(store: &SessionStore, id: &str) -> anyhow::Result<SessionTree> {
+    if !store.has_session(id)? {
+        anyhow::bail!("unknown session: {id}");
+    }
+    let recs = store.session_records(id, 10_000)?;
+    let summary = store.get_summary(id).unwrap_or_default();
+    let mut tree = tree_from_records(recs, &summary);
+    tree.id = id.to_string();
+    Ok(tree)
+}
+
 /// 从库记录重建树（与 CLI restore 同语义）。
 pub fn tree_from_records(recs: Vec<SessionRecord>, summary: &str) -> SessionTree {
     let mut s = SessionTree::new();

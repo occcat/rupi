@@ -11,7 +11,7 @@ use std::path::Path;
 /// 与 REPL 同构的内建斜杠命令（`/quit` 单独处理，此处仅用于提示）。
 pub const BUILTINS: &[&str] = &[
     "clone", "commands", "compact", "export", "fork", "goto", "import", "model", "name", "plan",
-    "quit", "reload", "resume", "rewind", "sessions", "skills", "thinking", "tree",
+    "quit", "reload", "resume", "rewind", "sessions", "settings", "skills", "thinking", "tree",
 ];
 
 /// 计算候选：`input` 以 `/` 开头且首 token 无空白时，按前缀过滤并排序去重；否则空。

@@ -426,6 +426,16 @@ impl SkillRegistry {
         }
     }
 
+    /// RPC `get_commands` 用：(name, description)。
+    pub fn command_entries(&self) -> Vec<(String, String)> {
+        self.skills
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| (s.meta.name.clone(), s.meta.description.clone()))
+            .collect()
+    }
+
     /// 系统提示索引块（阶段 1）。
     pub fn index_block(&self) -> String {
         let skills = self.skills.read().unwrap();

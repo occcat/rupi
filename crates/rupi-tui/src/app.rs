@@ -3,6 +3,7 @@
 //! 排空事件 channel、响应滚动/退出——流式 delta 到达即渲染。
 
 use crate::complete;
+use crate::keybindings::KeyTable;
 use crate::theme::Theme;
 use crate::tree_nav::TreeNavigator;
 use crate::view::{ChatView, InputBuffer};
@@ -25,8 +26,8 @@ use ratatui::{
     Terminal,
 };
 use rupi_agent::AgentLoop;
-use rupi_core::{commands, AgentEvent, Extension, Message, Role, SessionTree};
-use rupi_llm::LlmProvider;
+use rupi_core::{commands, AgentEvent, ContentBlock, Extension, Message, Role, SessionTree};
+use rupi_llm::{load_models, LlmProvider, ThinkingLevel};
 use rupi_mcp::McpManager;
 use rupi_memory::{FrozenMemory, MemoryManager, SessionStore};
 use rupi_skills::SkillRegistry;
@@ -69,6 +70,10 @@ pub struct TuiContext<'a> {
     pub meter: Option<Arc<Mutex<rupi_agent::TokenMeter>>>,
     /// `--no-session` 时 /fork /clone /name 不落盘。
     pub persist: bool,
+    /// 可热改的 settings（`/settings` 写回）。
+    pub settings: Option<&'a mut rupi_config::Settings>,
+    pub settings_home: std::path::PathBuf,
+    pub settings_cwd: std::path::PathBuf,
 }
 
 /// 一轮问答记录（传给 `on_turn`）。
@@ -189,6 +194,10 @@ fn collect_busy(buf: &mut String, key: &KeyEvent) -> BusyKey {
     match key.code {
         KeyCode::Char(c) if key.modifiers.is_empty() => {
             buf.push(c);
+            BusyKey::Typed
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            buf.push('\n');
             BusyKey::Typed
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => BusyKey::SubmitFollowUp,
@@ -413,6 +422,7 @@ fn dispatch_builtin(
         return match arg.parse::<rupi_llm::ThinkingLevel>() {
             Ok(l) => {
                 agent.thinking = Some(l);
+                rupi_tools::export_reasoning_level(l.as_str());
                 Builtin::Done(format!("[thinking switched to {l:?}]"))
             }
             Err(e) => Builtin::Done(format!("[thinking] {e:#}; staying on current")),
@@ -430,7 +440,9 @@ fn dispatch_builtin(
                 *provider = p.into();
                 if let Some(t) = rupi_llm::parse_model_spec(arg).thinking {
                     agent.thinking = Some(t);
+                    rupi_tools::export_reasoning_level(t.as_str());
                 }
+                rupi_tools::export_model(provider.name(), provider.model_id().unwrap_or(arg));
                 Builtin::Done(format!("[model switched to {arg}]"))
             }
             Err(e) => Builtin::Done(format!("[model] switch failed ({e:#})")),
@@ -582,13 +594,15 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+O/T 折叠，Ctrl+G 编辑，!cmd，/tree 导航，/sessions /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
+    view.push_system("rupi TUI — Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
     let mut chrome = UiChrome::default();
     chrome.footer.model = ctx.provider.name().to_string();
     let mut tree: Option<TreeNavigator> = None;
+    let keys = KeyTable::load(&ctx.settings_home);
+    let mut pending_images: Vec<ContentBlock> = Vec::new();
 
     loop {
         // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
@@ -682,14 +696,78 @@ async fn run_loop(
         }
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if keys.fold.matches(&key) => {
                 chrome.tools_folded = !chrome.tools_folded;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 chrome.thinking_folded = !chrome.thinking_folded;
             }
+            _ if keys.paste.matches(&key) => match clipboard_paste() {
+                ClipboardPaste::Image { media_type, data } => {
+                    pending_images.push(ContentBlock::Image { media_type, data });
+                    view.push_system("[image attached from clipboard]".into());
+                }
+                ClipboardPaste::Text(s) => {
+                    for c in s.chars() {
+                        input.push_char(c);
+                    }
+                }
+                ClipboardPaste::None => {}
+            },
+            _ if keys.model.matches(&key) => {
+                let list: Vec<String> = load_models()
+                    .into_iter()
+                    .map(|m| format!("{}/{}", m.provider, m.id))
+                    .collect();
+                match cycle_and_switch_model(ctx.provider, ctx.agent, &ctx.session_id.lock().unwrap(), &list) {
+                    Ok(spec) => {
+                        chrome.footer.model = ctx.provider.name().to_string();
+                        if let Some(set) = ctx.ext_set.as_ref() {
+                            set.emit_event(&AgentEvent::ModelChange {
+                                provider: ctx.provider.name().to_string(),
+                                model: spec.clone(),
+                            });
+                        }
+                        view.push_system(format!("[model {spec}]"));
+                    }
+                    Err(e) => view.push_system(format!("[model] {e}")),
+                }
+            }
+            _ if keys.enabled_models.matches(&key) => {
+                let list = ctx
+                    .settings
+                    .as_ref()
+                    .map(|s| s.enabled_models.clone())
+                    .unwrap_or_default();
+                if list.is_empty() {
+                    view.push_system("[model] enabledModels empty — set via /settings".into());
+                } else {
+                    match cycle_and_switch_model(
+                        ctx.provider,
+                        ctx.agent,
+                        &ctx.session_id.lock().unwrap(),
+                        &list,
+                    ) {
+                        Ok(spec) => {
+                            chrome.footer.model = ctx.provider.name().to_string();
+                            view.push_system(format!("[model {spec}]"));
+                        }
+                        Err(e) => view.push_system(format!("[model] {e}")),
+                    }
+                }
+            }
+            _ if keys.thinking.matches(&key) => {
+                let next = ctx.agent.thinking.unwrap_or(ThinkingLevel::Off).cycle();
+                ctx.agent.thinking = Some(next);
+                rupi_tools::export_reasoning_level(next.as_str());
+                view.push_system(format!("[thinking {}]", next.as_str()));
+            }
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                match open_external_editor(&input.text()) {
+                let editor = ctx
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.external_editor().map(|e| e.to_string()));
+                match open_external_editor(&input.text(), editor.as_deref()) {
                     Ok(s) => input.set_text(&s),
                     Err(e) => view.push_system(format!("[editor] {e:#}")),
                 }
@@ -716,10 +794,12 @@ async fn run_loop(
                 scroll = 0;
                 input.push_char(c);
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Enter
+                if keys.newline.matches(&key) || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 input.push_char('\n');
             }
-            KeyCode::Enter if !input.is_empty() => {
+            KeyCode::Enter if keys.send.matches(&key) && !input.is_empty() => {
                 // follow-up 自动跟进：drive_turn 带回运行中排队的输入，非空则直接作为
                 // 下一轮发出（dispatch/展开/落盘全走同一路径；Quit 在内层直接返回）。
                 // 内层 Done/Compact 的 continue 因 next 已空而等价于回到外循环读键。
@@ -740,6 +820,16 @@ async fn run_loop(
                             }
                         }
                     }
+                    if let Some(cmd) = text.strip_prefix("!!") {
+                        match run_bang_cmd(cmd.trim()) {
+                            Ok(out) => {
+                                view.push_system(format!("$ {cmd}"));
+                                view.push_system(out);
+                            }
+                            Err(e) => view.push_system(format!("[!!] {e:#}")),
+                        }
+                        continue;
+                    }
                     if let Some(cmd) = text.strip_prefix('!') {
                         match run_bang_cmd(cmd.trim()) {
                             Ok(out) => {
@@ -752,6 +842,16 @@ async fn run_loop(
                             }
                             Err(e) => view.push_system(format!("[!] {e:#}")),
                         }
+                        continue;
+                    }
+                    if let Some(msg) = handle_settings_cmd(
+                        &text,
+                        ctx.settings.as_deref_mut(),
+                        &ctx.settings_home,
+                        &ctx.settings_cwd,
+                        ctx.agent.inbox.as_deref(),
+                    ) {
+                        view.push_system(msg);
                         continue;
                     }
                     // 锁守卫只活在派发语句内：守卫跨 await 会触发 await_holding_lock，
@@ -913,14 +1013,15 @@ async fn run_loop(
                         }
                     }
                     // @path 引用展开：斜杠展开之后、发送之前内联文件（图片走 Image 块）。
-                    let user = if let Ok(cwd) = std::env::current_dir() {
-                        Message::from_blocks(
-                            Role::User,
-                            commands::expand_at_mentions_blocks(&send_text, &cwd),
-                        )
+                    let mut blocks = if let Ok(cwd) = std::env::current_dir() {
+                        commands::expand_at_mentions_blocks(&send_text, &cwd)
                     } else {
-                        Message::text(Role::User, send_text.clone())
+                        vec![ContentBlock::Text {
+                            text: send_text.clone(),
+                        }]
                     };
+                    blocks.extend(pending_images.drain(..));
+                    let user = Message::from_blocks(Role::User, blocks);
                     view.push_user(user.full_text());
                     scroll = 0;
                     // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
@@ -1292,12 +1393,14 @@ fn footer_text(busy: bool, queued: usize, chrome: &UiChrome) -> String {
     }
 }
 
-fn open_external_editor(initial: &str) -> anyhow::Result<String> {
+fn open_external_editor(initial: &str, configured: Option<&str>) -> anyhow::Result<String> {
     let path = std::env::temp_dir().join(format!("rupi-compose-{}.md", std::process::id()));
     std::fs::write(&path, initial)?;
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+    let editor = configured
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".into());
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let status = std::process::Command::new("sh")
@@ -1481,6 +1584,158 @@ fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
         out.push(RLine::from(Span::styled(line, style)));
     }
     out
+}
+
+fn handle_settings_cmd(
+    text: &str,
+    settings: Option<&mut rupi_config::Settings>,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    inbox: Option<&rupi_agent::MessageInbox>,
+) -> Option<String> {
+    let cmd = rupi_config::parse_settings_slash(text)?;
+    let Some(settings) = settings else {
+        return Some("[settings] no settings attached".into());
+    };
+    let path = rupi_config::write_target(home, cwd);
+    match cmd {
+        rupi_config::SettingsSlash::Show => Some(rupi_config::format_settings(settings, &path)),
+        rupi_config::SettingsSlash::Set { key, value } => {
+            if value.is_empty() {
+                return Some("[settings] usage: /settings <key> <value>".into());
+            }
+            match rupi_config::apply_setting(settings, &key, &value) {
+                Ok((jk, jv)) => {
+                    if let Err(e) = rupi_config::persist_patch(&path, &jk, jv) {
+                        return Some(format!("[settings] write failed: {e:#}"));
+                    }
+                    if let Some(inbox) = inbox {
+                        if let Some(m) = settings
+                            .steering_mode
+                            .as_deref()
+                            .and_then(rupi_agent::QueueMode::parse)
+                        {
+                            inbox.set_steering_mode(m);
+                        }
+                        if let Some(m) = settings
+                            .follow_up_mode
+                            .as_deref()
+                            .and_then(rupi_agent::QueueMode::parse)
+                        {
+                            inbox.set_follow_up_mode(m);
+                        }
+                    }
+                    Some(format!("[settings] {jk} = {value} (saved {})", path.display()))
+                }
+                Err(e) => Some(format!("[settings] {e:#}")),
+            }
+        }
+    }
+}
+
+fn cycle_and_switch_model(
+    provider: &mut Arc<dyn LlmProvider>,
+    agent: &mut AgentLoop,
+    session_id: &str,
+    list: &[String],
+) -> Result<String, String> {
+    if list.is_empty() {
+        return Err("no models".into());
+    }
+    let current = provider
+        .model_id()
+        .map(|m| m.to_string())
+        .unwrap_or_default();
+    let idx = list
+        .iter()
+        .position(|s| s == &current || s.ends_with(&format!("/{current}")) || current.ends_with(s));
+    let spec = match idx {
+        Some(i) => list[(i + 1) % list.len()].clone(),
+        None => list[0].clone(),
+    };
+    match rupi_llm::provider_for_model(&spec) {
+        Ok(mut p) => {
+            rupi_llm::apply_session_settings(&mut *p, Some(session_id));
+            *provider = p.into();
+            if let Some(t) = rupi_llm::parse_model_spec(&spec).thinking {
+                agent.thinking = Some(t);
+                rupi_tools::export_reasoning_level(t.as_str());
+            }
+            rupi_tools::export_model(provider.name(), provider.model_id().unwrap_or(&spec));
+            Ok(spec)
+        }
+        Err(e) => {
+            let p = rupi_llm::provider_or_mock(&spec, &rupi_llm::ProviderOptions::default());
+            *provider = p.into();
+            rupi_tools::export_model(provider.name(), provider.model_id().unwrap_or(&spec));
+            let _ = e;
+            Ok(spec)
+        }
+    }
+}
+
+enum ClipboardPaste {
+    Image { media_type: String, data: String },
+    Text(String),
+    None,
+}
+
+fn clipboard_paste() -> ClipboardPaste {
+    if let Some((media, bytes)) = clipboard_image_bytes() {
+        return ClipboardPaste::Image {
+            media_type: media,
+            data: rupi_core::encode_base64(&bytes),
+        };
+    }
+    if let Some(t) = clipboard_text() {
+        if !t.is_empty() {
+            return ClipboardPaste::Text(t);
+        }
+    }
+    ClipboardPaste::None
+}
+
+fn clipboard_image_bytes() -> Option<(String, Vec<u8>)> {
+    for (cmd, args, mime) in [
+        (
+            "wl-paste",
+            vec!["--type", "image/png", "--no-newline"],
+            "image/png",
+        ),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+            "image/png",
+        ),
+    ] {
+        if let Ok(out) = std::process::Command::new(cmd).args(args).output() {
+            if out.status.success() && !out.stdout.is_empty() && looks_like_image(&out.stdout) {
+                return Some((mime.into(), out.stdout));
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+fn clipboard_text() -> Option<String> {
+    for (cmd, args) in [
+        ("wl-paste", vec!["--type", "text", "--no-newline"]),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+    ] {
+        if let Ok(out) = std::process::Command::new(cmd).args(args).output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

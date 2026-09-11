@@ -1,7 +1,8 @@
 //! `provider/model[:thinking]` 解析与显式路由（Azure / Bedrock / Vertex / OpenRouter）。
 
 use super::{
-    AnthropicProvider, CompatKind, GeminiProvider, LlmProvider, OpenAiCompatProvider, ThinkingLevel,
+    catalog, AnthropicProvider, CompatKind, GeminiProvider, LlmProvider, MockProvider,
+    OpenAiCompatProvider, ThinkingLevel,
 };
 
 /// `--api-key` / `--provider` 覆盖（环境变量仍是缺省）。
@@ -56,11 +57,16 @@ fn split_thinking_suffix(s: &str) -> (&str, Option<ThinkingLevel>) {
     }
 }
 
+pub fn is_known_provider(name: &str) -> bool {
+    KNOWN_PROVIDERS.iter().any(|p| p.eq_ignore_ascii_case(name))
+        || catalog::find_extra_provider(name).is_some()
+}
+
 fn split_provider_prefix(s: &str) -> (Option<String>, String) {
     let Some((head, tail)) = s.split_once('/') else {
         return (None, s.to_string());
     };
-    if KNOWN_PROVIDERS.iter().any(|p| p.eq_ignore_ascii_case(head)) && !tail.is_empty() {
+    if is_known_provider(head) && !tail.is_empty() {
         return (Some(head.to_ascii_lowercase()), tail.to_string());
     }
     (None, s.to_string())
@@ -106,6 +112,9 @@ pub fn provider_from_spec(
         .or_else(|| spec.provider.clone())
         .unwrap_or_else(|| infer_provider(&spec.model).to_string());
     let key = opts.api_key.as_deref();
+    if let Some(extra) = catalog::find_extra_provider(&provider) {
+        return provider_from_extra(&extra, spec, opts);
+    }
     match provider.as_str() {
         "anthropic" => {
             let api_key = pick_key(key, &["RUPI_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"])?;
@@ -196,6 +205,62 @@ pub fn provider_from_spec(
         other => anyhow::bail!(
             "unknown provider '{other}' (openai|anthropic|gemini|openrouter|azure|bedrock|vertex)"
         ),
+    }
+}
+
+fn provider_from_extra(
+    extra: &catalog::ExtraProvider,
+    spec: &ModelSpec,
+    opts: &ProviderOptions,
+) -> anyhow::Result<Box<dyn LlmProvider>> {
+    let key = opts.api_key.as_deref();
+    match extra.protocol.as_str() {
+        "anthropic" => {
+            let mut names = vec!["RUPI_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"];
+            if let Some(e) = extra.api_key_env.as_deref() {
+                names.insert(0, e);
+            }
+            let api_key = pick_key(key, &names)?;
+            Ok(Box::new(AnthropicProvider::new(
+                extra.base_url.clone(),
+                api_key,
+                spec.model.clone(),
+            )))
+        }
+        "gemini" => {
+            let mut names = vec!["RUPI_GEMINI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"];
+            if let Some(e) = extra.api_key_env.as_deref() {
+                names.insert(0, e);
+            }
+            let api_key = pick_key(key, &names)?;
+            Ok(Box::new(GeminiProvider::new(
+                extra.base_url.clone(),
+                api_key,
+                spec.model.clone(),
+            )))
+        }
+        _ => {
+            let mut names = vec!["RUPI_API_KEY", "OPENAI_API_KEY"];
+            if let Some(e) = extra.api_key_env.as_deref() {
+                names.insert(0, e);
+            }
+            let api_key = pick_key(key, &names)?;
+            Ok(Box::new(OpenAiCompatProvider::new(
+                extra.base_url.clone(),
+                api_key,
+                spec.model.clone(),
+            )))
+        }
+    }
+}
+
+/// 缺 key 时回 Mock（RPC/TUI 切模型不因环境缺钥失败）。
+pub fn provider_or_mock(model: &str, opts: &ProviderOptions) -> Box<dyn LlmProvider> {
+    match provider_from_spec(&parse_model_spec(model), opts) {
+        Ok(p) => p,
+        Err(_) => Box::new(MockProvider::new(vec![MockProvider::text_response(
+            &format!("demo mode: missing key for {model}"),
+        )])),
     }
 }
 

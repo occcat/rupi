@@ -195,6 +195,10 @@ impl ChatView {
                     self.lines.push(Line::User(format!("[steer] {m}")));
                 }
             }
+            AgentEvent::ModelChange { provider, model } => {
+                self.lines
+                    .push(Line::System(format!("[model {provider}/{model}]")));
+            }
         }
     }
 

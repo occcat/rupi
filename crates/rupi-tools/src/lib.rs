@@ -792,7 +792,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Execute a shell command (bounded output; default 30s timeout; $RUPI_SESSION_ID holds the current session id)".into(),
+            description: "Execute a shell command (bounded output; default 30s timeout). Inherits RUPI_SESSION_ID / RUPI_SESSION_FILE / RUPI_PROVIDER / RUPI_MODEL / RUPI_REASONING_LEVEL (Pi: PI_SESSION_ID / PI_SESSION_FILE / PI_PROVIDER / PI_MODEL / PI_REASONING_LEVEL).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -822,6 +822,9 @@ impl Tool for BashTool {
         let (command, timeout_secs) = Self::parse_args(&arguments);
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command);
+        for (k, v) in current_session_env() {
+            cmd.env(k, v);
+        }
         // 自成进程组（setsid）：取消/超时杀整组，sh -c fork 出的孙进程不留孤儿。
         // BashTool 本就调 sh，Unix 假设与既有用例一致。
         use std::os::unix::process::CommandExt as _;
@@ -1362,10 +1365,79 @@ pub const MAX_TOOL_OUTPUT: usize = 12_000;
 /// 会话环境变量名：对标上游 `PI_SESSION_ID`。bash 子进程自动继承父进程环境，
 /// 前端（REPL/TUI）在会话建立后调用 [`export_session_id`] 导出一次，脚本里 `$RUPI_SESSION_ID` 即用。
 pub const SESSION_ENV_VAR: &str = "RUPI_SESSION_ID";
+/// 对标 `PI_SESSION_FILE`；SQLite 主存时可空。
+pub const SESSION_FILE_ENV: &str = "RUPI_SESSION_FILE";
+/// 对标 `PI_PROVIDER`。
+pub const PROVIDER_ENV: &str = "RUPI_PROVIDER";
+/// 对标 `PI_MODEL`。
+pub const MODEL_ENV: &str = "RUPI_MODEL";
+/// 对标 `PI_REASONING_LEVEL`。
+pub const REASONING_ENV: &str = "RUPI_REASONING_LEVEL";
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionContext {
+    pub session_id: String,
+    pub session_file: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_level: String,
+}
+
+fn session_ctx() -> &'static std::sync::Mutex<SessionContext> {
+    static CTX: std::sync::OnceLock<std::sync::Mutex<SessionContext>> = std::sync::OnceLock::new();
+    CTX.get_or_init(|| std::sync::Mutex::new(SessionContext::default()))
+}
+
+fn apply_session_env(ctx: &SessionContext) {
+    unsafe {
+        std::env::set_var(SESSION_ENV_VAR, &ctx.session_id);
+        std::env::set_var(SESSION_FILE_ENV, &ctx.session_file);
+        std::env::set_var(PROVIDER_ENV, &ctx.provider);
+        std::env::set_var(MODEL_ENV, &ctx.model);
+        std::env::set_var(REASONING_ENV, &ctx.reasoning_level);
+    }
+}
 
 /// 导出当前会话 id 到进程环境（子进程继承；resume 沿用 db 会话 id，跨进程稳定）。
 pub fn export_session_id(id: &str) {
-    std::env::set_var(SESSION_ENV_VAR, id);
+    let mut g = session_ctx().lock().unwrap();
+    g.session_id = id.to_string();
+    apply_session_env(&g);
+}
+
+pub fn export_session_file(path: &str) {
+    let mut g = session_ctx().lock().unwrap();
+    g.session_file = path.to_string();
+    apply_session_env(&g);
+}
+
+pub fn export_model(provider: &str, model: &str) {
+    let mut g = session_ctx().lock().unwrap();
+    g.provider = provider.to_string();
+    g.model = model.to_string();
+    apply_session_env(&g);
+}
+
+pub fn export_reasoning_level(level: &str) {
+    let mut g = session_ctx().lock().unwrap();
+    g.reasoning_level = level.to_string();
+    apply_session_env(&g);
+}
+
+pub fn export_session_context(ctx: SessionContext) {
+    *session_ctx().lock().unwrap() = ctx.clone();
+    apply_session_env(&ctx);
+}
+
+pub fn current_session_env() -> Vec<(String, String)> {
+    let g = session_ctx().lock().unwrap();
+    vec![
+        (SESSION_ENV_VAR.into(), g.session_id.clone()),
+        (SESSION_FILE_ENV.into(), g.session_file.clone()),
+        (PROVIDER_ENV.into(), g.provider.clone()),
+        (MODEL_ENV.into(), g.model.clone()),
+        (REASONING_ENV.into(), g.reasoning_level.clone()),
+    ]
 }
 
 pub fn truncate_middle(s: &str, limit: usize) -> String {
@@ -1871,6 +1943,29 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.content, "sess-hook-test");
+    }
+
+    #[tokio::test]
+    async fn bash_sees_rupi_model_env() {
+        export_session_context(SessionContext {
+            session_id: "s1".into(),
+            session_file: String::new(),
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            reasoning_level: "high".into(),
+        });
+        let r = ToolRegistry::with_builtins();
+        let out = r
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "printf '%s %s %s' \"$RUPI_PROVIDER\" \"$RUPI_MODEL\" \"$RUPI_REASONING_LEVEL\""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "openai gpt-4o-mini high");
     }
 
     #[tokio::test]

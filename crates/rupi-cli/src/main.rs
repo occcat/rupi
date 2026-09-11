@@ -345,20 +345,28 @@ fn project_resources() -> Option<(PathBuf, Vec<String>)> {
 /// 项目信任门（对标上游 project_trust）：项目根有本地资源且未被记住时问一次。
 /// 返回是否加载项目资源。无项目根 / 无项目资源 / 已记住 → true 不打扰；
 /// 非交互（管道/EOF）默认跳过并提示。
-fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
+fn load_project_resources(home: &PathBuf, cli: &Cli, settings: &rupi_config::Settings) -> bool {
     let (root, resources) = match project_resources() {
         Some(r) => r,
         None => return true,
     };
-    let mut store = rupi_core::trust::TrustStore::open(home.join("trusted_projects"));
-    if store.contains(&root) {
-        return true;
-    }
     if cli.trust_project {
         println!(
             "[trust] --trust-project: 本次加载项目资源 {}",
             root.display()
         );
+        return true;
+    }
+    match settings.project_trust() {
+        rupi_config::ProjectTrust::Always => return true,
+        rupi_config::ProjectTrust::Never => {
+            println!("[trust] defaultProjectTrust=never：跳过项目资源");
+            return false;
+        }
+        rupi_config::ProjectTrust::Ask => {}
+    }
+    let mut store = rupi_core::trust::TrustStore::open(home.join("trusted_projects"));
+    if store.contains(&root) {
         return true;
     }
     match rupi_core::trust::ask_trust_stdin(&root, &resources) {
@@ -407,11 +415,7 @@ fn builtin_skills_dir() -> PathBuf {
 
 /// 自定义命令目录：与 skills 同门，信任被拒只留全局 `~/commands`。
 fn command_dirs_filtered(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
-    if load_project {
-        rupi_core::commands::command_dirs(home)
-    } else {
-        vec![home.join("commands")]
-    }
+    rupi_core::commands::command_dirs_filtered(home, load_project)
 }
 
 /// 工作区沙箱根：启动时 cwd（canonicalize 消解符号链接），read/write/edit 约束其内。
@@ -857,6 +861,7 @@ struct Resolved {
     theme: String,
     overrides: std::collections::HashMap<String, rupi_agent::CompressionOverride>,
     persist: bool,
+    settings: rupi_config::Settings,
 }
 
 impl Resolved {
@@ -921,6 +926,7 @@ impl Resolved {
             theme: settings.theme().to_string(),
             overrides: merge_compression_overrides(&settings),
             persist: !cli.no_session,
+            settings,
         })
     }
 }
@@ -956,6 +962,70 @@ fn apply_prompt(agent: &mut AgentLoop, sys: &rupi_config::SystemPromptFiles) {
 
 fn apply_tool_filter(tools: &mut ToolRegistry, rt: &Resolved) {
     tools.retain(|n| rupi_config::tool_allowed(n, rt.tool_allow.as_deref(), &rt.tool_exclude));
+}
+
+fn apply_queue_settings(inbox: &rupi_agent::MessageInbox, settings: &rupi_config::Settings) {
+    if let Some(m) = settings
+        .steering_mode
+        .as_deref()
+        .and_then(rupi_agent::QueueMode::parse)
+    {
+        inbox.set_steering_mode(m);
+    }
+    if let Some(m) = settings
+        .follow_up_mode
+        .as_deref()
+        .and_then(rupi_agent::QueueMode::parse)
+    {
+        inbox.set_follow_up_mode(m);
+    }
+}
+
+fn sync_tool_env(sid: &str, provider: &dyn LlmProvider, thinking: Option<rupi_llm::ThinkingLevel>) {
+    rupi_tools::export_session_context(rupi_tools::SessionContext {
+        session_id: sid.to_string(),
+        session_file: String::new(),
+        provider: provider.name().to_string(),
+        model: provider.model_id().unwrap_or("").to_string(),
+        reasoning_level: thinking.map(|t| t.as_str().to_string()).unwrap_or_default(),
+    });
+}
+
+fn handle_settings_repl(
+    input: &str,
+    settings: &mut rupi_config::Settings,
+    home: &PathBuf,
+    inbox: Option<&rupi_agent::MessageInbox>,
+) -> bool {
+    let Some(cmd) = rupi_config::parse_settings_slash(input) else {
+        return false;
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path = rupi_config::write_target(home, &cwd);
+    match cmd {
+        rupi_config::SettingsSlash::Show => {
+            println!("{}", rupi_config::format_settings(settings, &path));
+        }
+        rupi_config::SettingsSlash::Set { key, value } => {
+            if value.is_empty() {
+                println!("[settings] usage: /settings <key> <value>");
+                return true;
+            }
+            match rupi_config::apply_setting(settings, &key, &value) {
+                Ok((jk, jv)) => match rupi_config::persist_patch(&path, &jk, jv) {
+                    Ok(()) => {
+                        if let Some(inbox) = inbox {
+                            apply_queue_settings(inbox, settings);
+                        }
+                        println!("[settings] {jk} = {value} (saved {})", path.display());
+                    }
+                    Err(e) => println!("[settings] write failed: {e:#}"),
+                },
+                Err(e) => println!("[settings] {e:#}"),
+            }
+        }
+    }
+    true
 }
 
 fn configure_agent(mut agent: AgentLoop, rt: &Resolved) -> AgentLoop {
@@ -1296,9 +1366,20 @@ async fn handle_session_slash(
 /// `--mode rpc`：装配与 `run` 同构的会话，再走 JSONL 协议循环。
 async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let _ = approver_for(cli, None)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let pre = rupi_config::Settings::load(home, &cwd);
+    rupi_llm::load_extra_providers(&home.join("providers.json"));
     let load_project = match project_resources() {
         None => true,
-        Some((_root, _)) if cli.trust_project => true,
+        Some((_root, _))
+            if cli.trust_project || pre.project_trust() == rupi_config::ProjectTrust::Always =>
+        {
+            true
+        }
+        Some(_) if pre.project_trust() == rupi_config::ProjectTrust::Never => {
+            eprintln!("[trust] defaultProjectTrust=never：跳过项目资源");
+            false
+        }
         Some(_) => {
             eprintln!("[trust] rpc 默认跳过项目资源（加 --trust-project 加载）");
             false
@@ -1348,6 +1429,7 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         agent = agent.with_thinking(t);
     }
     apply_tool_filter(&mut tools, &rt);
+    let store = Arc::new(Mutex::new(sess_db));
     let mut sess = rupi_agent::AgentSession::from_parts(
         provider,
         agent,
@@ -1360,9 +1442,14 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     );
     sess.extensions = ext_set.extension_arcs();
     sess.session_name = cli.name.clone();
+    sess.sess_db = Some(store.clone());
+    sess.persist = rt.persist;
+    sess.command_dirs = command_dirs_filtered(home, load_project);
+    sess.provider_opts = provider_options(cli);
+    apply_queue_settings(&sess.inbox, &rt.settings);
+    sync_tool_env(&sess.session_id, &*sess.provider, sess.agent.thinking);
     eprintln!("[rpc] session {sid} — JSONL on stdin/stdout");
     let sess = rpc::serve(sess).await?;
-    let store = Arc::new(Mutex::new(sess_db));
     persist_turn_if(
         rt.persist,
         &store,
@@ -1382,14 +1469,28 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     // 审批档位先验（错配直接 bail，不建会话不落盘）
     let approver = approver_for(cli, None)?;
     // 非交互不提问：有项目资源且未 --trust-project 则跳过并告知
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let pre = rupi_config::Settings::load(home, &cwd);
+    rupi_llm::load_extra_providers(&home.join("providers.json"));
     let load_project = match project_resources() {
         None => true,
-        Some((root, _)) if cli.trust_project => {
+        Some((root, _))
+            if cli.trust_project || pre.project_trust() == rupi_config::ProjectTrust::Always =>
+        {
             eprintln!(
-                "[trust] --trust-project: 本次加载项目资源 {}",
+                "[trust] {}: 本次加载项目资源 {}",
+                if cli.trust_project {
+                    "--trust-project"
+                } else {
+                    "defaultProjectTrust=always"
+                },
                 root.display()
             );
             true
+        }
+        Some(_) if pre.project_trust() == rupi_config::ProjectTrust::Never => {
+            eprintln!("[trust] defaultProjectTrust=never：跳过项目资源");
+            false
         }
         Some(_) => {
             eprintln!("[trust] 非交互默认跳过项目资源（加 --trust-project 加载）");
@@ -1461,6 +1562,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
         eprintln!("[subagents] subagent tool enabled");
     }
     apply_tool_filter(&mut tools, &rt);
+    sync_tool_env(&sid, &*provider, agent.thinking);
     // 后台 review（与 chat 同语义）：默认启发式复盘，非空建议打印，--review-apply 直接落盘
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
@@ -1615,12 +1717,17 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
 }
 
 async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
-    let load_project = load_project_resources(home, cli);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    rupi_llm::load_extra_providers(&home.join("providers.json"));
+    let pre = rupi_config::Settings::load(home, &cwd);
+    let load_project = load_project_resources(home, cli, &pre);
     let rt = Resolved::load(cli, home, load_project)?;
     let mut model = rt.model.clone();
     let pending: Arc<std::sync::Mutex<Vec<ReviewSuggestion>>> =
         Arc::new(std::sync::Mutex::new(vec![]));
-    let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt);
+    let inbox = Arc::new(rupi_agent::MessageInbox::new());
+    apply_queue_settings(&inbox, &rt.settings);
+    let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt).with_inbox(inbox.clone());
     agent = agent
         .with_policy(Arc::new(default_policy()))
         .with_plan_mode(cli.plan);
@@ -1680,6 +1787,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         build_provider(&model, Some(&sid), &provider_options(cli))
             .await?
             .into();
+    sync_tool_env(&sid, &*provider, agent.thinking);
+    let mut settings = rt.settings.clone();
     let meter = std::sync::Arc::new(std::sync::Mutex::new({
         let mut m = rupi_agent::TokenMeter::new(&model);
         if let Some(w) = rt.context_window {
@@ -1735,7 +1844,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
     apply_tool_filter(&mut tools, &rt);
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/export /import /fork /clone /name");
+    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/settings 改 steeringMode/followUpMode/defaultProjectTrust/externalEditor/enabledModels，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/export /import /fork /clone /name");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -1780,6 +1889,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             continue;
         }
+        if handle_settings_repl(&input, &mut settings, home, Some(&inbox)) {
+            continue;
+        }
         if input == "/plan" {
             agent.plan_mode = !agent.plan_mode;
             println!("[plan mode {}]", if agent.plan_mode { "on" } else { "off" });
@@ -1798,6 +1910,11 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                             agent.thinking = Some(t);
                         }
                         meter.lock().unwrap().set_model(&model);
+                        sync_tool_env(&sid, &*provider, agent.thinking);
+                        ext_set.emit_event(&rupi_core::AgentEvent::ModelChange {
+                            provider: provider.name().to_string(),
+                            model: model.clone(),
+                        });
                         println!("[model switched to {model}]");
                     }
                     Err(e) => eprintln!("[model] switch failed ({e:#}); staying on {model}"),
@@ -1817,6 +1934,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 match arg.parse::<rupi_llm::ThinkingLevel>() {
                     Ok(t) => {
                         agent.thinking = Some(t);
+                        rupi_tools::export_reasoning_level(t.as_str());
                         println!("[thinking switched to {t:?}]");
                     }
                     Err(e) => eprintln!("[thinking] {e:#}; staying on current"),
@@ -2076,7 +2194,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
 
 async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     // 项目信任门（全屏启动前 stdin 问一次，与 REPL 同语义）
-    let load_project = load_project_resources(home, cli);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    rupi_llm::load_extra_providers(&home.join("providers.json"));
+    let pre = rupi_config::Settings::load(home, &cwd);
+    let load_project = load_project_resources(home, cli, &pre);
     let rt = Resolved::load(cli, home, load_project)?;
     let thinking = rt.thinking;
     let mut tools = sandboxed_tools_filtered(rt.builtin_allow.as_deref());
@@ -2112,6 +2233,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             .await?
             .into();
     let inbox = std::sync::Arc::new(rupi_agent::MessageInbox::new());
+    apply_queue_settings(&inbox, &rt.settings);
     let mut agent = configure_agent(AgentLoop::new(cli.max_turns), &rt).with_inbox(inbox);
     // TUI 内审批：Ask 时暂停全屏问一句 [y/N]（与 REPL 同语义）；plan mode 同 REPL
     // 项目上下文守信任门（与 run/chat 同 helper）。
@@ -2219,6 +2341,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let sid_for_turn = sid_cell.clone();
     let sess_db_ctx = sess_db.clone();
     let persist_turns = rt.persist;
+    let mut settings = rt.settings.clone();
+    sync_tool_env(&sid, &*provider, agent.thinking);
     let ctx = rupi_tui::TuiContext {
         provider: &mut provider,
         agent: &mut agent,
@@ -2243,6 +2367,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             m
         }))),
         persist: rt.persist,
+        settings: Some(&mut settings),
+        settings_home: home.clone(),
+        settings_cwd: cwd.clone(),
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             if !persist_turns {
                 return;

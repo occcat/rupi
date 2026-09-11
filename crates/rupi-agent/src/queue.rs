@@ -1,8 +1,52 @@
 //! 运行中转向 / 跟进队列（对标 Pi `steeringMode` / `followUpMode`）。
 
+use rupi_core::{ContentBlock, Message, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+
+/// 排队消息：文本 + 可选图片（RPC `images[]`）。
+#[derive(Debug, Clone, Default)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub images: Vec<QueuedImage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl QueuedMessage {
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn to_user_message(&self) -> Message {
+        let mut blocks = Vec::new();
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: self.text.clone(),
+            });
+        }
+        for img in &self.images {
+            blocks.push(ContentBlock::Image {
+                media_type: img.media_type.clone(),
+                data: img.data.clone(),
+            });
+        }
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: String::new(),
+            });
+        }
+        Message::from_blocks(Role::User, blocks)
+    }
+}
 
 /// 队列一次取出一条还是全部。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -35,8 +79,8 @@ impl QueueMode {
 
 #[derive(Debug)]
 struct Inner {
-    steering: VecDeque<String>,
-    follow_up: VecDeque<String>,
+    steering: VecDeque<QueuedMessage>,
+    follow_up: VecDeque<QueuedMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
 }
@@ -67,28 +111,48 @@ impl MessageInbox {
     }
 
     pub fn steer(&self, message: impl Into<String>) {
-        let m = message.into();
-        if m.trim().is_empty() {
-            return;
-        }
-        self.inner.lock().unwrap().steering.push_back(m);
+        self.steer_msg(QueuedMessage::from_text(message));
     }
 
     pub fn follow_up(&self, message: impl Into<String>) {
-        let m = message.into();
-        if m.trim().is_empty() {
+        self.follow_up_msg(QueuedMessage::from_text(message));
+    }
+
+    pub fn steer_msg(&self, message: QueuedMessage) {
+        if message.text.trim().is_empty() && message.images.is_empty() {
             return;
         }
-        self.inner.lock().unwrap().follow_up.push_back(m);
+        self.inner.lock().unwrap().steering.push_back(message);
+    }
+
+    pub fn follow_up_msg(&self, message: QueuedMessage) {
+        if message.text.trim().is_empty() && message.images.is_empty() {
+            return;
+        }
+        self.inner.lock().unwrap().follow_up.push_back(message);
     }
 
     pub fn take_steering(&self) -> Vec<String> {
+        self.take_steering_msgs()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    pub fn take_follow_up(&self) -> Vec<String> {
+        self.take_follow_up_msgs()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    pub fn take_steering_msgs(&self) -> Vec<QueuedMessage> {
         let mut g = self.inner.lock().unwrap();
         let mode = g.steering_mode;
         take_by_mode(&mut g.steering, mode)
     }
 
-    pub fn take_follow_up(&self) -> Vec<String> {
+    pub fn take_follow_up_msgs(&self) -> Vec<QueuedMessage> {
         let mut g = self.inner.lock().unwrap();
         let mode = g.follow_up_mode;
         take_by_mode(&mut g.follow_up, mode)
@@ -100,7 +164,7 @@ impl MessageInbox {
             .unwrap()
             .steering
             .iter()
-            .cloned()
+            .map(|m| m.text.clone())
             .collect()
     }
 
@@ -110,7 +174,7 @@ impl MessageInbox {
             .unwrap()
             .follow_up
             .iter()
-            .cloned()
+            .map(|m| m.text.clone())
             .collect()
     }
 
@@ -118,8 +182,8 @@ impl MessageInbox {
     pub fn clear(&self) -> (Vec<String>, Vec<String>) {
         let mut g = self.inner.lock().unwrap();
         (
-            g.steering.drain(..).collect(),
-            g.follow_up.drain(..).collect(),
+            g.steering.drain(..).map(|m| m.text).collect(),
+            g.follow_up.drain(..).map(|m| m.text).collect(),
         )
     }
 
@@ -145,7 +209,7 @@ impl MessageInbox {
     }
 }
 
-fn take_by_mode(q: &mut VecDeque<String>, mode: QueueMode) -> Vec<String> {
+fn take_by_mode(q: &mut VecDeque<QueuedMessage>, mode: QueueMode) -> Vec<QueuedMessage> {
     match mode {
         QueueMode::All => q.drain(..).collect(),
         QueueMode::OneAtATime => q.pop_front().into_iter().collect(),
@@ -194,5 +258,21 @@ mod tests {
             Some(QueueMode::OneAtATime)
         );
         assert_eq!(QueueMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn queued_message_keeps_images() {
+        let inbox = MessageInbox::new();
+        inbox.steer_msg(QueuedMessage {
+            text: "look".into(),
+            images: vec![QueuedImage {
+                media_type: "image/png".into(),
+                data: "abc".into(),
+            }],
+        });
+        let msgs = inbox.take_steering_msgs();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].images.len(), 1);
+        assert!(msgs[0].to_user_message().has_images());
     }
 }

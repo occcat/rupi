@@ -9,6 +9,44 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// 项目信任默认策略（settings `defaultProjectTrust`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPolicy {
+    Ask,
+    Always,
+    Never,
+}
+
+impl TrustPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+/// 按策略决定是否加载项目资源。`force_trust`（`--trust-project`）压过 never。
+/// `already_trusted` 只在 Ask 下跳过提问。
+pub fn decide_load_project(
+    policy: TrustPolicy,
+    already_trusted: bool,
+    force_trust: bool,
+    ask: impl FnOnce() -> TrustAnswer,
+) -> bool {
+    if force_trust {
+        return true;
+    }
+    match policy {
+        TrustPolicy::Always => true,
+        TrustPolicy::Never => false,
+        TrustPolicy::Ask if already_trusted => true,
+        TrustPolicy::Ask => !matches!(ask(), TrustAnswer::Skip),
+    }
+}
+
 /// 用户对信任提问的回答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustAnswer {
@@ -107,6 +145,34 @@ mod tests {
         assert_eq!(parse_trust_answer(""), TrustAnswer::Skip);
         assert_eq!(parse_trust_answer("n"), TrustAnswer::Skip);
         assert_eq!(parse_trust_answer("xxx"), TrustAnswer::Skip);
+    }
+
+    #[test]
+    fn decide_load_project_never_skips_even_when_trusted() {
+        assert!(!decide_load_project(
+            TrustPolicy::Never,
+            true,
+            false,
+            || TrustAnswer::Always
+        ));
+        assert!(decide_load_project(
+            TrustPolicy::Never,
+            false,
+            true,
+            || TrustAnswer::Skip
+        ));
+        assert!(decide_load_project(
+            TrustPolicy::Always,
+            false,
+            false,
+            || TrustAnswer::Skip
+        ));
+        assert!(!decide_load_project(
+            TrustPolicy::Ask,
+            false,
+            false,
+            || TrustAnswer::Skip
+        ));
     }
 
     #[test]

@@ -1062,7 +1062,8 @@ pub struct SessionMessageRow {
 pub mod session_io;
 pub use session_io::{
     export_store_html, export_store_jsonl, export_tree_html, export_tree_jsonl, import_into_store,
-    import_jsonl, persist_tree, remap_tree, tree_from_records, ImportedSession, SessionHeader,
+    import_jsonl, persist_tree, remap_tree, resolve_session_ref, restore_tree, tree_from_records,
+    ImportedSession, SessionHeader,
 };
 
 /// 用户查询转 FTS5 短语：裸 `-` / `:` / `*` 等会被当运算符导致 syntax error，

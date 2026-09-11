@@ -9,6 +9,7 @@ license.workspace = true
 rupi-core = { path = "../rupi-core" }
 rupi-tools = { path = "../rupi-tools" }
 rupi-mcp = { path = "../rupi-mcp" }
+rupi-llm = { path = "../rupi-llm" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

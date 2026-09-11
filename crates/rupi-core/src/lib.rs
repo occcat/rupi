@@ -479,6 +479,11 @@ pub enum AgentEvent {
         count: usize,
         messages: Vec<String>,
     },
+    /// 模型切换（`/model`、RPC `set_model`、Ctrl+L/P）。扩展可订阅 `model_change`。
+    ModelChange {
+        provider: String,
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

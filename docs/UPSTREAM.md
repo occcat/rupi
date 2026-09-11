@@ -97,10 +97,13 @@
 | `pi --continue/--resume` | `--continue`/`-c` 最近会话、`--resume <id>`，`rupi sessions` / `session-show` |
 | `/export` `/import` `/fork` `/clone` `/name` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页） |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
-| `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；`--tools/--exclude-tools/--no-tools`、`--system-prompt/--append-system-prompt` |
-| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`；`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute` |
-| `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本） |
-| TUI | Markdown、工具/思考折叠、主题、`!cmd`、Ctrl+G、鼠标、`/tree` 导航器、footer、增量渲染 |
+| `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；只读合并 `~/.pi/agent/settings.json` / `.pi/settings.json`（同键 rupi 优先）。核心键：`steeringMode` / `followUpMode` / `defaultProjectTrust` / `externalEditor` / `enabledModels`。`/settings` 热改并写回（有项目文件则写项目，否则 `~/.rupi/settings.json`）。`--tools/--exclude-tools/--no-tools`、`--system-prompt/--append-system-prompt` |
+| 自定义命令 / prompts | `~/.rupi/commands` 与 `prompts`、`.rupi/` 与只读 `~/.pi/agent` / `.pi` 同展开；`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute` |
+| `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本；TS 跳过并提示改用 JSON-RPC `*.json`） |
+| TUI | Markdown、工具/思考折叠、主题、`!cmd` / `!!cmd`（后者只回显）、Shift+Enter 换行、Ctrl+V 贴图、Ctrl+L/P 模型（P 走 `enabledModels`）、Shift+Tab 思考档、`~/.rupi/keybindings.json` + 扩展 `registerKeybinding`、Ctrl+G、鼠标、`/tree` 导航器、footer、增量渲染 |
+| RPC 扩面 | `set_model` / `get_available_models` / `switch_session` / `fork` / `clone` / `get_tree` / `set_session_name` / `get_commands`；`prompt`/`steer`/`follow_up` 的 `images[]`（`{type,data,mimeType}`） |
+| bash 环境 | 子进程继承 `RUPI_SESSION_ID` / `RUPI_SESSION_FILE` / `RUPI_PROVIDER` / `RUPI_MODEL` / `RUPI_REASONING_LEVEL`（对标 `PI_*`） |
+| 扩展 provider | `registerProvider`（OpenAI/Anthropic/Gemini 兼容 `base_url`）写入 `providers.json` 并并入 `models.json`；核心事件 tag：`session_start` / `turn_start` / `turn_end` / `tool_call` / `tool_result` / `model_change` |
 
 ## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复
 

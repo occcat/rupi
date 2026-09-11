@@ -6,7 +6,7 @@ use rupi_core::{AgentEvent, Extension, ExtensionCommand, ToolDefinition};
 use rupi_mcp::{Incoming, StdioRpc};
 use rupi_tools::{Tool, ToolOutput, UiHint};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct RpcHost {
     pub manifest: ExtensionManifest,
@@ -67,6 +67,13 @@ impl RpcHost {
                 serde_json::json!({"kind": "session_start", "name": host.manifest.name}),
             )
             .await;
+        let _ = host
+            .rpc
+            .notify(
+                "notifications/event",
+                serde_json::json!({"tags": ["session_start"], "event": {"kind": "session_start"}}),
+            )
+            .await;
         Ok(host)
     }
 
@@ -114,6 +121,29 @@ impl RpcHost {
                 }
             }
             Incoming::Request { id, method, params } => match method.as_str() {
+                "registerProvider" => match register_provider_params(&params) {
+                    Ok(p) => {
+                        let _ = self
+                            .rpc
+                            .respond(id, serde_json::json!({"ok": true, "name": p.name}))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = self.rpc.respond_error(id, -32602, e.to_string()).await;
+                    }
+                },
+                "registerKeybinding" => {
+                    if let (Some(action), Some(key)) = (
+                        params.get("action").and_then(|a| a.as_str()),
+                        params
+                            .get("key")
+                            .or_else(|| params.get("keys"))
+                            .and_then(|k| k.as_str()),
+                    ) {
+                        push_keybinding(action, key);
+                    }
+                    let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
+                }
                 "registerCommand" => {
                     if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
                         self.commands.lock().unwrap().push(ExtensionCommand {
@@ -220,13 +250,109 @@ impl RpcHost {
 fn event_tags(event: &AgentEvent) -> Vec<&'static str> {
     match event {
         AgentEvent::ToolStart { .. } => vec!["tool_call", "tool_start"],
-        AgentEvent::ToolEnd { .. } => vec!["tool_end"],
+        AgentEvent::ToolEnd { .. } => vec!["tool_end", "tool_result"],
         AgentEvent::TurnEnd { .. } => vec!["turn_end"],
-        AgentEvent::TurnStart { .. } => vec!["turn_start"],
+        AgentEvent::TurnStart { turn } => {
+            if *turn == 1 {
+                vec!["session_start", "turn_start"]
+            } else {
+                vec!["turn_start"]
+            }
+        }
         AgentEvent::RunEnd { .. } => vec!["run_end", "session_end"],
         AgentEvent::UiHint { .. } => vec!["ui_hint"],
+        AgentEvent::ModelChange { .. } => vec!["model_change"],
         _ => vec![],
     }
+}
+
+fn register_provider_params(params: &serde_json::Value) -> anyhow::Result<rupi_llm::ExtraProvider> {
+    let name = params
+        .get("name")
+        .or_else(|| params.get("id"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let protocol = params
+        .get("protocol")
+        .or_else(|| params.get("compat"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("openai")
+        .to_string();
+    let base_url = params
+        .get("base_url")
+        .or_else(|| params.get("baseUrl"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string();
+    let api_key_env = params
+        .get("api_key_env")
+        .or_else(|| params.get("apiKeyEnv"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    let models = params
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|i| i.as_str())?.to_string();
+                    Some(rupi_llm::ModelEntry {
+                        id: id.clone(),
+                        provider: m
+                            .get("provider")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or(&name)
+                            .to_string(),
+                        name: m
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(&id)
+                            .to_string(),
+                        context: m
+                            .get("context")
+                            .or_else(|| m.get("contextWindow"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rupi_llm::register_extra_provider(rupi_llm::ExtraProvider {
+        name,
+        protocol,
+        base_url,
+        api_key_env,
+        models,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredKeybinding {
+    pub action: String,
+    pub key: String,
+}
+
+fn keybind_lock() -> &'static Mutex<Vec<RegisteredKeybinding>> {
+    static LOCK: OnceLock<Mutex<Vec<RegisteredKeybinding>>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn push_keybinding(action: &str, key: &str) {
+    let mut g = keybind_lock().lock().unwrap();
+    if let Some(slot) = g.iter_mut().find(|k| k.action == action) {
+        slot.key = key.to_string();
+    } else {
+        g.push(RegisteredKeybinding {
+            action: action.to_string(),
+            key: key.to_string(),
+        });
+    }
+}
+
+pub fn registered_keybindings() -> Vec<RegisteredKeybinding> {
+    keybind_lock().lock().unwrap().clone()
 }
 
 fn wants(sub: &HashSet<String>, tags: &[&str]) -> bool {
@@ -337,4 +463,38 @@ fn parse_tool_result(source: &str, v: serde_json::Value) -> ToolOutput {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_provider_requires_name_and_url() {
+        let err = register_provider_params(&serde_json::json!({"name": "x"})).unwrap_err();
+        assert!(err.to_string().contains("base_url"), "{err:#}");
+    }
+
+    #[test]
+    fn register_keybinding_overrides_same_action() {
+        push_keybinding("send", "ctrl+s");
+        push_keybinding("send", "ctrl+enter");
+        let got = registered_keybindings();
+        let send = got.iter().find(|k| k.action == "send").unwrap();
+        assert_eq!(send.key, "ctrl+enter");
+    }
+
+    #[test]
+    fn event_tags_include_session_start_on_first_turn() {
+        let first = event_tags(&AgentEvent::TurnStart { turn: 1 });
+        assert!(first.contains(&"session_start"));
+        assert!(first.contains(&"turn_start"));
+        let later = event_tags(&AgentEvent::TurnStart { turn: 2 });
+        assert!(!later.contains(&"session_start"));
+        let model = event_tags(&AgentEvent::ModelChange {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        assert_eq!(model, vec!["model_change"]);
+    }
 }
