@@ -9,6 +9,14 @@ pub mod anthropic;
 pub use anthropic::AnthropicProvider;
 pub mod gemini;
 pub use gemini::GeminiProvider;
+pub mod bedrock;
+pub use bedrock::BedrockProvider;
+pub mod vertex;
+pub use vertex::VertexProvider;
+pub mod catalog;
+pub use catalog::{format_catalog, load_models, ModelEntry};
+pub mod route;
+pub use route::{parse_model_spec, provider_from_spec, ModelSpec, ProviderOptions};
 pub mod overflow;
 pub use overflow::is_overflow_error;
 pub mod sse;
@@ -29,8 +37,8 @@ pub struct ChatRequest {
     pub thinking: Option<ThinkingLevel>,
 }
 
-/// 思考强度四档（对标上游 thinking levels）：各 provider 按自家参数名映射，
-/// 语义统一为“推理预算逐档放大”。`FromStr` 供 CLI `--thinking` 解析。
+/// 思考强度（对标上游 thinking levels）：off/low/medium/high/xhigh/max。
+/// 各 provider 按自家参数名映射，语义统一为“推理预算逐档放大”。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -39,6 +47,8 @@ pub enum ThinkingLevel {
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
 
 impl std::str::FromStr for ThinkingLevel {
@@ -48,8 +58,12 @@ impl std::str::FromStr for ThinkingLevel {
             "off" | "none" | "disabled" => Ok(ThinkingLevel::Off),
             "low" | "minimal" | "min" => Ok(ThinkingLevel::Low),
             "medium" | "med" => Ok(ThinkingLevel::Medium),
-            "high" | "max" => Ok(ThinkingLevel::High),
-            other => anyhow::bail!("invalid thinking level '{other}' (off|low|medium|high)"),
+            "high" => Ok(ThinkingLevel::High),
+            "xhigh" | "x-high" | "extra" => Ok(ThinkingLevel::XHigh),
+            "max" => Ok(ThinkingLevel::Max),
+            other => anyhow::bail!(
+                "invalid thinking level '{other}' (off|low|medium|high|xhigh|max)"
+            ),
         }
     }
 }
@@ -62,6 +76,8 @@ impl ThinkingLevel {
             ThinkingLevel::Low => Some("low"),
             ThinkingLevel::Medium => Some("medium"),
             ThinkingLevel::High => Some("high"),
+            ThinkingLevel::XHigh => Some("xhigh"),
+            ThinkingLevel::Max => Some("xhigh"),
         }
     }
 
@@ -71,7 +87,7 @@ impl ThinkingLevel {
             ThinkingLevel::Off => None,
             ThinkingLevel::Low => Some("LOW"),
             ThinkingLevel::Medium => Some("MEDIUM"),
-            ThinkingLevel::High => Some("HIGH"),
+            ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => Some("HIGH"),
         }
     }
 
@@ -82,6 +98,16 @@ impl ThinkingLevel {
             ThinkingLevel::Low => Some(1024),
             ThinkingLevel::Medium => Some(4096),
             ThinkingLevel::High => Some(8192),
+            ThinkingLevel::XHigh => Some(16384),
+            ThinkingLevel::Max => Some(32768),
+        }
+    }
+
+    /// 开启思考时 `max_tokens` 至少预算 + 输出预留，避免 medium/high 因默认 4096 静默失效。
+    pub fn anthropic_min_max_tokens(self, requested: u32) -> u32 {
+        match self.anthropic_budget() {
+            Some(b) => requested.max(b.saturating_add(4096)),
+            None => requested,
         }
     }
 }
@@ -145,7 +171,10 @@ pub fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<serde_json:
     for m in messages {
         match m.role {
             Role::System => out.push(serde_json::json!({"role":"system","content": m.full_text()})),
-            Role::User => out.push(serde_json::json!({"role":"user","content": m.full_text()})),
+            Role::User => out.push(serde_json::json!({
+                "role":"user",
+                "content": openai_user_content(m),
+            })),
             Role::Assistant => {
                 let calls: Vec<_> = m
                     .blocks
@@ -173,20 +202,60 @@ pub fn to_openai_messages(system: &str, messages: &[Message]) -> Vec<serde_json:
                 }
             }
             Role::Tool => {
+                let mut images = Vec::new();
                 for b in &m.blocks {
-                    if let ContentBlock::ToolResult {
-                        tool_call_id,
-                        content,
-                        ..
-                    } = b
-                    {
-                        out.push(serde_json::json!({"role":"tool","tool_call_id": tool_call_id, "content": content}));
+                    match b {
+                        ContentBlock::ToolResult {
+                            tool_call_id,
+                            content,
+                            ..
+                        } => {
+                            out.push(serde_json::json!({"role":"tool","tool_call_id": tool_call_id, "content": content}));
+                        }
+                        ContentBlock::Image { media_type, data } => {
+                            images.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {"url": rupi_core::image_data_url(media_type, data)},
+                            }));
+                        }
+                        _ => {}
                     }
+                }
+                if !images.is_empty() {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": "[image(s) from tool result]",
+                    })];
+                    parts.extend(images);
+                    out.push(serde_json::json!({"role":"user","content": parts}));
                 }
             }
         }
     }
     out
+}
+
+/// 用户消息：有图片时走 content parts（`image_url` data URL），否则保持字符串。
+fn openai_user_content(m: &Message) -> serde_json::Value {
+    if !m.has_images() {
+        return serde_json::Value::String(m.full_text());
+    }
+    let mut parts = Vec::new();
+    for b in &m.blocks {
+        match b {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": rupi_core::image_data_url(media_type, data)},
+                }));
+            }
+            _ => {}
+        }
+    }
+    serde_json::Value::Array(parts)
 }
 
 pub fn to_openai_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
@@ -261,17 +330,22 @@ pub fn apply_session_settings(p: &mut dyn LlmProvider, session_id: Option<&str>)
     }
 }
 
-/// 按模型名前缀选原生 provider（`claude-*`→Anthropic，`gemini-*`→Gemini，
-/// 其余→OpenAI-compatible）：缺 key 即 Err，由调用方决定回 mock 还是报错。
-/// CLI 与 TUI 的 `/model` 共用此路由，避免两端漂移。
+/// 按 `provider/model[:thinking]` 或模型名前缀选 provider。
+/// `claude-*`→Anthropic，`gemini-*`→Gemini，其余→OpenAI-compatible；
+/// 显式前缀 `openrouter/`/`azure/`/`bedrock/`/`vertex/` 走对应路由。
+/// 缺 key 即 Err，由调用方决定回 mock 还是报错。CLI 与 TUI `/model` 共用。
 pub fn provider_for_model(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
-    if model.starts_with("claude-") {
-        return Ok(Box::new(AnthropicProvider::from_env(model.to_string())?));
-    }
-    if model.starts_with("gemini-") {
-        return Ok(Box::new(GeminiProvider::from_env(model.to_string())?));
-    }
-    Ok(Box::new(OpenAiCompatProvider::from_env(model.to_string())?))
+    provider_from_spec(&parse_model_spec(model), &ProviderOptions::default())
+}
+
+/// OpenAI-compat 路由形态：默认 Chat Completions；Azure 走 deployment URL + `api-key`；
+/// OpenRouter 加 Referer/Title 与默认会话亲和。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompatKind {
+    #[default]
+    OpenAi,
+    OpenRouter,
+    Azure,
 }
 
 /// 进程内共享的 reqwest Client（rustls + webpki 根证书）。`clone` 只增 Arc；
@@ -299,6 +373,8 @@ pub struct OpenAiCompatProvider {
     pub model: String,
     pub session_id: String,
     pub session_affinity: Option<bool>,
+    pub kind: CompatKind,
+    pub api_version: Option<String>,
     client: reqwest::Client,
 }
 
@@ -310,7 +386,33 @@ impl OpenAiCompatProvider {
             model,
             session_id: uuid::Uuid::new_v4().to_string(),
             session_affinity: None,
+            kind: CompatKind::OpenAi,
+            api_version: None,
             client: crate::shared_http_client(),
+        }
+    }
+
+    pub fn with_kind(mut self, kind: CompatKind) -> Self {
+        self.kind = kind;
+        if kind == CompatKind::OpenRouter && self.session_affinity.is_none() {
+            self.session_affinity = Some(true);
+        }
+        self
+    }
+
+    pub fn with_api_version(mut self, ver: impl Into<String>) -> Self {
+        self.api_version = Some(ver.into());
+        self
+    }
+
+    fn chat_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        match self.kind {
+            CompatKind::Azure => {
+                let ver = self.api_version.as_deref().unwrap_or("2024-10-21");
+                format!("{base}/openai/deployments/{}/chat/completions?api-version={ver}", self.model)
+            }
+            _ => format!("{base}/chat/completions"),
         }
     }
 
@@ -327,13 +429,22 @@ impl OpenAiCompatProvider {
     fn session_header(&self) -> Option<(&'static str, &str)> {
         let on = match self.session_affinity {
             Some(v) => v,
-            None => is_openrouter_base_url(&self.base_url),
+            None => self.kind == CompatKind::OpenRouter || is_openrouter_base_url(&self.base_url),
         };
         on.then_some(("x-session-id", self.session_id.as_str()))
     }
 
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let req = req.bearer_auth(&self.api_key);
+        let req = match self.kind {
+            CompatKind::Azure => req.header("api-key", &self.api_key),
+            _ => req.bearer_auth(&self.api_key),
+        };
+        let req = match self.kind {
+            CompatKind::OpenRouter => req
+                .header("HTTP-Referer", "https://github.com/occcat/rupi")
+                .header("X-Title", "rupi"),
+            _ => req,
+        };
         match self.session_header() {
             Some((k, v)) => req.header(k, v),
             None => req,
@@ -354,7 +465,11 @@ impl OpenAiCompatProvider {
 #[async_trait]
 impl LlmProvider for OpenAiCompatProvider {
     fn name(&self) -> &str {
-        "openai-compat"
+        match self.kind {
+            CompatKind::OpenAi => "openai-compat",
+            CompatKind::OpenRouter => "openrouter",
+            CompatKind::Azure => "azure",
+        }
     }
 
     fn model_id(&self) -> Option<&str> {
@@ -370,7 +485,7 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = self.chat_url();
         let body = openai_body(&self.model, &req, false);
         let client = self.client.clone();
         let resp =
@@ -388,7 +503,7 @@ impl LlmProvider for OpenAiCompatProvider {
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<ChatResponse> {
         use futures::StreamExt as _;
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = self.chat_url();
         let body = openai_body(&self.model, &req, true);
         let client = self.client.clone();
         let resp =
@@ -922,11 +1037,17 @@ mod tests {
             ThinkingLevel::Medium
         );
         assert_eq!(ThinkingLevel::from_str("none").unwrap(), ThinkingLevel::Off);
+        assert_eq!(ThinkingLevel::from_str("xhigh").unwrap(), ThinkingLevel::XHigh);
+        assert_eq!(ThinkingLevel::from_str("max").unwrap(), ThinkingLevel::Max);
         assert!(ThinkingLevel::from_str("ultra").is_err());
         assert_eq!(ThinkingLevel::High.openai_effort(), Some("high"));
+        assert_eq!(ThinkingLevel::XHigh.openai_effort(), Some("xhigh"));
         assert_eq!(ThinkingLevel::Off.openai_effort(), None);
         assert_eq!(ThinkingLevel::Low.gemini_level(), Some("LOW"));
+        assert_eq!(ThinkingLevel::Max.gemini_level(), Some("HIGH"));
         assert_eq!(ThinkingLevel::Medium.anthropic_budget(), Some(4096));
+        assert_eq!(ThinkingLevel::XHigh.anthropic_budget(), Some(16384));
+        assert!(ThinkingLevel::High.anthropic_min_max_tokens(4096) > 8192);
     }
 
     #[test]
@@ -990,6 +1111,41 @@ mod tests {
                 unsafe { std::env::set_var(k, val) };
             }
         }
+    }
+
+    #[test]
+    fn openai_message_mapping_keeps_images() {
+        let m = Message::from_blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text {
+                    text: "see".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAA".into(),
+                },
+            ],
+        );
+        let msgs = to_openai_messages("sys", &[m]);
+        assert_eq!(msgs[1]["content"][0]["type"], "text");
+        assert_eq!(msgs[1]["content"][1]["type"], "image_url");
+        assert!(msgs[1]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn azure_chat_url_uses_deployments() {
+        let p = OpenAiCompatProvider::new("https://oai.example".into(), "k".into(), "gpt4".into())
+            .with_kind(CompatKind::Azure)
+            .with_api_version("2024-10-21");
+        assert_eq!(
+            p.chat_url(),
+            "https://oai.example/openai/deployments/gpt4/chat/completions?api-version=2024-10-21"
+        );
+        assert_eq!(p.name(), "azure");
     }
 
     #[test]

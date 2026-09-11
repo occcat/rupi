@@ -109,9 +109,9 @@ pub fn to_gemini_contents(messages: &[Message]) -> Vec<serde_json::Value> {
     for m in messages {
         match m.role {
             Role::System | Role::User => {
-                let t = m.full_text();
-                if !t.is_empty() {
-                    push("user", vec![serde_json::json!({"text": t})]);
+                let parts = gemini_user_parts(m);
+                if !parts.is_empty() {
+                    push("user", parts);
                 }
             }
             Role::Assistant => {
@@ -138,24 +138,29 @@ pub fn to_gemini_contents(messages: &[Message]) -> Vec<serde_json::Value> {
             Role::Tool => {
                 let mut parts = vec![];
                 for b in &m.blocks {
-                    if let ContentBlock::ToolResult {
-                        tool_call_id,
-                        content,
-                        is_error,
-                    } = b
-                    {
-                        let name = names
-                            .get(tool_call_id.as_str())
-                            .copied()
-                            .unwrap_or("unknown");
-                        let mut resp = serde_json::json!({
-                            "name": name,
-                            "response": {"content": content},
-                        });
-                        if *is_error {
-                            resp["response"]["is_error"] = true.into();
+                    match b {
+                        ContentBlock::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error,
+                        } => {
+                            let name = names
+                                .get(tool_call_id.as_str())
+                                .copied()
+                                .unwrap_or("unknown");
+                            let mut resp = serde_json::json!({
+                                "name": name,
+                                "response": {"content": content},
+                            });
+                            if *is_error {
+                                resp["response"]["is_error"] = true.into();
+                            }
+                            parts.push(serde_json::json!({"functionResponse": resp}));
                         }
-                        parts.push(serde_json::json!({"functionResponse": resp}));
+                        ContentBlock::Image { media_type, data } => {
+                            parts.push(gemini_image_part(media_type, data));
+                        }
+                        _ => {}
                     }
                 }
                 push("user", parts);
@@ -163,6 +168,36 @@ pub fn to_gemini_contents(messages: &[Message]) -> Vec<serde_json::Value> {
         }
     }
     out
+}
+
+fn gemini_image_part(media_type: &str, data: &str) -> serde_json::Value {
+    serde_json::json!({
+        "inline_data": {"mime_type": media_type, "data": data},
+    })
+}
+
+fn gemini_user_parts(m: &Message) -> Vec<serde_json::Value> {
+    if !m.has_images() {
+        let t = m.full_text();
+        return if t.is_empty() {
+            vec![]
+        } else {
+            vec![serde_json::json!({"text": t})]
+        };
+    }
+    let mut parts = Vec::new();
+    for b in &m.blocks {
+        match b {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(serde_json::json!({"text": text}));
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(gemini_image_part(media_type, data));
+            }
+            _ => {}
+        }
+    }
+    parts
 }
 
 pub fn to_gemini_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
@@ -485,7 +520,7 @@ impl super::LlmProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupi_core::Message;
+    use rupi_core::{Message, Role};
 
     #[test]
     fn maps_roles_and_function_call() {
@@ -524,6 +559,26 @@ mod tests {
         assert!(out[2]["parts"][0].get("functionResponse").is_some());
         // functionResponse 按历史 ToolCall 回填 name
         assert_eq!(out[2]["parts"][0]["functionResponse"]["name"], "bash");
+    }
+
+    #[test]
+    fn maps_user_images_as_inline_data() {
+        let msgs = vec![Message::from_blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text {
+                    text: "what".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAA".into(),
+                },
+            ],
+        )];
+        let out = to_gemini_contents(&msgs);
+        assert_eq!(out[0]["parts"][0]["text"], "what");
+        assert_eq!(out[0]["parts"][1]["inline_data"]["mime_type"], "image/png");
+        assert_eq!(out[0]["parts"][1]["inline_data"]["data"], "AAA");
     }
 
     #[test]

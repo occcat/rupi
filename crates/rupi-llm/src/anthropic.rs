@@ -79,7 +79,14 @@ impl AnthropicProvider {
         }
         let mut m = serde_json::Map::new();
         m.insert("model".into(), self.model.clone().into());
-        m.insert("max_tokens".into(), req.max_tokens.unwrap_or(4096).into());
+        // thinking 预算必须 < max_tokens：默认 4096 会让 medium(4096)/high(8192) 静默省略。
+        // 开启思考时抬高 max_tokens = max(请求值, budget+4096 输出预留)。
+        let requested = req.max_tokens.unwrap_or(4096);
+        let max_tokens = req
+            .thinking
+            .map(|t| t.anthropic_min_max_tokens(requested))
+            .unwrap_or(requested);
+        m.insert("max_tokens".into(), max_tokens.into());
         m.insert(
             "system".into(),
             serde_json::json!([{"type": "text", "text": req.system,
@@ -96,7 +103,7 @@ impl AnthropicProvider {
         // max_tokens 必须大于 budget；不满足任一条即省略 thinking（退化为普通请求，
         // 否则 400）。思考块签名由解析/累积器保留，多轮工具流原样回放。
         let budget = req.thinking.and_then(|t| t.anthropic_budget());
-        let thinking_on = budget.is_some_and(|b| req.max_tokens.unwrap_or(4096) > b);
+        let thinking_on = budget.is_some_and(|b| max_tokens > b);
         if thinking_on {
             m.insert(
                 "thinking".into(),
@@ -138,9 +145,9 @@ pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         match m.role {
             // system 会话消息极少见，降级为 user 文本（Anthropic 只认独立 system 参数）
             Role::System | Role::User => {
-                let t = m.full_text();
-                if !t.is_empty() {
-                    push("user", vec![serde_json::json!({"type": "text", "text": t})]);
+                let items = anthropic_user_items(m);
+                if !items.is_empty() {
+                    push("user", items);
                 }
             }
             Role::Assistant => {
@@ -191,22 +198,41 @@ pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }
             Role::Tool => {
                 let mut items = vec![];
+                let mut pending_images: Vec<serde_json::Value> = vec![];
                 for b in &m.blocks {
-                    if let ContentBlock::ToolResult {
-                        tool_call_id,
-                        content,
-                        is_error,
-                    } = b
-                    {
-                        let mut item = serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": [{"type": "text", "text": content}],
-                        });
-                        if *is_error {
-                            item["is_error"] = true.into();
+                    match b {
+                        ContentBlock::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error,
+                        } => {
+                            let mut content_items = vec![serde_json::json!({
+                                "type": "text", "text": content,
+                            })];
+                            content_items.append(&mut pending_images);
+                            let mut item = serde_json::json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_call_id,
+                                "content": content_items,
+                            });
+                            if *is_error {
+                                item["is_error"] = true.into();
+                            }
+                            items.push(item);
                         }
-                        items.push(item);
+                        ContentBlock::Image { media_type, data } => {
+                            pending_images.push(anthropic_image_part(media_type, data));
+                        }
+                        _ => {}
+                    }
+                }
+                if !pending_images.is_empty() {
+                    if let Some(last) = items.last_mut() {
+                        if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                            arr.extend(pending_images);
+                        }
+                    } else {
+                        items.extend(pending_images);
                     }
                 }
                 push("user", items);
@@ -214,6 +240,37 @@ pub fn to_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         }
     }
     out
+}
+
+fn anthropic_image_part(media_type: &str, data: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data},
+    })
+}
+
+fn anthropic_user_items(m: &Message) -> Vec<serde_json::Value> {
+    if !m.has_images() {
+        let t = m.full_text();
+        return if t.is_empty() {
+            vec![]
+        } else {
+            vec![serde_json::json!({"type": "text", "text": t})]
+        };
+    }
+    let mut items = Vec::new();
+    for b in &m.blocks {
+        match b {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                items.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            ContentBlock::Image { media_type, data } => {
+                items.push(anthropic_image_part(media_type, data));
+            }
+            _ => {}
+        }
+    }
+    items
 }
 
 pub fn to_anthropic_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
@@ -744,14 +801,65 @@ mod tests {
         let b = p.body(&med, false);
         assert_eq!(b["thinking"]["budget_tokens"], 4096);
         assert_eq!(b["temperature"], 1.0);
-        // max_tokens 不大于 budget：省略 thinking（否则 API 400），温度不变
+        // max_tokens 默认 4096 ≤ high 预算：抬高 max_tokens 并启用 thinking（不再静默失效）
         let mut tight = base();
         tight.thinking = Some(super::super::ThinkingLevel::High);
         tight.max_tokens = Some(4096);
         let b = p.body(&tight, false);
-        assert!(b.get("thinking").is_none());
-        let temp = b["temperature"].as_f64().unwrap();
-        assert!((temp - 0.2).abs() < 1e-6, "temperature untouched");
+        assert_eq!(b["thinking"]["budget_tokens"], 8192);
+        assert!(b["max_tokens"].as_u64().unwrap() > 8192);
+        assert_eq!(b["temperature"], 1.0);
+    }
+
+    #[test]
+    fn maps_user_and_tool_images() {
+        let user = Message::from_blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAA".into(),
+                },
+            ],
+        );
+        let assistant = Message {
+            id: "a".into(),
+            role: Role::Assistant,
+            blocks: vec![ContentBlock::ToolCall {
+                id: "tu1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        };
+        let tool = Message {
+            id: "t".into(),
+            role: Role::Tool,
+            blocks: vec![
+                ContentBlock::ToolResult {
+                    tool_call_id: "tu1".into(),
+                    content: "img".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    media_type: "image/jpeg".into(),
+                    data: "BBB".into(),
+                },
+            ],
+            provider: None,
+            created_at: chrono::Utc::now(),
+        };
+        let out = to_anthropic_messages(&[user, assistant, tool]);
+        assert_eq!(out[0]["content"][1]["type"], "image");
+        assert_eq!(out[0]["content"][1]["source"]["media_type"], "image/png");
+        let tr = &out[2]["content"][0];
+        assert_eq!(tr["type"], "tool_result");
+        assert_eq!(tr["content"][1]["type"], "image");
+        assert_eq!(tr["content"][1]["source"]["data"], "BBB");
     }
 
     #[test]

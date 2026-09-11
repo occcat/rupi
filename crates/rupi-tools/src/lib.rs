@@ -14,10 +14,26 @@ pub use truncate::{
     DEFAULT_MAX_LINES,
 };
 
+/// 工具回包里的图片（read/@file 读到 png/jpg 等）：主循环写入 `ContentBlock::Image`。
+#[derive(Debug, Clone)]
+pub struct ToolImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// 扩展/工具给出的 UI 提示（对标 Pi extension UI hints）。
+#[derive(Debug, Clone)]
+pub struct UiHint {
+    pub kind: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    pub images: Vec<ToolImage>,
+    pub ui_hint: Option<UiHint>,
 }
 
 impl ToolOutput {
@@ -25,13 +41,27 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
+            ui_hint: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
+            ui_hint: None,
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
+        self
+    }
+
+    pub fn with_ui_hint(mut self, hint: UiHint) -> Self {
+        self.ui_hint = Some(hint);
+        self
     }
 }
 
@@ -314,34 +344,135 @@ impl Tool for ReadTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(2000)
             .clamp(1, 5000) as usize;
-        match tokio::fs::read_to_string(path).await {
-            Ok(c) => {
-                let lines: Vec<&str> = c.lines().collect();
-                if offset >= lines.len() {
-                    return Ok(ToolOutput::ok(format!(
-                        "[read {path}: offset {offset} past end ({} lines)]",
-                        lines.len()
-                    )));
-                }
-                let end = (offset + limit).min(lines.len());
-                let mut s = lines[offset..end].join("\n");
-                if s.len() < c.len() && end < lines.len() {
-                    s.push_str(&format!(
-                        "\n…[truncated: lines {}-{} of {} — pass offset={} for more]",
-                        offset + 1,
-                        end,
-                        lines.len(),
-                        end
-                    ));
-                } else if end == lines.len() && offset > 0 {
-                    s.push_str(&format!("\n[end of file: {} lines]", lines.len()));
-                }
-                // 单行超长同样截断（minified/二进制行），保上下文有界
-                Ok(ToolOutput::ok(truncate_middle(&s, MAX_TOOL_OUTPUT)))
+        Ok(read_path_paged(path, offset, limit).await)
+    }
+}
+
+/// 先 `metadata` 再读：图片整文件（有上限）；文本按行跳过 offset、只收 limit，
+/// 50MB 文件不再 `read_to_string` 进内存。小文件（≤2MB）会扫剩余行数以报 total。
+pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+/// 超过此大小不再为了 “of N lines” 扫完全文，只报字节数。
+const READ_COUNT_REMAINING_MAX: u64 = 2 * 1024 * 1024;
+
+async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    if path.is_empty() {
+        return ToolOutput::err("read requires path");
+    }
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+    };
+    if !meta.is_file() {
+        return ToolOutput::err(format!("read {path} failed: not a file"));
+    }
+    let file_len = meta.len();
+    if let Some(media) = rupi_core::image_media_type(std::path::Path::new(path)) {
+        if file_len > MAX_IMAGE_BYTES {
+            return ToolOutput::err(format!(
+                "read {path}: image {media} is {file_len} bytes (max {MAX_IMAGE_BYTES})"
+            ));
+        }
+        let bytes = match tokio::fs::read(path).await {
+            Ok(b) => b,
+            Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+        };
+        let caption = format!(
+            "[image {media} · {file_len} bytes · attached to this tool result]"
+        );
+        return ToolOutput::ok(caption).with_images(vec![ToolImage {
+            media_type: media.to_string(),
+            data: rupi_core::encode_base64(&bytes),
+        }]);
+    }
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut skipped = 0usize;
+    while skipped < offset {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                return ToolOutput::ok(format!(
+                    "[read {path}: offset {offset} past end ({skipped} lines)]"
+                ));
             }
-            Err(e) => Ok(ToolOutput::err(format!("read {path} failed: {e}"))),
+            Ok(_) => skipped += 1,
+            Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
         }
     }
+    let mut page: Vec<String> = Vec::new();
+    let mut page_bytes = 0usize;
+    let mut hit_eof = false;
+    for _ in 0..limit {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                hit_eof = true;
+                break;
+            }
+            Ok(_) => {
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                page_bytes += line.len();
+                page.push(line);
+                if page_bytes >= MAX_TOOL_OUTPUT {
+                    break;
+                }
+            }
+            Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+        }
+    }
+    if page.is_empty() && hit_eof {
+        return ToolOutput::ok(format!(
+            "[read {path}: offset {offset} past end ({offset} lines)]"
+        ));
+    }
+    let start = offset + 1;
+    let end = offset + page.len();
+    let mut more = false;
+    let mut total: Option<usize> = None;
+    if !hit_eof {
+        if file_len <= READ_COUNT_REMAINING_MAX {
+            let mut rem = 0usize;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => rem += 1,
+                    Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+                }
+            }
+            more = rem > 0;
+            total = Some(end + rem);
+        } else {
+            let mut peek = [0u8; 1];
+            match reader.read(&mut peek).await {
+                Ok(n) if n > 0 => more = true,
+                _ => more = false,
+            }
+        }
+    }
+    let mut s = page.join("\n");
+    if more {
+        match total {
+            Some(n) => s.push_str(&format!(
+                "\n…[truncated: lines {start}-{end} of {n} — pass offset={end} for more]"
+            )),
+            None => s.push_str(&format!(
+                "\n…[truncated: lines {start}-{end} · {file_len} bytes — pass offset={end} for more]"
+            )),
+        }
+    } else if offset > 0 {
+        s.push_str(&format!("\n[end of file: {} lines]", total.unwrap_or(end)));
+    }
+    ToolOutput::ok(truncate_middle(&s, MAX_TOOL_OUTPUT))
 }
 
 pub struct WriteTool;
@@ -1307,6 +1438,47 @@ mod tests {
             .unwrap();
         assert!(past.content.contains("past end"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn read_does_not_slurp_huge_file_and_attaches_images() {
+        let dir = std::env::temp_dir().join(format!("rupi-huge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = ToolRegistry::with_builtins();
+        // 大文件：>2MB 走 peek 而非扫完全文；只取 3 行，回包不含整文件。
+        let big = dir.join("huge.txt");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big).unwrap();
+            for i in 0..80_000 {
+                writeln!(f, "row{i}").unwrap();
+            }
+        }
+        let path = big.to_string_lossy().to_string();
+        let out = r
+            .execute("read", serde_json::json!({"path": path, "limit": 3}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.starts_with("row0\nrow1\nrow2"), "{}", out.content);
+        assert!(out.content.contains("truncated"), "{}", out.content);
+        assert!(!out.content.contains("row79999"));
+        // 图片：metadata 后整读，base64 进 images
+        let png = dir.join("dot.png");
+        std::fs::write(&png, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 8, 7]).unwrap();
+        let img = r
+            .execute(
+                "read",
+                serde_json::json!({"path": png.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(!img.is_error, "{}", img.content);
+        assert_eq!(img.images.len(), 1);
+        assert_eq!(img.images[0].media_type, "image/png");
+        assert!(!img.images[0].data.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

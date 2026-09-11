@@ -58,9 +58,33 @@ fn help_lists_key_subcommands() {
         "mcp-list",
         "ext-list",
         "commands",
+        "login",
+        "models",
     ] {
         assert!(out.contains(sub), "help 缺子命令 {sub}:\n{out}");
     }
+}
+
+#[test]
+fn login_is_stubbed_and_models_catalog_prints() {
+    let home = fresh_home();
+    let o = rupi(&home, &["login", "anthropic"]).output().unwrap();
+    assert!(o.status.success(), "login 非零: {o:?}");
+    let (out, _) = out_text(&o);
+    assert!(out.contains("stubbed"), "login 应声明 OAuth 未落地:\n{out}");
+    assert!(out.contains("ANTHROPIC_API_KEY"), "{out}");
+
+    let o = rupi(&home, &["--list-models"]).output().unwrap();
+    assert!(o.status.success(), "--list-models 非零: {o:?}");
+    let (out, _) = out_text(&o);
+    assert!(out.contains("openai/gpt-4o-mini"), "--list-models:\n{out}");
+    assert!(out.contains("anthropic/"), "{out}");
+    assert!(out.contains("bedrock/"), "{out}");
+
+    let o = rupi(&home, &["models"]).output().unwrap();
+    assert!(o.status.success(), "models 非零: {o:?}");
+    let (out, _) = out_text(&o);
+    assert!(out.contains("vertex/"), "models:\n{out}");
 }
 
 #[test]

@@ -53,9 +53,18 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// 模型名（OpenAI-compatible）
+    /// 模型：`name` 或 `provider/model[:thinking]`（openai|anthropic|gemini|openrouter|azure|bedrock|vertex）
     #[arg(long, default_value = "gpt-4o-mini")]
     model: String,
+    /// 覆盖当前 provider 的 API key（仍可读对应环境变量）
+    #[arg(long)]
+    api_key: Option<String>,
+    /// 强制 provider（覆盖模型名前缀与 `provider/` 段）
+    #[arg(long)]
+    provider: Option<String>,
+    /// 打印 models.json 目录（内置 + ~/.rupi/models.json）后退出
+    #[arg(long, default_value_t = false)]
+    list_models: bool,
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
     /// MCP server 配置 JSON 文件（数组）：[{"name":..,"command":..,"args":[..],"env":{..}}]
@@ -109,7 +118,7 @@ struct Cli {
     /// Ask 裁决一律拒绝且不问（与 --approve 互斥）
     #[arg(long, default_value_t = false)]
     no_approve: bool,
-    /// 思考强度（对标上游 /thinking：off|low|medium|high；映射为各 provider 推理参数）
+    /// 思考强度（off|low|medium|high|xhigh|max；也可写在 `--model provider/model:high`）
     #[arg(long)]
     thinking: Option<String>,
     /// 回合内禁用内建记忆（MEMORY.md/USER.md 不注入、memory 工具与指导块撤下；
@@ -173,6 +182,13 @@ enum Cmd {
     Sessions,
     /// 查看会话明细
     SessionShow { id: String },
+    /// OAuth 登录占位（本版只打印用法；完整设备码流未落地）
+    Login {
+        /// anthropic | openai | copilot | vertex | bedrock
+        provider: Option<String>,
+    },
+    /// 打印模型目录（同 `--list-models`）
+    Models,
     /// MCP 探活：tools/resources/prompts 三区段（stdio 命令或 `--url` 二选一）
     McpList {
         command: String,
@@ -359,39 +375,133 @@ fn load_extensions(tools: &mut ToolRegistry, dir: &PathBuf) -> rupi_ext::Extensi
             dir.display()
         );
     }
-    rupi_ext::register_all(tools, manifests);
+    set.register(tools, manifests);
     set
+}
+
+fn provider_options(cli: &Cli) -> rupi_llm::ProviderOptions {
+    rupi_llm::ProviderOptions {
+        api_key: cli.api_key.clone(),
+        provider: cli.provider.clone(),
+    }
+}
+
+fn apply_cli_secrets(cli: &Cli) {
+    let Some(k) = cli.api_key.as_deref() else {
+        return;
+    };
+    match cli.provider.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => std::env::set_var("RUPI_ANTHROPIC_KEY", k),
+        Some("gemini") => std::env::set_var("RUPI_GEMINI_KEY", k),
+        Some("openrouter") => std::env::set_var("RUPI_OPENROUTER_KEY", k),
+        Some("azure") => std::env::set_var("AZURE_OPENAI_API_KEY", k),
+        Some("bedrock") => std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", k),
+        Some("vertex") => std::env::set_var("VERTEX_TOKEN", k),
+        _ => std::env::set_var("RUPI_API_KEY", k),
+    }
+}
+
+fn print_login_stub(provider: Option<&str>) {
+    println!("OAuth login is stubbed in this release (no browser/device-code flow).");
+    println!("Use an API key instead, e.g. `--api-key $KEY --model provider/model`.\n");
+    let detail = match provider.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("anthropic") | Some("claude") => {
+            "anthropic: export ANTHROPIC_API_KEY or RUPI_ANTHROPIC_KEY\n  planned: Claude Pro/Max OAuth → ~/.rupi/oauth/anthropic.json"
+        }
+        Some("openai") | Some("codex") | Some("chatgpt") => {
+            "openai/codex: export OPENAI_API_KEY or RUPI_API_KEY\n  planned: ChatGPT Codex OAuth → ~/.rupi/oauth/openai.json"
+        }
+        Some("copilot") | Some("github") => {
+            "copilot: not implemented\n  planned: GitHub device-code → ~/.rupi/oauth/copilot.json"
+        }
+        Some("vertex") | Some("google") => {
+            "vertex: export VERTEX_TOKEN or GOOGLE_OAUTH_ACCESS_TOKEN\n  (gcloud auth print-access-token is the current workaround)"
+        }
+        Some("bedrock") | Some("aws") => {
+            "bedrock: export AWS_BEARER_TOKEN_BEDROCK or BEDROCK_API_KEY"
+        }
+        Some(other) => {
+            println!("unknown login provider '{other}'.");
+            ""
+        }
+        None => {
+            "providers you can pass: anthropic | openai | copilot | vertex | bedrock\n  none of these OAuth flows are implemented yet."
+        }
+    };
+    if !detail.is_empty() {
+        println!("{detail}");
+    }
 }
 
 async fn build_provider(
     model: &str,
     session_id: Option<&str>,
+    opts: &rupi_llm::ProviderOptions,
 ) -> anyhow::Result<Box<dyn LlmProvider>> {
-    // 路由收敛到 rupi_llm::provider_for_model（与 TUI /model 同源）；缺 key 回 mock，
-    // 各家提示沿用此前的文案（claude-/gemini- 带原错误，其余走固定缺 key 行）。
-    // 会话装配收敛到 apply_session_settings：sid（无则沿用实例级随机 id）+ 环境显式开关。
-    let mut p = match rupi_llm::provider_for_model(model) {
+    let spec = rupi_llm::parse_model_spec(model);
+    let mut p = match rupi_llm::provider_from_spec(&spec, opts) {
         Ok(p) => p,
         Err(e) => {
-            let demo = if model.starts_with("claude-") {
-                eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
-                "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。"
-            } else if model.starts_with("gemini-") {
-                eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
-                "demo mode：设置 RUPI_GEMINI_KEY 后可接 Gemini。已收到你的请求，工具链就绪。"
-            } else {
-                eprintln!(
-                    "[rupi] no RUPI_API_KEY/OPENAI_API_KEY — using mock provider (demo mode)"
-                );
-                "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。"
+            let hint = spec
+                .provider
+                .as_deref()
+                .unwrap_or_else(|| {
+                    if spec.model.starts_with("claude-") {
+                        "anthropic"
+                    } else if spec.model.starts_with("gemini-") {
+                        "gemini"
+                    } else {
+                        "openai"
+                    }
+                });
+            let demo = match hint {
+                "anthropic" => {
+                    eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                    "demo mode：设置 RUPI_ANTHROPIC_KEY 后可接 Claude。已收到你的请求，工具链就绪。"
+                }
+                "gemini" | "vertex" => {
+                    eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                    "demo mode：设置 RUPI_GEMINI_KEY / VERTEX_TOKEN 后可接 Gemini。已收到你的请求，工具链就绪。"
+                }
+                "openrouter" => {
+                    eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                    "demo mode：设置 OPENROUTER_API_KEY 后可接 OpenRouter。"
+                }
+                "azure" => {
+                    eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                    "demo mode：设置 AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT。"
+                }
+                "bedrock" => {
+                    eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
+                    "demo mode：设置 AWS_BEARER_TOKEN_BEDROCK。"
+                }
+                _ => {
+                    eprintln!(
+                        "[rupi] no RUPI_API_KEY/OPENAI_API_KEY — using mock provider (demo mode)"
+                    );
+                    "demo mode：设置 RUPI_API_KEY 后可接真实模型。已收到你的请求，工具链就绪。"
+                }
             };
-            Box::new(MockProvider::new(vec![
-                MockProvider::text_response(demo),
-            ])) as Box<dyn LlmProvider>
+            Box::new(MockProvider::new(vec![MockProvider::text_response(demo)]))
+                as Box<dyn LlmProvider>
         }
     };
     rupi_llm::apply_session_settings(&mut *p, session_id);
     Ok(p)
+}
+
+fn emit_ext_hints(set: &rupi_ext::ExtensionSet) {
+    for (source, hint) in set.drain_ui_hints() {
+        eprintln!("[ui {source}/{}] {}", hint.kind, hint.message);
+    }
+}
+
+fn user_turn(text: &str) -> rupi_core::Message {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    rupi_core::Message::from_blocks(
+        rupi_core::Role::User,
+        rupi_core::commands::expand_at_mentions_blocks(text, &cwd),
+    )
 }
 
 #[tokio::main]
@@ -401,6 +511,11 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .ok();
     let cli = Cli::parse();
+    apply_cli_secrets(&cli);
+    if cli.list_models {
+        print!("{}", rupi_llm::format_catalog(&rupi_llm::load_models()));
+        return Ok(());
+    }
     let home = home_dir();
 
     match cli.cmd {
@@ -483,8 +598,22 @@ async fn main() -> anyhow::Result<()> {
                 println!("no extensions in {} (*.json manifests)", dir.display());
             }
             for m in manifests {
-                println!("{} — {}", m.name, m.description);
+                println!(
+                    "{} [{}] — {}",
+                    m.name,
+                    match m.protocol {
+                        rupi_ext::ExtProtocol::Jsonrpc => "jsonrpc",
+                        rupi_ext::ExtProtocol::Oneshot => "oneshot",
+                    },
+                    m.description
+                );
             }
+        }
+        Some(Cmd::Login { provider }) => {
+            print_login_stub(provider.as_deref());
+        }
+        Some(Cmd::Models) => {
+            print!("{}", rupi_llm::format_catalog(&rupi_llm::load_models()));
         }
         Some(Cmd::Sessions) => {
             let store = SessionStore::open(&home)?;
@@ -597,13 +726,13 @@ impl rupi_agent::Approver for AutoApprover {
 
 /// 思考强度解析：未传 flag 即 None（不干预）；非法值直接 bail 并列合法档。
 fn thinking_for(cli: &Cli) -> anyhow::Result<Option<rupi_llm::ThinkingLevel>> {
-    cli.thinking
-        .as_deref()
-        .map(|s| {
-            s.parse()
-                .map_err(|e| anyhow::anyhow!("--thinking 解析失败: {e:#}"))
-        })
-        .transpose()
+    if let Some(s) = cli.thinking.as_deref() {
+        return s
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("--thinking 解析失败: {e:#}"));
+    }
+    Ok(rupi_llm::parse_model_spec(&cli.model).thinking)
 }
 
 /// 三档审批装配：--approve 全放行 / --no-approve 全拒绝（互斥，错配直接 bail）
@@ -746,7 +875,8 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     } else {
         None
     };
-    let _ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
+    let ext_set = load_extensions(&mut tools, &ext_dir(home, cli));
+    let ext_arcs = ext_set.extension_arcs();
     // 非交互不提问：有项目资源且未 --trust-project 则跳过并告知
     let load_project = match project_resources() {
         None => true,
@@ -776,7 +906,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     // provider 在会话 id 落定后构造：亲和头荷载即 sessions.db 会话 id，
     // --resume 同 id 即同一下游（实例级随机 id 只保同进程粘滞）。
-    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid)).await?.into();
+    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid), &provider_options(cli)).await?.into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
@@ -840,11 +970,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     }
     let before_len = session.current_path.len();
     // @path 引用展开（与 REPL 同语义，root 取 current_dir）：-p 也可内联文件。
-    let prompt_expanded = rupi_core::commands::expand_at_mentions(
-        prompt,
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    );
-    let prompt: &str = &prompt_expanded;
+    let user = user_turn(prompt);
     use std::io::Write as _;
     // --json：stdout 只走 JSONL 事件（AgentEvent 的 serde 形状，`type` 区分），人读诊断仍走 stderr
     let emit_json = |e: &rupi_core::AgentEvent| {
@@ -854,15 +980,15 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
         }
     };
     let res = agent
-        .run(
+        .run_with_user(
             &*provider,
             &mut session,
-            prompt,
+            user,
             &tools,
             &*mem,
             &frozen,
             &*skills,
-            &[],
+            &ext_arcs,
             &|e| {
                 if json {
                     emit_json(&e);
@@ -894,6 +1020,13 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
                     } => {
                         eprintln!("\n[usage in={input_tokens} out={output_tokens}]")
                     }
+                    rupi_core::AgentEvent::UiHint {
+                        source,
+                        kind,
+                        message,
+                    } => {
+                        eprintln!("\n[ui {source}/{kind}] {message}")
+                    }
                     _ => {}
                 }
             },
@@ -901,6 +1034,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
             &rupi_core::CancelFlag::new(),
         )
         .await;
+    emit_ext_hints(&ext_set);
     let stop = match res {
         Ok(s) => s,
         Err(e) => {
@@ -1005,7 +1139,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let sess_db = SessionStore::open(home)?;
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     // provider 与 reviewer 在会话 id 落定后装配：亲和头荷载即 sessions.db 会话 id
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&model, Some(&sid)).await?.into();
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&model, Some(&sid), &provider_options(cli)).await?.into();
     if cli.review_enabled() {
         let pending_clone = pending.clone();
         // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
@@ -1054,7 +1188,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         println!("[subagents] subagent tool enabled");
     }
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [名] 切换模型，/thinking [off|low|medium|high] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
+    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -1082,6 +1216,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 "{}",
                 rupi_core::commands::index_block(&command_dirs_filtered(home, load_project))
             );
+            let extra = ext_set.command_index();
+            if !extra.is_empty() {
+                println!("{extra}");
+            }
             continue;
         }
         if input == "/reload" {
@@ -1105,10 +1243,13 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             if arg.is_empty() {
                 println!("[model {model}]");
             } else {
-                match build_provider(arg, Some(&sid)).await {
+                match build_provider(arg, Some(&sid), &provider_options(cli)).await {
                     Ok(p) => {
                         provider = p.into();
                         model = arg.to_string();
+                        if let Some(t) = rupi_llm::parse_model_spec(arg).thinking {
+                            agent.thinking = Some(t);
+                        }
                         println!("[model switched to {model}]");
                     }
                     Err(e) => eprintln!("[model] switch failed ({e:#}); staying on {model}"),
@@ -1233,27 +1374,27 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             } else if let Some(expanded) = skills.expand_as_command(name, args) {
                 println!("[skill /{name}]");
                 input = expanded;
+            } else if let Some(expanded) = ext_set.expand_command(name, args) {
+                println!("[ext /{name}]");
+                input = expanded;
             }
         }
-        // @path 引用展开：斜杠展开之后、发送之前内联文件内容（root 取 current_dir）。
-        input = rupi_core::commands::expand_at_mentions(
-            &input,
-            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        );
+        let user = user_turn(&input);
         let before_len = session.current_path.len();
         // 协作取消：Ctrl-C 只在 run 期间捕获（select 存活时），置位后循环在检查点
         // 优雅中止；空闲输入时无监听器，按默认行为杀进程（与现状一致）。
         let cancel = rupi_core::CancelFlag::new();
         // Box 拥有式持有：取消后仍需 await 到底，结束后显式 drop 释放 &mut session 借用。
-        let mut fut = Box::pin(agent.run(
+        let ext_arcs = ext_set.extension_arcs();
+        let mut fut = Box::pin(agent.run_with_user(
             &*provider,
             &mut session,
-            &input,
+            user,
             &tools,
             &*mem,
             &frozen,
             &*skills,
-            &[],
+            &ext_arcs,
             &|e| match e {
                 rupi_core::AgentEvent::TextDelta { delta } => print!("{delta}"),
                 rupi_core::AgentEvent::ToolStart { name, .. } => println!("\n[tool {name}]…"),
@@ -1283,6 +1424,13 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 } => {
                     println!("\n[usage in={input_tokens} out={output_tokens}]")
                 }
+                rupi_core::AgentEvent::UiHint {
+                    source,
+                    kind,
+                    message,
+                } => {
+                    println!("\n[ui {source}/{kind}] {message}")
+                }
                 rupi_core::AgentEvent::RunEnd {
                     stop_reason: rupi_core::StopReason::Aborted,
                 } => {
@@ -1311,6 +1459,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             println!();
             continue;
         }
+        emit_ext_hints(&ext_set);
         persist_turn(&sess_db, &sid, &session, before_len);
         // 压缩摘要落盘（变化才写）
         if let Some(sum) = &session.summary {
@@ -1363,7 +1512,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         restore_or_new(cli, &db)?
     };
     // provider 在会话 id 落定后构造（与 run/chat 同序，亲和头荷载即本会话 id）
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid)).await?.into();
+    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid), &provider_options(cli)).await?.into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());

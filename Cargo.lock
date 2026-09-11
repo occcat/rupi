@@ -1481,6 +1481,7 @@ dependencies = [
  "rupi-agent",
  "rupi-core",
  "rupi-llm",
+ "rupi-mcp",
  "rupi-memory",
  "rupi-skills",
  "rupi-tools",

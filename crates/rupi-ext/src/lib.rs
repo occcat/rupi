@@ -3,17 +3,25 @@
 //! Pi 哲学："No MCP. Build CLI tools with READMEs, or build an extension"。
 //! 本 crate 落的是前半句：每个扩展 = 一个 manifest（`*.json`）+ 任意可执行命令。
 //!
-//! 契约：调用时把 `arguments` JSON 写进子进程 stdin，stdout 即工具结果；
+//! 契约：
+//! - `protocol: oneshot`（默认）：调用时把 `arguments` JSON 写进子进程 stdin，stdout 即工具结果。
+//! - `protocol: jsonrpc`：长连接双向 JSON-RPC（复用 `rupi_mcp::StdioRpc` 帧），
+//!   可 `initialize` 注册斜杠命令、订阅 `tool_call`/`turn_end`/`session_*`、回 UI 提示。
+//! WASM 不在本 crate 范围。
+//!
 //! 非零退出码 → tool error（`stderr` 并入），绝不崩主循环。
 //! 热重载：`ExtensionSet::refresh()` 按 mtime 增量重载，agent 写新工具后
 //! `/reload`（或每轮自动检查）即刻可用；修工具开 side-quest branch，修完 rewind 回来。
 
-use rupi_core::ToolDefinition;
+use rupi_core::{ExtensionCommand, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+mod rpc;
+pub use rpc::{ExternalRpcTool, RpcHost};
 
 /// 扩展 manifest（`extensions/*.json`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,14 +45,45 @@ pub struct ExtensionManifest {
     /// 必现误杀，1s 墙钟对子进程 spawn 本就是竞态。
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// `oneshot`（默认 stdin JSON）或 `jsonrpc` 长连接。
+    #[serde(default)]
+    pub protocol: ExtProtocol,
+    /// JSON-RPC 扩展可在 manifest 里预注册斜杠命令。
+    #[serde(default)]
+    pub commands: Vec<ExtensionCommand>,
+    /// 预订阅事件名：`tool_call` / `turn_end` / `session_start` / `session_end` / `*`。
+    #[serde(default)]
+    pub subscribe: Vec<String>,
+}
+
+/// 扩展进程协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtProtocol {
+    #[default]
+    Oneshot,
+    #[serde(alias = "json-rpc", alias = "rpc")]
+    Jsonrpc,
 }
 
 fn default_timeout() -> u64 {
     30
 }
 
+/// 当前 tokio 运行时内 `block_in_place`；无运行时则起一个 current-thread。
+pub(crate) fn block_on_async<F: std::future::Future>(f: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => tokio::task::block_in_place(|| h.block_on(f)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("ext rpc runtime")
+            .block_on(f),
+    }
+}
+
 /// 生效超时：0 回默认值，其余至少 1s（防 `timeout(0)` 瞬杀）。
-fn effective_timeout_secs(manifest_secs: u64) -> u64 {
+pub(crate) fn effective_timeout_secs(manifest_secs: u64) -> u64 {
     if manifest_secs == 0 {
         default_timeout()
     } else {
@@ -223,6 +262,7 @@ pub struct ExtensionSet {
     pub dir: PathBuf,
     /// 文件 → (mtime, 工具名)
     snapshot: HashMap<String, (SystemTime, String)>,
+    rpc_hosts: HashMap<String, Arc<rpc::RpcHost>>,
 }
 
 impl ExtensionSet {
@@ -230,6 +270,89 @@ impl ExtensionSet {
         Self {
             dir,
             snapshot: HashMap::new(),
+            rpc_hosts: HashMap::new(),
+        }
+    }
+
+    pub fn extension_arcs(&self) -> Vec<Arc<dyn rupi_core::Extension>> {
+        self.rpc_hosts
+            .values()
+            .cloned()
+            .map(|h| h as Arc<dyn rupi_core::Extension>)
+            .collect()
+    }
+
+    pub fn list_commands(&self) -> Vec<ExtensionCommand> {
+        let mut out = Vec::new();
+        for h in self.rpc_hosts.values() {
+            out.extend(h.command_list());
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    pub fn command_index(&self) -> String {
+        let items = self.list_commands();
+        if items.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("extension commands:");
+        for c in items {
+            s.push_str(&format!("\n  /{}  {}", c.name, c.description));
+        }
+        s
+    }
+
+    pub fn expand_command(&self, name: &str, args: &str) -> Option<String> {
+        for h in self.rpc_hosts.values() {
+            if let Some(p) = h.expand_command(name, args) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    pub fn drain_ui_hints(&self) -> Vec<(String, rupi_tools::UiHint)> {
+        let mut out = Vec::new();
+        for (name, h) in &self.rpc_hosts {
+            for hint in h.drain_hints() {
+                out.push((name.clone(), hint));
+            }
+        }
+        out
+    }
+
+    fn drop_rpc(&mut self, name: &str) {
+        self.rpc_hosts.remove(name);
+    }
+
+    /// 安装 manifests：oneshot 注册 ExternalTool；jsonrpc 拉起长连接。
+    pub fn register(
+        &mut self,
+        registry: &mut rupi_tools::ToolRegistry,
+        manifests: Vec<ExtensionManifest>,
+    ) {
+        for m in manifests {
+            self.install_one(registry, m);
+        }
+    }
+
+    fn install_one(&mut self, registry: &mut rupi_tools::ToolRegistry, m: ExtensionManifest) {
+        match m.protocol {
+            ExtProtocol::Oneshot => {
+                registry.register(Arc::new(ExternalTool::new(m)));
+            }
+            ExtProtocol::Jsonrpc => {
+                let name = m.name.clone();
+                self.drop_rpc(&name);
+                match rpc::RpcHost::start(m) {
+                    Ok(host) => {
+                        registry.register(Arc::new(rpc::ExternalRpcTool::new(host.clone())));
+                        self.rpc_hosts.insert(name, host);
+                    }
+                    Err(e) => tracing::warn!("skip jsonrpc extension {name}: {e:#}"),
+                }
+            }
         }
     }
 
@@ -321,9 +444,17 @@ fn load_one(path: &Path) -> anyhow::Result<ExtensionManifest> {
     Ok(m)
 }
 
-/// 把 manifests 注册进 `ToolRegistry`（同名：后加载覆盖，便于热更新）。
+/// 把 oneshot manifests 注册进 `ToolRegistry`（同名：后加载覆盖）。
+/// JSON-RPC 扩展请走 [`ExtensionSet::register`]（需要活会话）。
 pub fn register_all(registry: &mut rupi_tools::ToolRegistry, manifests: Vec<ExtensionManifest>) {
     for m in manifests {
+        if m.protocol == ExtProtocol::Jsonrpc {
+            tracing::warn!(
+                "jsonrpc extension {} needs ExtensionSet::register (skipped)",
+                m.name
+            );
+            continue;
+        }
         registry.register(Arc::new(ExternalTool::new(m)));
     }
 }
@@ -338,11 +469,12 @@ pub fn refresh_extensions(
     let mut lines = Vec::new();
     for name in removed {
         tools.unregister(&name);
+        set.drop_rpc(&name);
         lines.push(format!("[ext] removed {name}"));
     }
     if !changed.is_empty() {
         let names: Vec<String> = changed.iter().map(|m| m.name.clone()).collect();
-        register_all(tools, changed);
+        set.register(tools, changed);
         lines.push(format!("[ext] reloaded: {}", names.join(", ")));
     }
     lines
@@ -351,6 +483,7 @@ pub fn refresh_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rupi_core::Extension;
     use rupi_tools::Tool as _;
 
     fn write(dir: &Path, name: &str, body: &str) {
@@ -469,5 +602,65 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("hi"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jsonrpc_extension_commands_tools_and_ui_hint() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": mid,
+            "result": {"capabilities": {
+                "commands": [{"name": "shout", "description": "yell"}],
+                "events": ["tool_call", "turn_end"]
+            }}
+        }), flush=True)
+    elif method == "tools/call":
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": mid,
+            "result": {"content": "pong", "ui": {"kind": "note", "message": "called"}}
+        }), flush=True)
+    elif method == "commands/execute":
+        args = (msg.get("params") or {}).get("args") or ""
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": mid,
+            "result": {"prompt": "SHOUT " + args}
+        }), flush=True)
+"#;
+        let mut m: ExtensionManifest = serde_json::from_str(
+            r#"{"name":"echo-rpc","description":"rpc demo","input_schema":{"type":"object"},"command":"python3","protocol":"jsonrpc","timeout_secs":8}"#,
+        )
+        .unwrap();
+        m.args = vec!["-u".into(), "-c".into(), script.into()];
+        let host = RpcHost::start(m).expect("start jsonrpc ext");
+        assert!(
+            host.command_list().iter().any(|c| c.name == "shout"),
+            "initialize should register /shout"
+        );
+        assert_eq!(
+            host.expand_command("shout", "hi").as_deref(),
+            Some("SHOUT hi")
+        );
+        let out = host.call_tool(serde_json::json!({"text": "x"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "pong");
+        assert_eq!(
+            out.ui_hint.as_ref().map(|h| h.message.as_str()),
+            Some("called")
+        );
+        host.on_event(&rupi_core::AgentEvent::TurnEnd {
+            turn: 1,
+            stop_reason: rupi_core::StopReason::Done,
+        })
+        .await
+        .unwrap();
     }
 }
