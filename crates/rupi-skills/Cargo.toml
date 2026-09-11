@@ -2,6 +2,7 @@
 name = "rupi-skills"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
