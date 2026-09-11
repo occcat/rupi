@@ -231,6 +231,20 @@ struct PushTarget {
     server: String,
 }
 
+/// 进程内共享 MCP HTTP Client（30s 超时，rustls + webpki 根证书）。
+fn shared_http_client() -> reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build rustls HTTP client")
+        })
+        .clone()
+}
+
 fn note_tools_changed(target: &PushTarget, method: &str, sid: Option<i64>) {
     // list_changed 按 spec 是无 id 通知；带 id 的同名包不认（防误触发）。
     if method == "notifications/tools/list_changed" && sid.is_none() {
@@ -390,9 +404,7 @@ impl McpBridge {
             .url
             .clone()
             .context("MCP http transport requires config.url")?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let client = shared_http_client();
         let bridge = Self {
             config,
             roots: vec![McpRoot::cwd()],
