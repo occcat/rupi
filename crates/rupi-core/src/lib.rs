@@ -2,6 +2,7 @@
 //! 对标 `pi-agent-core` 的最小运行时无关层：只放类型与 trait，不依赖任何 LLM 或 IO。
 
 pub mod commands;
+pub mod template;
 pub mod trust;
 
 use chrono::{DateTime, Utc};

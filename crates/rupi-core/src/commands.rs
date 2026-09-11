@@ -1,7 +1,8 @@
 //! 自定义斜杠命令：`commands/*.md` 即 `/name args`（对标 Claude Code slash commands）。
 //!
-//! 文件即命令：`<name>.md` 正文为提示模板，`$ARGUMENTS` 替换为用户参数；
-//! 无占位符则把参数拼到末尾。可选 YAML frontmatter（description 等）只做元信息，解析时剥离。
+//! 文件即命令：`<name>.md` 正文为提示模板；`$ARGUMENTS` / `$1` / `{{var}}` 见
+//! [`crate::template`]。无占位符则把参数拼到末尾。可选 YAML frontmatter
+//! （description 等）只做元信息，解析时剥离。
 //! 内建命令（/quit、/tree 等）优先；未知 `/foo` 先查自定义命令，查不到才当普通消息发送。
 
 use std::collections::HashMap;
@@ -53,7 +54,8 @@ pub fn split(input: &str) -> Option<(&str, &str)> {
     Some((name, args))
 }
 
-/// 展开命令：读文件、剥 frontmatter、替换 `$ARGUMENTS`。文件缺失/非法返回 None。
+/// 展开命令：读文件、剥 frontmatter、按 [`crate::template`] 替换占位符。
+/// 文件缺失/非法返回 None。
 pub fn expand(dirs: &[PathBuf], name: &str, args: &str) -> Option<String> {
     let table = discover(dirs);
     let path = table.get(&name.to_lowercase())?;
@@ -66,13 +68,7 @@ fn expand_file(path: &Path, args: &str) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    if body.contains("$ARGUMENTS") {
-        Some(body.replace("$ARGUMENTS", args))
-    } else if args.is_empty() {
-        Some(body)
-    } else {
-        Some(format!("{body}\n\n{args}"))
-    }
+    Some(crate::template::expand(&body, args))
 }
 
 /// 剥可选 YAML frontmatter（`---` 开头到下一个 `---`），无则原文。
@@ -341,6 +337,11 @@ mod tests {
         );
         assert!(expand(&dirs, "empty", "").is_none());
         assert!(expand(&dirs, "missing", "").is_none());
+        write(&base, "focus.md", "Focus: {{focus:-general}}\n$1\n");
+        assert_eq!(
+            expand(&dirs, "focus", "focus=security leftover").unwrap(),
+            "Focus: security\nleftover"
+        );
         // 非法文件名不收录
         write(&base, "Bad Name.md", "x");
         assert!(!discover(&dirs).contains_key("bad name"));

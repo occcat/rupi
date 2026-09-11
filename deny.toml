@@ -1,0 +1,47 @@
+# cargo-deny：咨询 + 许可证 + 来源。许可表按当前 lockfile 常见 OSI 许可放行。
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# 仓内 crate 未写 license 字段，不当成第三方未授权。
+unused-allowed-license = "allow"
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    "MIT-0",
+    "Unlicense",
+    "0BSD",
+    "blessing",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

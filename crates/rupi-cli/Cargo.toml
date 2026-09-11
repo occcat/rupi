@@ -3,6 +3,7 @@ name = "rupi-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "rupi"
@@ -20,6 +21,7 @@ rupi-memory = { path = "../rupi-memory" }
 rupi-skills = { path = "../rupi-skills" }
 rupi-ext = { path = "../rupi-ext" }
 rupi-tui = { path = "../rupi-tui" }
+rupi-pkg = { path = "../rupi-pkg" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

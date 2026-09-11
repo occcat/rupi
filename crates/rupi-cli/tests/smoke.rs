@@ -65,6 +65,9 @@ fn help_lists_key_subcommands() {
         "commands",
         "login",
         "models",
+        "install",
+        "uninstall",
+        "packages",
     ] {
         assert!(out.contains(sub), "help 缺子命令 {sub}:\n{out}");
     }
@@ -90,6 +93,67 @@ fn login_is_stubbed_and_models_catalog_prints() {
     assert!(o.status.success(), "models 非零: {o:?}");
     let (out, _) = out_text(&o);
     assert!(out.contains("vertex/"), "models:\n{out}");
+}
+
+#[test]
+fn install_local_package_lists_skill_command_ext() {
+    let home = fresh_home();
+    let pkg = home.join("src-pkg");
+    std::fs::create_dir_all(pkg.join("skills/demo-skill")).unwrap();
+    std::fs::write(
+        pkg.join("skills/demo-skill/SKILL.md"),
+        "---\nname: demo-skill\ndescription: smoke install skill\n---\nDo it.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(pkg.join("prompts")).unwrap();
+    std::fs::write(
+        pkg.join("prompts/greet.md"),
+        "---\ndescription: greet someone\n---\nHello {{who:-world}}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(pkg.join("extensions")).unwrap();
+    std::fs::write(
+        pkg.join("extensions/demo-echo.json"),
+        r#"{"name":"demo-echo","description":"echo","input_schema":{"type":"object"},"command":"true"}"#,
+    )
+    .unwrap();
+
+    let o = rupi(&home, &["install", pkg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "install 失败: {o:?}");
+    let (out, err) = out_text(&o);
+    assert!(
+        out.contains("demo-skill") && out.contains("greet") && out.contains("demo-echo"),
+        "install 报告缺资源:\n{out}\n{err}"
+    );
+
+    let o = rupi(&home, &["skills-list"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(
+        out.contains("demo-skill"),
+        "skills-list 未见安装 skill:\n{out}"
+    );
+
+    let o = rupi(&home, &["commands"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(out.contains("/greet"), "commands 未见 /greet:\n{out}");
+
+    let o = rupi(&home, &["ext-list"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(out.contains("demo-echo"), "ext-list 未见 demo-echo:\n{out}");
+
+    let o = rupi(&home, &["packages"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(out.contains("local:"), "packages 未列出 local 包:\n{out}");
+
+    let o = rupi(&home, &["uninstall", pkg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "uninstall 失败: {o:?}");
+    let o = rupi(&home, &["packages"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(out.contains("no packages"), "卸载后仍有包:\n{out}");
 }
 
 #[test]

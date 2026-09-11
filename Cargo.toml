@@ -11,11 +11,14 @@ members = [
   "crates/rupi-ext",
   "crates/rupi-tui",
   "crates/rupi-cli",
+  "crates/rupi-pkg",
+  "crates/rupi-benches",
 ]
 resolver = "2"
 
 [workspace.package]
 rust-version = "1.88"
+license = "MIT OR Apache-2.0"
 
 [profile.release]
 lto = "fat"
