@@ -1061,9 +1061,10 @@ pub struct SessionMessageRow {
 
 pub mod session_io;
 pub use session_io::{
-    export_store_html, export_store_jsonl, export_tree_html, export_tree_jsonl, import_into_store,
-    import_jsonl, persist_tree, remap_tree, resolve_session_ref, restore_tree, tree_from_records,
-    ImportedSession, SessionHeader,
+    export_store_html, export_store_jsonl, export_tree_html, export_tree_jsonl, fork_session,
+    format_session_status, import_into_store, import_jsonl, looks_like_session_path, open_session,
+    persist_tree, remap_tree, resolve_session_id, resolve_session_ref, restore_tree,
+    tree_from_records, ImportedSession, OpenedSession, SessionHeader,
 };
 
 /// 用户查询转 FTS5 短语：裸 `-` / `:` / `*` 等会被当运算符导致 syntax error，
@@ -1229,6 +1230,15 @@ impl SessionStore {
     pub fn get_name(&self, session_id: &str) -> anyhow::Result<Option<String>> {
         let n: Option<String> = self.conn.query_row(
             "SELECT name FROM sessions WHERE id = ?",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.filter(|s| !s.is_empty()))
+    }
+
+    pub fn get_cwd(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let n: Option<String> = self.conn.query_row(
+            "SELECT cwd FROM sessions WHERE id = ?",
             rusqlite::params![session_id],
             |r| r.get(0),
         )?;

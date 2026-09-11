@@ -46,6 +46,8 @@ pub struct AgentSessionBuilder {
     session: Option<SessionTree>,
     session_id: Option<String>,
     session_name: Option<String>,
+    /// `--session` / RPC / `-r` 共用：id 或 JSONL 路径（见 [`rupi_memory::open_session`]）。
+    session_path: Option<String>,
 }
 
 impl Default for AgentSessionBuilder {
@@ -59,6 +61,7 @@ impl Default for AgentSessionBuilder {
             session: None,
             session_id: None,
             session_name: None,
+            session_path: None,
         }
     }
 }
@@ -94,7 +97,18 @@ impl AgentSessionBuilder {
         self
     }
 
+    /// 打开已有会话：SQLite id（或唯一前缀）或 Pi JSONL 路径。与 CLI `--session` 同一装入。
+    pub fn session_path(mut self, spec: impl Into<String>) -> Self {
+        self.session_path = Some(spec.into());
+        self
+    }
+
     pub fn build(self) -> AgentSession {
+        self.try_build()
+            .unwrap_or_else(|e| panic!("AgentSession::build failed: {e:#}"))
+    }
+
+    pub fn try_build(self) -> anyhow::Result<AgentSession> {
         let provider = self
             .provider
             .unwrap_or_else(|| Arc::new(rupi_llm::MockProvider::new(vec![])));
@@ -104,17 +118,32 @@ impl AgentSessionBuilder {
                 .unwrap_or_else(|_| std::env::temp_dir().join("rupi-embed"))
         });
         let _ = std::fs::create_dir_all(&home);
+        let mut session = self.session;
+        let mut session_id = self.session_id;
+        let mut session_name = self.session_name;
+        if let Some(spec) = &self.session_path {
+            let db = rupi_memory::SessionStore::open(&home)?;
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let opened = rupi_memory::open_session(&db, spec, &cwd)?;
+            session = Some(opened.tree);
+            session_id = Some(opened.id);
+            if session_name.is_none() {
+                session_name = opened.name;
+            }
+        }
         let store = MemoryStore::new(home);
         let frozen = store.frozen_snapshot();
         let mem = MemoryManager::new(store);
         let tools = self.tools.unwrap_or_else(ToolRegistry::with_builtins);
         let skills = self.skills.unwrap_or_default();
-        let session = self.session.unwrap_or_default();
-        let session_id = self.session_id.unwrap_or_else(|| session.id.clone());
+        let session = session.unwrap_or_default();
+        let session_id = session_id.unwrap_or_else(|| session.id.clone());
         let inbox = Arc::new(MessageInbox::new());
         let mut agent = AgentLoop::new(self.max_turns);
         agent.inbox = Some(inbox.clone());
-        AgentSession {
+        Ok(AgentSession {
             provider,
             agent,
             session,
@@ -126,14 +155,14 @@ impl AgentSessionBuilder {
             inbox,
             cancel: CancelFlag::new(),
             session_id,
-            session_name: self.session_name,
+            session_name,
             streaming: Arc::new(AtomicBool::new(false)),
             last_usage: Arc::new(Mutex::new(None)),
             sess_db: None,
             persist: false,
             command_dirs: Vec::new(),
             provider_opts: ProviderOptions::default(),
-        }
+        })
     }
 }
 
@@ -563,5 +592,40 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("second")));
         assert!(!sess.state().is_streaming);
         assert_eq!(sess.state().pending_message_count, 0);
+    }
+
+    #[test]
+    fn builder_session_path_loads_jsonl() {
+        let home = std::env::temp_dir().join(format!(
+            "rupi-sdk-sess-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let db = rupi_memory::SessionStore::open(&home).unwrap();
+        let mut tree = SessionTree::new();
+        tree.push(rupi_core::Message::text(
+            rupi_core::Role::User,
+            "from jsonl",
+        ));
+        let jsonl = rupi_memory::export_tree_jsonl(&tree, "/tmp/p", Some("sdk"), None);
+        let path = home.join("s.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        drop(db);
+        let sess = AgentSession::builder()
+            .home(home.clone())
+            .session_path(path.to_string_lossy().as_ref())
+            .try_build()
+            .unwrap();
+        assert!(sess
+            .messages()
+            .iter()
+            .any(|m| m.full_text().contains("from jsonl")));
+        assert_eq!(sess.session_name.as_deref(), Some("sdk"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

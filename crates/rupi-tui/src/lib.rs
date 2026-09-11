@@ -5,6 +5,7 @@ pub mod app;
 pub mod complete;
 pub mod keybindings;
 pub mod markdown;
+pub mod session_nav;
 pub mod theme;
 pub mod tree_nav;
 pub mod view;

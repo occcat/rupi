@@ -499,6 +499,20 @@ fn settings_and_system_md_apply() {
         out.contains("system-prompt"),
         "help 缺 --system-prompt:\n{out}"
     );
+    for flag in [
+        "session",
+        "pick-session",
+        "fork",
+        "print",
+        "no-context-files",
+        "no-builtin-tools",
+        "no-extensions",
+        "no-skills",
+        "extension",
+        "skill",
+    ] {
+        assert!(out.contains(flag), "help 缺 --{flag}:\n{out}");
+    }
 }
 
 #[test]
@@ -1038,4 +1052,206 @@ fn run_sends_session_id_affinity_header() {
         got2.iter().all(|h| h == &sid),
         "续聊后亲和头仍应等于同会话 id {sid}：{got2:?}"
     );
+}
+
+#[test]
+fn stdin_print_atfile_session_fork_and_slash() {
+    let home = fresh_home();
+    std::fs::write(home.join("README.md"), "PIPEFILE unique-readme-body").unwrap();
+    std::fs::write(home.join("AGENTS.md"), "AGENTS_SHOULD_HIDE").unwrap();
+
+    let mut child = rupi(&home, &["--no-approve", "run", "summarize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hi-from-pipe")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "piped run 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--no-context-files",
+            "run",
+            "@README.md",
+            "总结",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "@file run 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (sess, _) = out_text(&o);
+    let sid = sess
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .expect("session id")
+        .to_string();
+
+    let o = rupi(&home, &["session-show", &sid]).output().unwrap();
+    let (show, _) = out_text(&o);
+    assert!(show.contains("hi-from-pipe"), "stdin 未进会话:\n{show}");
+    assert!(
+        show.contains("PIPEFILE unique-readme-body") || show.contains("README.md"),
+        "@file 未进会话:\n{show}"
+    );
+
+    // 无子命令位置参数：非 TTY 走 run（对标 `rupi @README.md 总结`）
+    let o = rupi(&home, &["--no-approve", "@README.md", "总结"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "positional @file 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let mut child = rupi(&home, &["--no-approve", "-p", "summarize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hi-from-print-pipe")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "-p 管道失败:\nstdout={out}\nstderr={err}"
+    );
+    let o = rupi(&home, &["session-search", "hi-from-print-pipe"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
+    assert!(
+        o.status.success() && hit.contains("hi-from-print-pipe"),
+        "-p stdin 未进会话:\n{hit}\n{err}"
+    );
+
+    let jsonl = home.join("pi.jsonl");
+    let mut tree_jsonl = String::from(
+        r#"{"type":"session","version":3,"id":"import-me","timestamp":"2026-01-01T00:00:00.000Z","cwd":"."}"#,
+    );
+    tree_jsonl.push('\n');
+    tree_jsonl.push_str(
+        r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"jsonl-hello"}],"timestamp":1}}"#,
+    );
+    tree_jsonl.push('\n');
+    std::fs::write(&jsonl, tree_jsonl).unwrap();
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--session",
+            jsonl.to_str().unwrap(),
+            "run",
+            "after-import",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--session jsonl 失败:\nstdout={out}\nstderr={err}"
+    );
+    let o = rupi(&home, &["session-search", "jsonl-hello"])
+        .output()
+        .unwrap();
+    let (hit, _) = out_text(&o);
+    assert!(hit.contains("jsonl-hello"), "JSONL 未装入:\n{hit}");
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--fork",
+            jsonl.to_str().unwrap(),
+            "run",
+            "forked",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--fork 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let before = rupi(&home, &["sessions"]).output().unwrap();
+    let (before_out, _) = out_text(&before);
+    let n_before = before_out.lines().count();
+    let o = rupi(&home, &["--no-approve", "-r", "run", "picked-latest"])
+        .output()
+        .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "-r run 失败:\nstdout={out}\nstderr={err}"
+    );
+    let after = rupi(&home, &["sessions"]).output().unwrap();
+    let (after_out, _) = out_text(&after);
+    assert_eq!(
+        after_out.lines().count(),
+        n_before,
+        "-r 应续最近会话而不是新建:\n{after_out}"
+    );
+
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--no-builtin-tools",
+            "--no-skills",
+            "--no-extensions",
+            "-nc",
+            "run",
+            "flags-ok",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "resource flags 失败:\nstdout={out}\nstderr={err}"
+    );
+
+    let o = chat_with(
+        home.as_path(),
+        &["--no-approve"],
+        b"/session\n/new\n/session\n/quit\n",
+    );
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "chat /session /new 失败:\n{out}\n{err}");
+    assert!(out.contains("id:"), "/session 无 id:\n{out}");
+    assert!(out.contains("[new "), "/new 无新 id:\n{out}");
+    let ids: Vec<_> = out.lines().filter(|l| l.starts_with("id: ")).collect();
+    assert!(ids.len() >= 2, "应打印两个 /session:\n{out}");
+    assert_ne!(ids[0], ids[1], "/new 后 /session 应是新 id:\n{out}");
 }
