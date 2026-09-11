@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::StreamExt as _;
+use futures::{Stream, StreamExt as _};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
@@ -646,12 +646,16 @@ async fn run_loop(
     Ok(())
 }
 
-/// 回合内循环：agent future 与键盘事件同场 `select!`，delta 到达即画。
+/// 回合内循环：agent future、键盘、事件 channel 同场 `select!`，delta 到达即画。
+/// `on_event` 走 `tokio::sync::mpsc`（不再用 `std::sync::mpsc`）：后者不唤醒 async
+/// runtime，内循环只会在按键或整轮结束时重绘，流式名存实亡。
 /// 运行中继续打字排队为 follow-up（`collect_followup`），返回 `(Control, followup)`：
 /// 调用方在 `Continue` 且排队非空时自动发出下一轮（对标上游 follow-up 全量注入）。
+/// `terminal` / `reader` 泛型：生产走 Crossterm + `EventStream`，单测走 `TestBackend`
+/// + pending 键流，断言无按键时 delta 也会 `draw`。
 #[allow(clippy::too_many_arguments)]
-async fn drive_turn(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+async fn drive_turn<B, S>(
+    terminal: &mut Terminal<B>,
     agent: &AgentLoop,
     provider: &dyn LlmProvider,
     session: &mut SessionTree,
@@ -661,12 +665,16 @@ async fn drive_turn(
     skills: &SkillRegistry,
     review_lines: &Option<Arc<std::sync::Mutex<Vec<String>>>>,
     on_turn: &Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
-    reader: &mut EventStream,
+    reader: &mut S,
     view: &mut ChatView,
     text: String,
-) -> anyhow::Result<(Control, String)> {
-    let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
-    let on_event = |e: AgentEvent| {
+) -> anyhow::Result<(Control, String)>
+where
+    B: Backend,
+    S: Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let on_event = move |e: AgentEvent| {
         let _ = tx.send(e);
     };
     // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
@@ -697,62 +705,45 @@ async fn drive_turn(
     let end: End = {
         tokio::pin!(fut);
         loop {
-            while let Ok(e) = rx.try_recv() {
-                view.push_event(&e);
-            }
-            if let Some(buf) = review_lines {
-                for line in buf.lock().unwrap().drain(..) {
-                    view.push_system(line);
-                }
-            }
-            draw(
-                terminal,
-                view,
-                &qb,
-                scroll,
-                true,
-                followup.chars().count(),
-                &[],
-                '/',
-            )?;
+            flush_turn_view(&mut rx, review_lines, view);
+            paint_busy(terminal, view, &qb, scroll, &followup)?;
             tokio::select! {
+                biased;
                 res = &mut fut => {
-                    while let Ok(e) = rx.try_recv() {
-                        view.push_event(&e);
-                    }
-                    if let Some(buf) = review_lines {
-                        for line in buf.lock().unwrap().drain(..) {
-                            view.push_system(line);
-                        }
-                    }
+                    flush_turn_view(&mut rx, review_lines, view);
+                    // 收尾再画一帧：与 fut 竞速的最后几个 delta 也落到 TestBackend / 屏幕上。
+                    paint_busy(terminal, view, &qb, scroll, &followup)?;
                     break End::Finished(res);
                 }
                 maybe_key = reader.next() => {
-                    match maybe_key {
-                        Some(Ok(Event::Key(key))) => {
-                            if collect_followup(&mut followup, &key) {
-                                qb.set_text(&followup);
-                            } else {
-                                match key.code {
-                                    KeyCode::Char('c')
-                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        break End::Quit;
-                                    }
-                                    // 中止本轮：只置位不 drop future，会话停在一致点，
-                                    // TurnEnd/RunEnd{Aborted} 照常进视图。排队保留，
-                                    // 中止后自动跑排队≈转向。
-                                    KeyCode::Esc => {
-                                        cancel.cancel();
-                                    }
-                                    KeyCode::PageUp => scroll = scroll.saturating_add(5),
-                                    KeyCode::PageDown => scroll = scroll.saturating_sub(5),
-                                    _ => {}
+                    if let Some(Ok(Event::Key(key))) = maybe_key {
+                        if collect_followup(&mut followup, &key) {
+                            qb.set_text(&followup);
+                        } else {
+                            match key.code {
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    break End::Quit;
                                 }
+                                // 中止本轮：只置位不 drop future，会话停在一致点，
+                                // TurnEnd/RunEnd{Aborted} 照常进视图。排队保留，
+                                // 中止后自动跑排队≈转向。
+                                KeyCode::Esc => {
+                                    cancel.cancel();
+                                }
+                                KeyCode::PageUp => scroll = scroll.saturating_add(5),
+                                KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+                                _ => {}
                             }
                         }
-                        _ => {}
                     }
+                }
+                // delta / 工具事件到达即醒：下一圈 flush + draw，不必等按键或整轮结束。
+                // `Some(e) =` 在发送端随 future 关闭后禁用此臂，避免 recv() 空转。
+                Some(e) = rx.recv() => {
+                    view.push_event(&e);
+                    flush_turn_view(&mut rx, review_lines, view);
                 }
             }
         }
@@ -804,6 +795,40 @@ async fn drive_turn(
             Ok((Control::Continue, followup))
         }
     }
+}
+
+fn flush_turn_view(
+    rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    review_lines: &Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    view: &mut ChatView,
+) {
+    while let Ok(e) = rx.try_recv() {
+        view.push_event(&e);
+    }
+    if let Some(buf) = review_lines {
+        for line in buf.lock().unwrap().drain(..) {
+            view.push_system(line);
+        }
+    }
+}
+
+fn paint_busy<B: Backend>(
+    terminal: &mut Terminal<B>,
+    view: &ChatView,
+    input: &InputBuffer,
+    scroll: u16,
+    followup: &str,
+) -> anyhow::Result<()> {
+    draw(
+        terminal,
+        view,
+        input,
+        scroll,
+        true,
+        followup.chars().count(),
+        &[],
+        '/',
+    )
 }
 
 /// 全屏绘制（Backend 泛型：生产走 Crossterm，单测走 TestBackend 真画一遍断言像素行）。
@@ -1056,6 +1081,177 @@ mod tests {
             .collect();
         assert!(screen.contains("Esc"), "缺中断提示:\n{screen}");
         assert!(!screen.contains("queued"), "无排队不应提 queued:\n{screen}");
+    }
+
+    /// 录屏后端：每次 `draw` 记下像素行；若已含 marker 则叫醒 provider，
+    /// 证明重绘发生在 agent future 结束之前、且没有按键。
+    struct StreamingTestBackend {
+        inner: ratatui::backend::TestBackend,
+        marker: String,
+        painted: Arc<tokio::sync::Notify>,
+        frames: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ratatui::backend::Backend for StreamingTestBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)?;
+            let screen: String = self
+                .inner
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            if screen.contains(&self.marker) {
+                self.painted.notify_waiters();
+            }
+            self.frames.lock().unwrap().push(screen);
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// 先推一个独特 delta，再挂起等 TUI 画到该 marker；若 `select!` 没有
+    /// `rx.recv()` 臂，这里会超时，整轮失败。
+    struct SlowDeltaProvider {
+        marker: String,
+        painted: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SlowDeltaProvider {
+        fn name(&self) -> &str {
+            "slow-delta"
+        }
+        async fn complete(
+            &self,
+            _req: rupi_llm::ChatRequest,
+        ) -> anyhow::Result<rupi_llm::ChatResponse> {
+            Ok(rupi_llm::MockProvider::text_response(&self.marker))
+        }
+        async fn complete_streaming(
+            &self,
+            req: rupi_llm::ChatRequest,
+            tx: mpsc::Sender<rupi_llm::StreamEvent>,
+        ) -> anyhow::Result<rupi_llm::ChatResponse> {
+            let resp = self.complete(req).await?;
+            let _ = tx
+                .send(rupi_llm::StreamEvent::TextDelta(self.marker.clone()))
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), self.painted.notified())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("TUI did not redraw after TextDelta without a keypress")
+                })?;
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_turn_redraws_delta_without_keypress() {
+        // 键流永远 pending：若重绘只靠按键，marker 不会在 future 结束前出现。
+        let marker = "STREAM_DELTA_OK";
+        let painted = Arc::new(tokio::sync::Notify::new());
+        let frames = Arc::new(Mutex::new(Vec::<String>::new()));
+        let backend = StreamingTestBackend {
+            inner: ratatui::backend::TestBackend::new(40, 12),
+            marker: marker.to_string(),
+            painted: painted.clone(),
+            frames: frames.clone(),
+        };
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut reader = futures::stream::pending::<std::io::Result<Event>>();
+        let provider = SlowDeltaProvider {
+            marker: marker.to_string(),
+            painted,
+        };
+        let agent = AgentLoop::new(3);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::default();
+        let home = std::env::temp_dir().join(format!(
+            "rupi-tui-stream-redraw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mem = MemoryManager::new(rupi_memory::MemoryStore::new(home.clone()));
+        let frozen = FrozenMemory::default();
+        let skills = SkillRegistry::default();
+        let mut view = ChatView::default();
+        view.push_user("ping".into());
+        let (ctrl, followup) = drive_turn(
+            &mut terminal,
+            &agent,
+            &provider,
+            &mut session,
+            &tools,
+            &mem,
+            &frozen,
+            &skills,
+            &None,
+            &None,
+            &mut reader,
+            &mut view,
+            "ping".into(),
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(ctrl, Control::Continue), "回合应正常结束");
+        assert!(followup.is_empty());
+        assert!(
+            !view
+                .lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("turn failed"))),
+            "回合失败: {:?}",
+            view.lines
+        );
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.iter().any(|s| s.contains(marker)),
+            "TestBackend 应在无按键时画出 delta:\n{}",
+            frames.last().cloned().unwrap_or_default()
+        );
+        // provider 在 complete_streaming 返回前就等到了含 marker 的帧，
+        // 因此至少有一帧发生在整轮结束的收尾 draw 之前。
+        let first_hit = frames.iter().position(|s| s.contains(marker)).unwrap();
+        assert!(
+            first_hit + 1 < frames.len(),
+            "delta 应在流式过程中入画，而不是只靠收尾那一帧；first_hit={first_hit} frames={}",
+            frames.len()
+        );
     }
 
     #[test]
