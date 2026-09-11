@@ -59,6 +59,17 @@ impl InputBuffer {
         self.cursor = self.chars.len();
     }
 
+    /// 当前光标（字符级，@路径补全定位 token 用）。
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// 写回补全结果并指定光标（@行中补全用，越界钳制到末尾）。
+    pub fn set_text_and_cursor(&mut self, s: &str, cursor: usize) {
+        self.chars = s.chars().collect();
+        self.cursor = cursor.min(self.chars.len());
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty()
     }

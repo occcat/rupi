@@ -318,13 +318,32 @@ async fn run_loop(
     let mut reader = EventStream::new();
 
     loop {
-        // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）
+        // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
+        // 无斜杠候选时回退 @路径补全（root 取 current_dir，失败即无弹窗）。
         let custom_names: Vec<String> = commands::list(&ctx.command_dirs)
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        let completion = complete::candidates(&input.text(), &custom_names);
-        draw(terminal, &view, &input, scroll, false, 0, &completion)?;
+        let slash_completion = complete::candidates(&input.text(), &custom_names);
+        let (completion, completion_prefix) = if slash_completion.is_empty() {
+            let at = match std::env::current_dir() {
+                Ok(cwd) => complete::at_candidates(&input.text(), input.cursor(), &cwd),
+                Err(_) => Vec::new(),
+            };
+            (at, '@')
+        } else {
+            (slash_completion, '/')
+        };
+        draw(
+            terminal,
+            &view,
+            &input,
+            scroll,
+            false,
+            0,
+            &completion,
+            completion_prefix,
+        )?;
         let Some(Ok(Event::Key(key))) = reader.next().await else {
             continue;
         };
@@ -335,6 +354,14 @@ async fn run_loop(
             KeyCode::Tab => {
                 if let Some(done) = complete::apply_tab(&input.text(), &custom_names) {
                     input.set_text(&done);
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    // 斜杠无命中时回退 @路径补全（行中 token，光标留在补全后）。
+                    let text = input.text();
+                    if let Some((done, cursor)) =
+                        complete::apply_at_tab(&text, input.cursor(), &cwd)
+                    {
+                        input.set_text_and_cursor(&done, cursor);
+                    }
                 }
             }
             KeyCode::Left => input.move_left(),
@@ -532,6 +559,7 @@ async fn drive_turn(
                 true,
                 followup.chars().count(),
                 &[],
+                '/',
             )?;
             tokio::select! {
                 res = &mut fut => {
@@ -613,6 +641,7 @@ async fn drive_turn(
 }
 
 /// 全屏绘制（Backend 泛型：生产走 Crossterm，单测走 TestBackend 真画一遍断言像素行）。
+#[allow(clippy::too_many_arguments)]
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
     view: &ChatView,
@@ -621,6 +650,7 @@ fn draw<B: Backend>(
     busy: bool,
     queued: usize,
     completion: &[String],
+    completion_prefix: char,
 ) -> anyhow::Result<()> {
     terminal
         .draw(|f| {
@@ -656,7 +686,7 @@ fn draw<B: Backend>(
                     .take(8)
                     .map(|c| {
                         RLine::from(vec![Span::styled(
-                            format!("/{c}"),
+                            format!("{completion_prefix}{c}"),
                             Style::default().fg(Color::Yellow),
                         )])
                     })
@@ -788,7 +818,7 @@ mod tests {
         }
         let completion = vec!["help".to_string(), "history".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, false, 0, &completion).unwrap();
+        draw(&mut terminal, &view, &input, 0, false, 0, &completion, '/').unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -814,13 +844,32 @@ mod tests {
     }
 
     #[test]
+    fn draw_at_completion_uses_at_prefix() {
+        // @路径候选弹窗以前缀 @ 展示（与斜杠 / 区分）。
+        use ratatui::{backend::TestBackend, Terminal};
+        let view = ChatView::default();
+        let input = InputBuffer::default();
+        let completion = vec!["src/main.rs".to_string()];
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        draw(&mut terminal, &view, &input, 0, false, 0, &completion, '@').unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("@src/main.rs"), "缺 @ 候选:\n{screen}");
+    }
+
+    #[test]
     fn draw_busy_status_hints_steer_and_quit() {
         // 运行中状态栏即 steering 说明书：排队时提示 Esc 中断并转向，无排队只提示中断。
         use ratatui::{backend::TestBackend, Terminal};
         let view = ChatView::default();
         let input = InputBuffer::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 2, &[]).unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 2, &[], '/').unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -831,7 +880,7 @@ mod tests {
         assert!(screen.contains("2 queued"), "缺排队数:\n{screen}");
         assert!(screen.contains("Esc"), "缺转向提示:\n{screen}");
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 0, &[]).unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 0, &[], '/').unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
