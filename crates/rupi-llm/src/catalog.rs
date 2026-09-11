@@ -75,10 +75,7 @@ pub fn format_catalog(models: &[ModelEntry]) -> String {
         } else {
             String::new()
         };
-        s.push_str(&format!(
-            "  {}/{}  — {}{ctx}\n",
-            m.provider, m.id, m.name
-        ));
+        s.push_str(&format!("  {}/{}  — {}{ctx}\n", m.provider, m.id, m.name));
     }
     s
 }
@@ -90,7 +87,9 @@ mod tests {
     #[test]
     fn builtin_catalog_has_core_providers() {
         let m = builtin_models();
-        assert!(m.iter().any(|e| e.provider == "openai" && e.id == "gpt-4o-mini"));
+        assert!(m
+            .iter()
+            .any(|e| e.provider == "openai" && e.id == "gpt-4o-mini"));
         assert!(m.iter().any(|e| e.provider == "anthropic"));
         assert!(m.iter().any(|e| e.provider == "gemini"));
         assert!(m.iter().any(|e| e.provider == "openrouter"));

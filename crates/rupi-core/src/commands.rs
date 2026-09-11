@@ -108,7 +108,8 @@ pub const AT_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// 纯文本展开（测试与不关心图片块的调用方）。图片写成 `[image mime]` 占位。
 pub fn expand_at_mentions(text: &str, root: &Path) -> String {
-    crate::Message::from_blocks(crate::Role::User, expand_at_mentions_blocks(text, root)).full_text()
+    crate::Message::from_blocks(crate::Role::User, expand_at_mentions_blocks(text, root))
+        .full_text()
 }
 
 /// 图文混排展开：文本围栏 + 图片块按原文顺序交错。
@@ -407,18 +408,12 @@ mod tests {
             expand_at_mentions("读 @missing.txt", &base),
             "读 @missing.txt"
         );
-        assert_eq!(
-            expand_at_mentions("读 @../secret", &base),
-            "读 @../secret"
-        );
+        assert_eq!(expand_at_mentions("读 @../secret", &base), "读 @../secret");
         assert_eq!(expand_at_mentions("读 @/abs", &base), "读 @/abs");
         std::fs::create_dir_all(base.join("sub")).unwrap();
         assert_eq!(expand_at_mentions("读 @sub", &base), "读 @sub");
         // 中文透传不损坏
-        assert_eq!(
-            expand_at_mentions("你好世界", &base),
-            "你好世界"
-        );
+        assert_eq!(expand_at_mentions("你好世界", &base), "你好世界");
         let _ = std::fs::remove_dir_all(&base);
     }
 

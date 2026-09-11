@@ -217,14 +217,15 @@ for line in sys.stdin:
     elif method=="tools/call":
         print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":"hi"}}), flush=True)
 "#;
-        let rpc = StdioRpc::spawn("python3", &["-u".into(), "-c".into(), script.into()], &HashMap::new())
-            .await
-            .unwrap();
+        let rpc = StdioRpc::spawn(
+            "python3",
+            &["-u".into(), "-c".into(), script.into()],
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         let mut incoming = rpc.take_incoming().await.unwrap();
-        let init = rpc
-            .call("initialize", serde_json::json!({}))
-            .await
-            .unwrap();
+        let init = rpc.call("initialize", serde_json::json!({})).await.unwrap();
         assert_eq!(init["ok"], true);
         let ping = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
             .await

@@ -61,9 +61,9 @@ impl std::str::FromStr for ThinkingLevel {
             "high" => Ok(ThinkingLevel::High),
             "xhigh" | "x-high" | "extra" => Ok(ThinkingLevel::XHigh),
             "max" => Ok(ThinkingLevel::Max),
-            other => anyhow::bail!(
-                "invalid thinking level '{other}' (off|low|medium|high|xhigh|max)"
-            ),
+            other => {
+                anyhow::bail!("invalid thinking level '{other}' (off|low|medium|high|xhigh|max)")
+            }
         }
     }
 }
@@ -410,7 +410,10 @@ impl OpenAiCompatProvider {
         match self.kind {
             CompatKind::Azure => {
                 let ver = self.api_version.as_deref().unwrap_or("2024-10-21");
-                format!("{base}/openai/deployments/{}/chat/completions?api-version={ver}", self.model)
+                format!(
+                    "{base}/openai/deployments/{}/chat/completions?api-version={ver}",
+                    self.model
+                )
             }
             _ => format!("{base}/chat/completions"),
         }
@@ -488,8 +491,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = self.chat_url();
         let body = openai_body(&self.model, &req, false);
         let client = self.client.clone();
-        let resp =
-            post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
+        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
         let resp = ensure_success("openai-compat", resp).await?;
         let v: serde_json::Value = resp.json().await?;
         parse_openai_response(v)
@@ -506,8 +508,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = self.chat_url();
         let body = openai_body(&self.model, &req, true);
         let client = self.client.clone();
-        let resp =
-            post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
+        let resp = post_json_with_retry(|| self.authed(client.post(url.clone())), &body, 3).await?;
         let resp = ensure_success("openai-compat", resp).await?;
         let mut stream = resp.bytes_stream();
         let mut parser = SseParser::default();
@@ -908,10 +909,7 @@ mod teststub {
         start_with_status(payload, 200).await
     }
 
-    pub async fn start_with_status(
-        payload: serde_json::Value,
-        status: u16,
-    ) -> (String, Arc<Seen>) {
+    pub async fn start_with_status(payload: serde_json::Value, status: u16) -> (String, Arc<Seen>) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let seen = Arc::new(Seen::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1037,7 +1035,10 @@ mod tests {
             ThinkingLevel::Medium
         );
         assert_eq!(ThinkingLevel::from_str("none").unwrap(), ThinkingLevel::Off);
-        assert_eq!(ThinkingLevel::from_str("xhigh").unwrap(), ThinkingLevel::XHigh);
+        assert_eq!(
+            ThinkingLevel::from_str("xhigh").unwrap(),
+            ThinkingLevel::XHigh
+        );
         assert_eq!(ThinkingLevel::from_str("max").unwrap(), ThinkingLevel::Max);
         assert!(ThinkingLevel::from_str("ultra").is_err());
         assert_eq!(ThinkingLevel::High.openai_effort(), Some("high"));
@@ -1118,9 +1119,7 @@ mod tests {
         let m = Message::from_blocks(
             Role::User,
             vec![
-                ContentBlock::Text {
-                    text: "see".into(),
-                },
+                ContentBlock::Text { text: "see".into() },
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: "AAA".into(),
@@ -1360,10 +1359,7 @@ mod tests {
             OpenAiCompatProvider::new("https://api.openai.com/v1".into(), "k".into(), "m".into())
                 .with_session_affinity(true)
                 .with_session_id("sess-1");
-        assert_eq!(
-            forced.session_header(),
-            Some(("x-session-id", "sess-1"))
-        );
+        assert_eq!(forced.session_header(), Some(("x-session-id", "sess-1")));
         let opted_out = OpenAiCompatProvider::new(
             "https://openrouter.ai/api/v1".into(),
             "k".into(),
@@ -1450,11 +1446,17 @@ mod error_body_tests {
         .await;
         let p = OpenAiCompatProvider::new(base, "k".into(), "x".into());
         let err = p.complete(req()).await.unwrap_err();
-        assert!(format!("{err:#}").contains("no access to model x"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("no access to model x"),
+            "{err:#}"
+        );
         assert!(format!("{err:#}").contains("400"), "{err:#}");
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let err = p.complete_streaming(req(), tx).await.unwrap_err();
-        assert!(format!("{err:#}").contains("no access to model x"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("no access to model x"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1471,7 +1473,10 @@ mod error_body_tests {
 
     #[test]
     fn extract_error_message_prefers_json_error_message() {
-        assert_eq!(extract_error_message(r#"{"error":{"message":"boom"}}"#), "boom");
+        assert_eq!(
+            extract_error_message(r#"{"error":{"message":"boom"}}"#),
+            "boom"
+        );
         assert_eq!(extract_error_message(r#"{"error":"plain"}"#), "plain");
         assert_eq!(extract_error_message(r#"{"message":"m"}"#), "m");
         assert_eq!(extract_error_message("  raw text "), "raw text");
@@ -1488,7 +1493,10 @@ mod error_body_tests {
         .await;
         assert_eq!(
             rx.try_recv().unwrap(),
-            StreamEvent::Usage { input: 12, output: 3 }
+            StreamEvent::Usage {
+                input: 12,
+                output: 3
+            }
         );
     }
 }

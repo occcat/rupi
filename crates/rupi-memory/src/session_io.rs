@@ -196,7 +196,9 @@ fn message_entries(id: &str, parent: Option<&str>, msg: &Message) -> Vec<(String
                         "name": name,
                         "arguments": arguments,
                     })),
-                    ContentBlock::ToolResult { .. } | ContentBlock::RedactedThinking { .. } => None,
+                    ContentBlock::ToolResult { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Image { .. } => None,
                 })
                 .collect();
             vec![(

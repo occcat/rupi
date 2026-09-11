@@ -268,7 +268,10 @@ mod tests {
         let e = expect_err("anthropic/claude-x");
         assert!(e.contains("ANTHROPIC_API_KEY"), "{e}");
         let e = expect_err("openrouter/openai/gpt-4o");
-        assert!(e.contains("OPENROUTER") || e.contains("RUPI_API_KEY"), "{e}");
+        assert!(
+            e.contains("OPENROUTER") || e.contains("RUPI_API_KEY"),
+            "{e}"
+        );
         let e = expect_err("azure/gpt-4o");
         assert!(e.contains("AZURE") || e.contains("RUPI_API_KEY"), "{e}");
         let e = expect_err("bedrock/x");

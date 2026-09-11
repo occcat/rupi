@@ -239,7 +239,11 @@ impl ExternalTool {
                 if out.status.success() {
                     rupi_tools::ToolOutput::ok(text)
                 } else {
+<<<<<<< HEAD
                     let err = rupi_tools::decode_utf8(&out.stderr).trim().to_string();
+=======
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+>>>>>>> 672ddfe (修 #9 变基后 CI：Image 匹配与 rustfmt)
                     rupi_tools::ToolOutput::err(format!("exit {}: {err}", out.status))
                 }
             }

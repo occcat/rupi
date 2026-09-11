@@ -515,7 +515,10 @@ impl AnthropicAccumulator {
                     self.stop_reason = Some(s.to_string());
                 }
                 // usage：message_start 给 input_tokens，message_delta 给累计 output_tokens
-                if let Some(n) = data.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                if let Some(n) = data
+                    .pointer("/usage/output_tokens")
+                    .and_then(|x| x.as_u64())
+                {
                     let _ = tx
                         .send(super::StreamEvent::Usage {
                             input: self.input_tokens,
@@ -1343,7 +1346,10 @@ mod tests {
         let body = seen.body.lock().unwrap();
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["stream"], false);
-        assert_eq!(body.pointer("/system/0/text"), Some(&serde_json::json!("sys")));
+        assert_eq!(
+            body.pointer("/system/0/text"),
+            Some(&serde_json::json!("sys"))
+        );
         assert!(body.get("tools").is_none());
         assert!(body.get("thinking").is_none());
     }

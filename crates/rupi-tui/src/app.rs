@@ -896,16 +896,7 @@ where
     // 协作取消：内循环 Esc 置位，主循环在检查点优雅中止（TurnEnd/RunEnd{Aborted} 照常走事件通道）。
     let cancel = rupi_core::CancelFlag::new();
     let fut = agent.run_with_user(
-        provider,
-        session,
-        user,
-        tools,
-        mem,
-        frozen,
-        skills,
-        extensions,
-        &on_event,
-        &cancel,
+        provider, session, user, tools, mem, frozen, skills, extensions, &on_event, &cancel,
     );
     let mut scroll: u16 = 0;
     // 运行中输入的排队缓冲：输入框实时回显（qb 镜像），结束自动跟进

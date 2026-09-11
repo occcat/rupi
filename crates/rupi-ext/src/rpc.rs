@@ -26,9 +26,8 @@ impl RpcHost {
         manifest: ExtensionManifest,
         timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<Self>> {
-        let rpc = Arc::new(
-            StdioRpc::spawn(&manifest.command, &manifest.args, &manifest.env).await?,
-        );
+        let rpc =
+            Arc::new(StdioRpc::spawn(&manifest.command, &manifest.args, &manifest.env).await?);
         let mut incoming = rpc.take_incoming().await.unwrap();
         let host = Arc::new(Self {
             commands: Mutex::new(manifest.commands.clone()),
@@ -114,44 +113,42 @@ impl RpcHost {
                     self.push_hint(&params);
                 }
             }
-            Incoming::Request { id, method, params } => {
-                match method.as_str() {
-                    "registerCommand" => {
-                        if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
-                            self.commands.lock().unwrap().push(ExtensionCommand {
-                                name: name.to_string(),
-                                description: params
-                                    .get("description")
-                                    .and_then(|d| d.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                            });
-                        }
-                        let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
+            Incoming::Request { id, method, params } => match method.as_str() {
+                "registerCommand" => {
+                    if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
+                        self.commands.lock().unwrap().push(ExtensionCommand {
+                            name: name.to_string(),
+                            description: params
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        });
                     }
-                    "subscribe" => {
-                        if let Some(arr) = params.get("events").and_then(|e| e.as_array()) {
-                            let mut set = self.subscribe.lock().unwrap();
-                            for e in arr {
-                                if let Some(s) = e.as_str() {
-                                    set.insert(s.to_string());
-                                }
+                    let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
+                }
+                "subscribe" => {
+                    if let Some(arr) = params.get("events").and_then(|e| e.as_array()) {
+                        let mut set = self.subscribe.lock().unwrap();
+                        for e in arr {
+                            if let Some(s) = e.as_str() {
+                                set.insert(s.to_string());
                             }
                         }
-                        let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
                     }
-                    "ui/hint" => {
-                        self.push_hint(&params);
-                        let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
-                    }
-                    _ => {
-                        let _ = self
-                            .rpc
-                            .respond_error(id, -32601, format!("method not found: {method}"))
-                            .await;
-                    }
+                    let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
                 }
-            }
+                "ui/hint" => {
+                    self.push_hint(&params);
+                    let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
+                }
+                _ => {
+                    let _ = self
+                        .rpc
+                        .respond_error(id, -32601, format!("method not found: {method}"))
+                        .await;
+                }
+            },
         }
     }
 
@@ -183,16 +180,12 @@ impl RpcHost {
     }
 
     pub fn expand_command(&self, name: &str, args: &str) -> Option<String> {
-        let known = self
-            .commands
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c.name == name);
+        let known = self.commands.lock().unwrap().iter().any(|c| c.name == name);
         if !known {
             return None;
         }
-        let timeout = std::time::Duration::from_secs(effective_timeout_secs(self.manifest.timeout_secs));
+        let timeout =
+            std::time::Duration::from_secs(effective_timeout_secs(self.manifest.timeout_secs));
         match block_on_async(self.rpc.call_timeout(
             "commands/execute",
             serde_json::json!({"name": name, "args": args}),
@@ -211,7 +204,8 @@ impl RpcHost {
     }
 
     pub fn call_tool(&self, arguments: serde_json::Value) -> ToolOutput {
-        let timeout = std::time::Duration::from_secs(effective_timeout_secs(self.manifest.timeout_secs));
+        let timeout =
+            std::time::Duration::from_secs(effective_timeout_secs(self.manifest.timeout_secs));
         match block_on_async(self.rpc.call_timeout(
             "tools/call",
             serde_json::json!({"name": self.manifest.name, "arguments": arguments}),

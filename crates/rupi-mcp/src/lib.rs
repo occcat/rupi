@@ -387,8 +387,17 @@ impl McpBridge {
                 ..
             } => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                Self::call_http(client, url, session_id, &self.roots, &push, id, method, params)
-                    .await
+                Self::call_http(
+                    client,
+                    url,
+                    session_id,
+                    &self.roots,
+                    &push,
+                    id,
+                    method,
+                    params,
+                )
+                .await
             }
         }
     }
@@ -433,8 +442,8 @@ impl McpBridge {
             .unwrap_or("")
             .to_string();
         if ctype.contains("text/event-stream") && status.is_success() {
-            let msg =
-                Self::read_sse_stream(client, url, session_id, roots, push, id, method, resp).await?;
+            let msg = Self::read_sse_stream(client, url, session_id, roots, push, id, method, resp)
+                .await?;
             return Self::unwrap_result(method, msg);
         }
         let body = resp.text().await.unwrap_or_default();
@@ -696,8 +705,17 @@ impl McpBridge {
                     watch: self.tool_watch.clone(),
                     server: self.config.name.clone(),
                 };
-                Self::call_http(client, url, session_id, &self.roots, &push, id, method, params)
-                    .await?;
+                Self::call_http(
+                    client,
+                    url,
+                    session_id,
+                    &self.roots,
+                    &push,
+                    id,
+                    method,
+                    params,
+                )
+                .await?;
                 Ok(())
             }
         }
@@ -1392,10 +1410,17 @@ impl McpManager {
                 tracing::warn!("MCP tool name conflict: {name}; first wins");
                 continue;
             }
-            registry.register(Arc::new(McpToolExecutor::new(server, entry.bridge.clone(), t)));
+            registry.register(Arc::new(McpToolExecutor::new(
+                server,
+                entry.bridge.clone(),
+                t,
+            )));
             added.push(name);
         }
-        let desired: Vec<String> = fresh.iter().map(|t| format!("{prefix}{}", t.name)).collect();
+        let desired: Vec<String> = fresh
+            .iter()
+            .map(|t| format!("{prefix}{}", t.name))
+            .collect();
         for gone in current.iter().filter(|n| !desired.contains(n)) {
             registry.unregister(gone);
             tracing::debug!(target: "rupi-mcp", "MCP tool removed: {gone}");

@@ -736,9 +736,7 @@ mod tests {
         let m = Message::from_blocks(
             Role::User,
             vec![
-                ContentBlock::Text {
-                    text: "see".into(),
-                },
+                ContentBlock::Text { text: "see".into() },
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: encode_base64(&[0, 1, 2]),
@@ -748,7 +746,10 @@ mod tests {
         assert!(m.has_images());
         assert!(m.full_text().contains("see"));
         assert!(m.full_text().contains("[image image/png]"));
-        assert_eq!(image_media_type(std::path::Path::new("a.PNG")), Some("image/png"));
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.PNG")),
+            Some("image/png")
+        );
         assert_eq!(image_media_type(std::path::Path::new("x.txt")), None);
         // RFC 4648：`Man` → `TWFu`；空输入空串
         assert_eq!(encode_base64(b"Man"), "TWFu");

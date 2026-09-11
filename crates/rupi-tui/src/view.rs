@@ -237,6 +237,8 @@ mod tests {
         });
         assert_eq!(v.lines.len(), 2);
         assert!(matches!(&v.lines[0], Line::Tool(s) if s.contains("compacting")));
-        assert!(matches!(&v.lines[1], Line::Tool(s) if s.contains("summarized 4") && s.contains("kept 2")));
+        assert!(
+            matches!(&v.lines[1], Line::Tool(s) if s.contains("summarized 4") && s.contains("kept 2"))
+        );
     }
 }
