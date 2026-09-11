@@ -1441,6 +1441,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rupi-agent",
+ "rupi-config",
  "rupi-core",
  "rupi-ext",
  "rupi-llm",
@@ -1455,6 +1456,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "rupi-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

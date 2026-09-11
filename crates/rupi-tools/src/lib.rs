@@ -103,6 +103,15 @@ impl ToolRegistry {
         self.tools.remove(name).is_some()
     }
 
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    /// `--tools` / `--exclude-tools` 过滤（不改工具实现，只改注册表可见集）。
+    pub fn retain<F: Fn(&str) -> bool>(&mut self, f: F) {
+        self.tools.retain(|k, _| f(k));
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|t| t.definition()).collect()
     }

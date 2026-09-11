@@ -91,6 +91,11 @@ impl Message {
             .any(|b| matches!(b, ContentBlock::Image { .. }))
     }
 
+    /// 估算本条消息送模型时的 token 数（文本 + 工具块）。
+    pub fn estimate_tokens(&self) -> u64 {
+        estimate_tokens(&self.full_text())
+    }
+
     pub fn full_text(&self) -> String {
         self.blocks
             .iter()
@@ -173,9 +178,14 @@ impl SessionTree {
             .collect()
     }
 
-    /// 历史总字符数（压缩触发依据）。
+    /// 历史总字符数（展示/兼容；压实触发改走 [`Self::history_tokens`]）。
     pub fn history_chars(&self) -> usize {
         self.history().iter().map(|m| m.full_text().len()).sum()
+    }
+
+    /// 当前分支历史的估算 token 数（对标 Pi contextTokens）。
+    pub fn history_tokens(&self) -> u64 {
+        self.history().iter().map(|m| m.estimate_tokens()).sum()
     }
 
     /// 记录压缩摘要：`through` 为摘要覆盖到的最后一个节点 id。
@@ -184,20 +194,50 @@ impl SessionTree {
         self.summary_through = Some(through);
     }
 
-    /// prompt 用窗口：无摘要时全量；有摘要时 `[摘要, 近 keep_last 条]`。
+    /// prompt 用窗口：无摘要时全量；有摘要时 `[摘要, summary_through 之后的消息]`。
+    /// `keep_last` 仅在缺少 `summary_through` 时作尾部条数兜底（兼容旧调用）。
     /// 树本身不动，rewind/branch 语义不受影响。
     pub fn prompt_history(&self, keep_last: usize) -> Vec<Message> {
         let all: Vec<Message> = self.history().into_iter().cloned().collect();
         let Some(summary) = &self.summary else {
             return all;
         };
-        let start = all.len().saturating_sub(keep_last);
+        let start = self
+            .summary_through
+            .as_ref()
+            .and_then(|t| self.current_path.iter().position(|id| id == t))
+            .map(|i| i + 1)
+            .unwrap_or_else(|| all.len().saturating_sub(keep_last));
         let mut out = vec![Message::text(
             Role::System,
             format!("[Conversation summary so far]\n{summary}"),
         )];
-        out.extend(all[start..].iter().cloned());
+        if start < all.len() {
+            out.extend(all[start..].iter().cloned());
+        }
         out
+    }
+
+    /// 从末尾累加 token，保留至少 `keep_recent_tokens`；返回应被摘要的前缀长度。
+    /// 整段都不够切（或空）时返回 `None`。
+    pub fn compaction_cut(&self, keep_recent_tokens: usize) -> Option<usize> {
+        let hist = self.history();
+        if hist.is_empty() {
+            return None;
+        }
+        let mut acc = 0u64;
+        let mut kept = 0usize;
+        for m in hist.iter().rev() {
+            acc = acc.saturating_add(m.estimate_tokens());
+            kept += 1;
+            if acc >= keep_recent_tokens as u64 {
+                break;
+            }
+        }
+        if kept >= hist.len() {
+            return None;
+        }
+        Some(hist.len() - kept)
     }
 
     /// 分叉：从 `from_node` 切出一条新游标（side-quest 修工具不污染主上下文）。
@@ -383,7 +423,10 @@ pub enum AgentEvent {
     CompactionStart,
     /// 压实结束（对标上游 `compaction_end`）：`summarized` 为被摘要的消息数，
     /// `kept` 为保留的尾部条数。
-    CompactionEnd { summarized: usize, kept: usize },
+    CompactionEnd {
+        summarized: usize,
+        kept: usize,
+    },
     /// 本回合模型用量（provider 在流末尾给出；未给则不发射）。对标 pi-ai usage。
     Usage {
         input_tokens: u64,
@@ -456,6 +499,23 @@ impl CancelFlag {
             self.inner.notify.notified().await;
         }
     }
+}
+
+/// 混合估算：ASCII 约 4 字符/token，非 ASCII（含 CJK）约 1 字/token。
+/// 无 tiktoken 依赖；provider 回报的 `usage` 可在上层校准。
+pub fn estimate_tokens(text: &str) -> u64 {
+    let mut tokens = 0u64;
+    let mut ascii_run = 0u64;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+        } else {
+            tokens += ascii_run.div_ceil(4);
+            ascii_run = 0;
+            tokens += 1;
+        }
+    }
+    tokens + ascii_run.div_ceil(4)
 }
 
 /// 工具定义：JSON Schema 描述参数；`prompt_snippet` 为必填——Pi 若缺了它就不会把工具列入系统提示。
@@ -611,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_history_uses_summary_plus_window() {
+    fn prompt_history_uses_summary_plus_after_through() {
         let mut s = SessionTree::new();
         for i in 0..5 {
             s.push(Message::text(Role::User, format!("msg {i}")));
@@ -620,11 +680,26 @@ mod tests {
         assert_eq!(s.prompt_history(2).len(), 5);
         let through = s.current_path[2].clone();
         s.set_summary("early stuff".into(), through);
-        // 有摘要：1 条摘要 + 近 2 条
-        let w = s.prompt_history(2);
+        // 有摘要：1 条摘要 + through 之后（msg 3/4），keep 参数不再切片
+        let w = s.prompt_history(99);
         assert_eq!(w.len(), 3);
         assert!(w[0].full_text().contains("early stuff"));
         assert!(w[2].full_text().contains("msg 4"));
+    }
+
+    #[test]
+    fn estimate_tokens_ascii_and_cjk() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens("你好"), 2);
+        assert!(estimate_tokens("hello 世界") >= 3);
+        let mut s = SessionTree::new();
+        s.push(Message::text(Role::User, "abcd"));
+        assert_eq!(s.history_tokens(), 1);
+        assert_eq!(s.compaction_cut(1), None);
+        s.push(Message::text(Role::User, "efghijkl"));
+        assert_eq!(s.compaction_cut(1), Some(1));
     }
 
     #[test]

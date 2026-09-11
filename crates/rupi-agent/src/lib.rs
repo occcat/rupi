@@ -24,14 +24,21 @@ pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
 pub mod discovery;
 pub mod hooks;
+pub mod tokens;
 pub use discovery::{default_always, DiscoveryConfig, ScoredHit};
 pub use hooks::{
     DenyToolsHook, HookDecision, RecordedCall, RecordingHook, RedirectCommandHook, ToolHook,
+};
+pub use tokens::{
+    context_window_for, rates_for, TokenMeter, DEFAULT_CONTEXT_WINDOW, DEFAULT_KEEP_RECENT_TOKENS,
+    DEFAULT_RESERVE_TOKENS,
 };
 
 #[derive(Clone)]
 pub struct PromptBuilder {
     pub base: String,
+    /// `--append-system-prompt` / APPEND_SYSTEM.md 追加块（在 base 之后、记忆之前）。
+    pub append: String,
     /// 上下文文件搜索根：`(cwd, agent_dir)`。每 turn 重读拼块（改完即生效）；
     /// `None` 则不拼（单测/内嵌调用默认）。
     pub context_dirs: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -41,8 +48,14 @@ impl PromptBuilder {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
+            append: String::new(),
             context_dirs: None,
         }
+    }
+
+    pub fn with_append(mut self, append: impl Into<String>) -> Self {
+        self.append = append.into();
+        self
     }
 
     pub fn with_context_dirs(
@@ -63,6 +76,13 @@ impl PromptBuilder {
         extensions: &[Arc<dyn Extension>],
     ) -> String {
         let mut s = self.base.clone();
+        if !self.append.is_empty() {
+            s.push('\n');
+            s.push_str(&self.append);
+            if !self.append.ends_with('\n') {
+                s.push('\n');
+            }
+        }
         s.push_str(&mem.system_block(frozen));
         // 项目上下文（AGENTS.md 系）：记忆之后、skill 索引之前（对标上游相对位置）。
         if let Some((cwd, agent_dir)) = self.context_dirs.as_ref() {
@@ -117,10 +137,20 @@ struct PendingCall {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompressionOverride {
-    #[serde(default)]
-    pub threshold_chars: Option<usize>,
-    #[serde(default)]
-    pub keep_last: Option<usize>,
+    #[serde(default, alias = "reserveTokens", alias = "threshold_chars")]
+    pub reserve_tokens: Option<usize>,
+    #[serde(default, alias = "keepRecentTokens", alias = "keep_last")]
+    pub keep_recent_tokens: Option<usize>,
+    #[serde(default, alias = "contextWindow")]
+    pub context_window: Option<usize>,
+}
+
+/// 本轮压实参数：`used + reserve > window` 触发；切点按 `keep_recent_tokens` 从尾部累加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionParams {
+    pub reserve_tokens: usize,
+    pub keep_recent_tokens: usize,
+    pub context_window: usize,
 }
 
 /// 解析压实覆盖 JSON（`RUPI_COMPRESSION_OVERRIDES`）：
@@ -165,11 +195,17 @@ pub struct AgentLoop {
     /// 后台 review：主循环结束后安静复盘，提炼记忆/Skill 建议。默认关闭。
     pub reviewer: Option<Arc<dyn Reviewer>>,
     pub on_suggestion: Option<Arc<dyn Fn(ReviewSuggestion) + Send + Sync>>,
-    /// 会话压缩：历史超 `compress_threshold_chars` 时摘要最旧部分，只把摘要 + 近期送模型。
-    pub compress_threshold_chars: usize,
-    pub compress_keep_last: usize,
-    /// 按模型压实覆盖：`provider.name()/model_id` → 阈值/保留条数（见 [`CompressionOverride`]）。
+    /// 会话压缩：`history_tokens > context_window - reserve_tokens` 时摘要最旧部分。
+    pub reserve_tokens: usize,
+    pub keep_recent_tokens: usize,
+    /// 0 = 按模型价目表窗口；单测可 `with_context_window` 钉死。
+    pub context_window: usize,
+    pub compaction_enabled: bool,
+    /// 按模型压实覆盖：`provider.name()/model_id` → reserve/keep/window。
     pub compress_overrides: HashMap<String, CompressionOverride>,
+    /// `--tools` 全量白名单（含 memory/skill）；`None` 不过滤。
+    pub tool_allow: Option<HashSet<String>>,
+    pub tool_deny: HashSet<String>,
     /// 权限门：默认全放行；计划模式/规则/审批按需装配。
     pub policy: Arc<dyn Policy>,
     pub approver: Option<Arc<dyn Approver>>,
@@ -198,9 +234,13 @@ impl AgentLoop {
             ),
             reviewer: None,
             on_suggestion: None,
-            compress_threshold_chars: 60_000,
-            compress_keep_last: 20,
+            reserve_tokens: tokens::DEFAULT_RESERVE_TOKENS,
+            keep_recent_tokens: tokens::DEFAULT_KEEP_RECENT_TOKENS,
+            context_window: 0,
+            compaction_enabled: true,
             compress_overrides: HashMap::new(),
+            tool_allow: None,
+            tool_deny: HashSet::new(),
             policy: Arc::new(policy::AllowAll),
             approver: None,
             plan_mode: false,
@@ -222,10 +262,40 @@ impl AgentLoop {
         self
     }
 
-    pub fn with_compression(mut self, threshold_chars: usize, keep_last: usize) -> Self {
-        self.compress_threshold_chars = threshold_chars;
-        self.compress_keep_last = keep_last;
+    pub fn with_compression(mut self, reserve_tokens: usize, keep_recent_tokens: usize) -> Self {
+        self.reserve_tokens = reserve_tokens;
+        self.keep_recent_tokens = keep_recent_tokens;
         self
+    }
+
+    pub fn with_context_window(mut self, window: usize) -> Self {
+        self.context_window = window;
+        self
+    }
+
+    pub fn with_compaction_enabled(mut self, enabled: bool) -> Self {
+        self.compaction_enabled = enabled;
+        self
+    }
+
+    pub fn with_tool_filter(
+        mut self,
+        allow: Option<Vec<String>>,
+        deny: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.tool_allow = allow.map(|v| v.into_iter().collect());
+        self.tool_deny = deny.into_iter().collect();
+        self
+    }
+
+    fn tool_visible(&self, name: &str) -> bool {
+        if self.tool_deny.contains(name) {
+            return false;
+        }
+        match &self.tool_allow {
+            None => true,
+            Some(a) => a.contains(name),
+        }
     }
 
     /// 按模型压实覆盖（`RUPI_COMPRESSION_OVERRIDES` 解析结果直传）。
@@ -240,17 +310,29 @@ impl AgentLoop {
     /// 本轮压实参数：命中 `name/model_id` 覆盖的字段优先，其余回全局。
     /// 无 model_id 的 provider（如 Mock）永远走全局——覆盖键写了也命中不了，
     /// 宁可保守用全局，也不猜模型。
-    pub fn compression_for(&self, provider: &dyn LlmProvider) -> (usize, usize) {
+    pub fn compression_for(&self, provider: &dyn LlmProvider) -> CompressionParams {
         let key = provider
             .model_id()
             .map(|m| format!("{}/{}", provider.name(), m));
         let o = key.as_deref().and_then(|k| self.compress_overrides.get(k));
-        (
-            o.and_then(|x| x.threshold_chars)
-                .unwrap_or(self.compress_threshold_chars),
-            o.and_then(|x| x.keep_last)
-                .unwrap_or(self.compress_keep_last),
-        )
+        let model = provider.model_id().unwrap_or("");
+        let window = o
+            .and_then(|x| x.context_window)
+            .or(if self.context_window > 0 {
+                Some(self.context_window)
+            } else {
+                None
+            })
+            .unwrap_or_else(|| tokens::context_window_for(model));
+        CompressionParams {
+            reserve_tokens: o
+                .and_then(|x| x.reserve_tokens)
+                .unwrap_or(self.reserve_tokens),
+            keep_recent_tokens: o
+                .and_then(|x| x.keep_recent_tokens)
+                .unwrap_or(self.keep_recent_tokens),
+            context_window: window,
+        }
     }
 
     pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
@@ -439,6 +521,7 @@ impl AgentLoop {
         let mut all_tools = tools.definitions();
         all_tools.extend(mem.all_tool_definitions());
         all_tools.extend(skills.tool_definitions());
+        all_tools.retain(|t| self.tool_visible(&t.name));
         // 记忆 prefetch：注入到本轮（不污染冻结快照）；寒暄门在 manager 内
         let recalled = mem.prefetch_all(&user_input).await;
         // 回想指示紧跟 prefetch（Hermes describe_recall 同约）：有注入才发射，
@@ -487,7 +570,8 @@ impl AgentLoop {
             if self.plan_mode {
                 system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
             }
-            let history: Vec<Message> = session.prompt_history(self.compression_for(provider).1);
+            let history: Vec<Message> =
+                session.prompt_history(self.compression_for(provider).keep_recent_tokens);
             let req = ChatRequest {
                 system,
                 messages: history,
@@ -569,9 +653,7 @@ impl AgentLoop {
                     rupi_llm::StreamEvent::TextDelta(delta) => {
                         on_event(AgentEvent::TextDelta { delta })
                     }
-                    rupi_llm::StreamEvent::Usage { input, output } => {
-                        usage = Some((input, output))
-                    }
+                    rupi_llm::StreamEvent::Usage { input, output } => usage = Some((input, output)),
                 }
             }
             if let Some((input_tokens, output_tokens)) = usage {
@@ -950,15 +1032,21 @@ impl AgentLoop {
         on_event: &(dyn Fn(AgentEvent) + Sync),
         extra_prompt: Option<&str>,
     ) {
-        // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的阈值。
-        let (threshold_chars, keep_last) = self.compression_for(provider);
+        // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的 reserve/keep。
+        let params = self.compression_for(provider);
+        let keep_recent = params.keep_recent_tokens;
         if !force {
-            if session.history_chars() <= threshold_chars {
+            if !self.compaction_enabled {
                 return;
             }
-            // 已压缩过且新增不足一窗：跳过，避免每轮重复烧模型
-            // tail = 上次压缩点之后未压缩的消息数；首轮压缩后 tail == keep，
-            // 新增 new_count 条后 tail == keep + new_count；new_count <= keep 时跳过。
+            let used = session.history_tokens() as usize;
+            // reserve >= window：没有可触发区间（含单测 `usize::MAX` 哨兵）。
+            if params.reserve_tokens >= params.context_window
+                || used <= params.context_window.saturating_sub(params.reserve_tokens)
+            {
+                return;
+            }
+            // 已压缩过且新增不足约两窗 keepRecent：跳过，避免每轮重复烧模型。
             if let Some(through) = &session.summary_through {
                 if session.summary.is_some() {
                     let pos = session
@@ -967,17 +1055,22 @@ impl AgentLoop {
                         .position(|id| id == through)
                         .map(|i| i + 1)
                         .unwrap_or(0);
-                    if session.current_path.len().saturating_sub(pos) <= keep_last * 2 {
+                    let tail: u64 = session
+                        .history()
+                        .iter()
+                        .skip(pos)
+                        .map(|m| m.estimate_tokens())
+                        .sum();
+                    if tail <= (keep_recent as u64).saturating_mul(2) {
                         return;
                     }
                 }
             }
         }
         let total = session.current_path.len();
-        if total <= keep_last {
+        let Some(cut) = session.compaction_cut(keep_recent) else {
             return;
-        }
-        let cut = total - keep_last;
+        };
         let chunk: Vec<String> = session.history()[..cut]
             .iter()
             .map(|m| m.full_text())
@@ -1035,9 +1128,13 @@ impl AgentLoop {
         session.set_summary(summary, through);
         on_event(AgentEvent::CompactionEnd {
             summarized: cut,
-            kept: keep_last,
+            kept: total - cut,
         });
-        tracing::info!("session compressed: {total} msgs, kept last {keep_last}");
+        tracing::info!(
+            "session compressed: {total} msgs, kept last {} ({} tokens budget)",
+            total - cut,
+            keep_recent
+        );
     }
 
     /// 后台 review：主流程结束后安静复盘，非空建议推给 `on_suggestion`。永不抛错。
@@ -1070,7 +1167,10 @@ fn extract_file_ops(messages: &[&Message]) -> (Vec<String>, Vec<String>) {
             continue;
         }
         for b in &m.blocks {
-            if let ContentBlock::ToolCall { name, arguments, .. } = b {
+            if let ContentBlock::ToolCall {
+                name, arguments, ..
+            } = b
+            {
                 let Some(path) = arguments.get("path").and_then(|v| v.as_str()) else {
                     continue;
                 };
@@ -1113,7 +1213,10 @@ fn parse_file_op_tags(summary: &str) -> (Vec<String>, Vec<String>) {
             .map(str::to_string)
             .collect()
     }
-    (section(summary, "read-files"), section(summary, "modified-files"))
+    (
+        section(summary, "read-files"),
+        section(summary, "modified-files"),
+    )
 }
 
 /// 旧摘要喂模型前剥掉同名块（合并后重贴权威表，避免模型复述/篡改旧列表）。
@@ -1147,7 +1250,10 @@ fn strip_file_op_tags(summary: &str) -> String {
 fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = vec![];
     if !read_files.is_empty() {
-        sections.push(format!("<read-files>\n{}\n</read-files>", read_files.join("\n")));
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
     }
     if !modified_files.is_empty() {
         sections.push(format!(
@@ -1166,7 +1272,12 @@ fn merged_file_lists(previous: Option<&str>, chunk: &[&Message]) -> (Vec<String>
     use std::collections::BTreeSet;
     let (old_read, old_modified) = previous.map(parse_file_op_tags).unwrap_or_default();
     let (fresh_read, fresh_modified) = extract_file_ops(chunk);
-    let read: Vec<String> = old_read.into_iter().chain(fresh_read).collect::<BTreeSet<_>>().into_iter().collect();
+    let read: Vec<String> = old_read
+        .into_iter()
+        .chain(fresh_read)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let modified: Vec<String> = old_modified
         .into_iter()
         .chain(fresh_modified)
@@ -1210,8 +1321,8 @@ impl Extension for ToolExtension {
 mod tests {
     use super::*;
     use rupi_llm::{ChatResponse, MockProvider};
-    use rupi_memory::MemoryStore;
     use rupi_memory::MemoryProvider;
+    use rupi_memory::MemoryStore;
 
     #[test]
     fn builder_injects_agents_md_between_memory_and_skills() {
@@ -1227,9 +1338,13 @@ mod tests {
         let mem = MemoryManager::new(MemoryStore::new(base.join("mem")));
         let frozen = FrozenMemory::default();
         let skills = SkillRegistry::default();
-        let plain = PromptBuilder::new("BASE")
-            .build(&frozen, &mem, &skills, &[], &[]);
+        let plain = PromptBuilder::new("BASE").build(&frozen, &mem, &skills, &[], &[]);
         assert!(!plain.contains("project_context"), "{plain}");
+        let appended = PromptBuilder::new("BASE")
+            .with_append("APPEND_BLOCK")
+            .build(&frozen, &mem, &skills, &[], &[]);
+        assert!(appended.contains("BASE"), "{appended}");
+        assert!(appended.contains("APPEND_BLOCK"), "{appended}");
         let with = PromptBuilder::new("BASE")
             .with_context_dirs(proj, home)
             .build(&frozen, &mem, &skills, &[], &[]);
@@ -1278,8 +1393,7 @@ mod tests {
         let agent = AgentLoop::new(3);
         let mut session = SessionTree::new();
         let tools = ToolRegistry::with_builtins();
-        let home =
-            std::env::temp_dir().join(format!("rupi-agent-cancel0-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rupi-agent-cancel0-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         let events = std::sync::Mutex::new(vec![]);
         let cancel = CancelFlag::new();
@@ -1307,7 +1421,10 @@ mod tests {
             "置位后不得调模型"
         );
         let ev = events.lock().unwrap().join("\n");
-        assert!(!ev.contains("TurnStart"), "首轮前取消不应有 TurnStart：\n{ev}");
+        assert!(
+            !ev.contains("TurnStart"),
+            "首轮前取消不应有 TurnStart：\n{ev}"
+        );
         assert!(ev.contains("RunEnd") && ev.contains("Aborted"), "{ev}");
     }
 
@@ -1340,8 +1457,7 @@ mod tests {
         let agent = AgentLoop::new(3);
         let mut session = SessionTree::new();
         let tools = ToolRegistry::with_builtins();
-        let home =
-            std::env::temp_dir().join(format!("rupi-agent-cancel1-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rupi-agent-cancel1-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         let events = std::sync::Mutex::new(vec![]);
         let cancel = CancelFlag::new();
@@ -1445,17 +1561,18 @@ mod tests {
                 "{mode:?}: {tool_texts:?}"
             );
             let ev = events.lock().unwrap().join("\n");
-            assert!(ev.contains("TurnEnd") && ev.contains("Aborted"), "{mode:?}: {ev}");
+            assert!(
+                ev.contains("TurnEnd") && ev.contains("Aborted"),
+                "{mode:?}: {ev}"
+            );
         }
     }
 
     async fn mem_with_jsonl_history(
         tag: &str,
     ) -> (MemoryManager, FrozenMemory, std::path::PathBuf) {
-        let home = std::env::temp_dir().join(format!(
-            "rupi-agent-recall-{tag}-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("rupi-agent-recall-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let mut mem = MemoryManager::new(MemoryStore::new(home.clone()));
         let mut p = rupi_memory::JsonlProvider::new(10);
@@ -1497,7 +1614,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(reason, StopReason::Done));
-        assert!(hit.load(std::sync::atomic::Ordering::SeqCst), "应发射回想指示");
+        assert!(
+            hit.load(std::sync::atomic::Ordering::SeqCst),
+            "应发射回想指示"
+        );
         assert_eq!(*seen.lock().unwrap(), "🧠 jsonl — recalled 2 memories");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1530,7 +1650,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!hit.load(std::sync::atomic::Ordering::SeqCst), "寒暄不应有回想指示");
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::SeqCst),
+            "寒暄不应有回想指示"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1558,10 +1681,7 @@ mod tests {
         let (read, modified) = extract_file_ops(&refs);
         // 先读后改的 a 归已改；bash 无 path 忽略；用户消息不算
         assert_eq!(read, vec!["b.txt".to_string()]);
-        assert_eq!(
-            modified,
-            vec!["a.txt".to_string(), "c.txt".to_string()]
-        );
+        assert_eq!(modified, vec!["a.txt".to_string(), "c.txt".to_string()]);
         // 空输入 → 空表 → 无块
         assert_eq!(
             extract_file_ops(&[]),
@@ -1573,7 +1693,8 @@ mod tests {
     #[tokio::test]
     async fn compress_appends_file_lists_for_compressed_range_only() {
         // keep=2/total=6 → 前 4 条被压；尾部工具调用不进摘要
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        // 短消息：keepRecent=7 token 恰好留尾 2 条（tail+write），前 4 条进摘要。
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 7);
         let mut session = SessionTree::new();
         session.push(Message::text(Role::User, "start"));
         session.push(tool_msg("edit", serde_json::json!({"path": "old.txt"})));
@@ -1592,7 +1713,10 @@ mod tests {
             .await;
         let s = session.summary.clone().expect("summary");
         assert!(s.starts_with("SUM"), "{s}");
-        assert!(s.contains("<modified-files>\nold.txt\n</modified-files>"), "{s}");
+        assert!(
+            s.contains("<modified-files>\nold.txt\n</modified-files>"),
+            "{s}"
+        );
         assert!(s.contains("<read-files>\nref.txt\n</read-files>"), "{s}");
         assert!(!s.contains("tail.txt"), "kept 尾部足迹不应进摘要：{s}");
     }
@@ -1600,7 +1724,7 @@ mod tests {
     #[tokio::test]
     async fn compress_merges_file_lists_across_rounds() {
         // 第二轮压实：旧块 ∪ 新足迹，且同名块只出现一次
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
         let mut session = SessionTree::new();
         for i in 0..3 {
             session.push(Message::text(
@@ -1617,8 +1741,7 @@ mod tests {
             "prev prose\n\n<modified-files>\nancient.txt\n</modified-files>".into(),
             through,
         );
-        let home =
-            std::env::temp_dir().join(format!("rupi-agent-fileops2-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rupi-agent-fileops2-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         agent
             .force_compress(
@@ -1630,13 +1753,21 @@ mod tests {
         let s = session.summary.clone().expect("summary");
         assert!(s.contains("ancient.txt"), "{s}");
         assert!(s.contains("new.txt"), "{s}");
-        assert_eq!(s.matches("<modified-files>").count(), 1, "块只能出现一次：{s}");
-        assert_eq!(s.matches("<read-files>").count(), 0, "无读足迹不应有空块：{s}");
+        assert_eq!(
+            s.matches("<modified-files>").count(),
+            1,
+            "块只能出现一次：{s}"
+        );
+        assert_eq!(
+            s.matches("<read-files>").count(),
+            0,
+            "无读足迹不应有空块：{s}"
+        );
     }
 
     #[tokio::test]
     async fn compress_without_tool_calls_appends_no_tags() {
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
         let mut session = SessionTree::new();
         for i in 0..4 {
             session.push(Message::text(
@@ -1644,8 +1775,7 @@ mod tests {
                 format!("plain message number {i} with padding xxxxxxxxxx"),
             ));
         }
-        let home =
-            std::env::temp_dir().join(format!("rupi-agent-fileops3-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rupi-agent-fileops3-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         agent
             .force_compress(
@@ -1662,7 +1792,7 @@ mod tests {
         // 对标上游 compaction_start/end：真压实发射起止事件（6 条压前 4 留后 2），
         // 跳过路径（阈值未命中）静默无事件。
         use std::sync::Mutex;
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
         let mut session = SessionTree::new();
         for i in 0..6 {
             session.push(Message::text(
@@ -1670,8 +1800,7 @@ mod tests {
                 format!("long message number {i} with padding xxxxxxxxxx"),
             ));
         }
-        let home =
-            std::env::temp_dir().join(format!("rupi-agent-compev-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("rupi-agent-compev-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         let seen = Mutex::new(Vec::<AgentEvent>::new());
         agent
@@ -1705,8 +1834,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_compress_compacts_without_threshold() {        // /compact 直调 force：阈值检查跳过，条数够切即压；短历史无操作不烧模型。
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+    async fn force_compress_compacts_without_threshold() {
+        // /compact 直调 force：阈值检查跳过，条数够切即压；短历史无操作不烧模型。
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
         let mut session = SessionTree::new();
         for i in 0..6 {
             session.push(Message::text(
@@ -1751,7 +1881,7 @@ mod tests {
     async fn force_compress_with_prompt_appends_focus() {
         // `/compact <prompt>`：自定义指令拼进摘要 system（Additional focus），
         // 空串回退默认指令。
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
         let home = std::env::temp_dir().join(format!("rupi-agent-cprompt-{}", std::process::id()));
         let mem = MemoryManager::new(MemoryStore::new(home));
         let mk_session = || {
@@ -1767,7 +1897,13 @@ mod tests {
         let provider = MockProvider::new(vec![MockProvider::text_response("S")]);
         let mut session = mk_session();
         agent
-            .force_compress_with_prompt(&provider, &mut session, &mem, &|_| {}, Some("keep file list"))
+            .force_compress_with_prompt(
+                &provider,
+                &mut session,
+                &mem,
+                &|_| {},
+                Some("keep file list"),
+            )
             .await;
         let systems = provider.seen_systems.lock().unwrap().clone();
         assert_eq!(systems.len(), 1);
@@ -1789,7 +1925,9 @@ mod tests {
             MockProvider::text_response("SUMMARY: talked about tea"),
             MockProvider::text_response("hello"),
         ]);
-        let agent = AgentLoop::new(3).with_compression(50, 2);
+        let agent = AgentLoop::new(3)
+            .with_compression(20, 20)
+            .with_context_window(50);
         let mut session = SessionTree::new();
         for i in 0..6 {
             session.push(Message::text(
@@ -1826,7 +1964,9 @@ mod tests {
 
     #[tokio::test]
     async fn compress_skips_when_little_new_content() {
-        let agent = AgentLoop::new(3).with_compression(50, 2);
+        let agent = AgentLoop::new(3)
+            .with_compression(20, 20)
+            .with_context_window(50);
         let mut session = SessionTree::new();
         for i in 0..6 {
             session.push(Message::text(
@@ -1858,7 +1998,10 @@ mod tests {
                 anyhow::bail!("down")
             }
         }
-        let agent = AgentLoop::new(3).with_compression(10, 1);
+        // "message N padding yyyyy" ≈ 6 token；keep=6 留 1 条，prompt = 摘要+1。
+        let agent = AgentLoop::new(3)
+            .with_compression(10, 6)
+            .with_context_window(20);
         let mut session = SessionTree::new();
         for i in 0..4 {
             session.push(Message::text(
@@ -1913,32 +2056,63 @@ mod tests {
         m.insert(
             "anthropic/claude-x".to_string(),
             CompressionOverride {
-                threshold_chars: Some(100),
-                keep_last: Some(3),
+                reserve_tokens: Some(100),
+                keep_recent_tokens: Some(3),
+                context_window: Some(50_000),
             },
         );
         m.insert(
             "gemini/gemini-y".to_string(),
             CompressionOverride {
-                threshold_chars: None,
-                keep_last: Some(7),
+                reserve_tokens: None,
+                keep_recent_tokens: Some(7),
+                context_window: None,
             },
         );
         let agent = AgentLoop::new(3)
             .with_compression(9999, 20)
+            .with_context_window(80_000)
             .with_compression_overrides(m);
         // 全命中
         let p = named("anthropic", "claude-x", vec![]);
-        assert_eq!(agent.compression_for(&p), (100, 3));
-        // 部分覆盖：阈值回全局
+        assert_eq!(
+            agent.compression_for(&p),
+            CompressionParams {
+                reserve_tokens: 100,
+                keep_recent_tokens: 3,
+                context_window: 50_000
+            }
+        );
+        // 部分覆盖：reserve/window 回全局
         let g = named("gemini", "gemini-y", vec![]);
-        assert_eq!(agent.compression_for(&g), (9999, 7));
+        assert_eq!(
+            agent.compression_for(&g),
+            CompressionParams {
+                reserve_tokens: 9999,
+                keep_recent_tokens: 7,
+                context_window: 80_000
+            }
+        );
         // 未登录模型走全局
         let other = named("anthropic", "claude-z", vec![]);
-        assert_eq!(agent.compression_for(&other), (9999, 20));
+        assert_eq!(
+            agent.compression_for(&other),
+            CompressionParams {
+                reserve_tokens: 9999,
+                keep_recent_tokens: 20,
+                context_window: 80_000
+            }
+        );
         // 无 model_id（Mock/动态网关）永远走全局，不猜模型
         let mock = MockProvider::new(vec![]);
-        assert_eq!(agent.compression_for(&mock), (9999, 20));
+        assert_eq!(
+            agent.compression_for(&mock),
+            CompressionParams {
+                reserve_tokens: 9999,
+                keep_recent_tokens: 20,
+                context_window: 80_000
+            }
+        );
     }
 
     #[tokio::test]
@@ -1956,13 +2130,15 @@ mod tests {
         m.insert(
             "anthropic/claude-x".to_string(),
             CompressionOverride {
-                threshold_chars: Some(10),
-                keep_last: Some(2),
+                reserve_tokens: Some(10),
+                keep_recent_tokens: Some(20),
+                context_window: Some(40),
             },
         );
-        // 全局阈值天花板：无覆盖时不压；覆盖把阈值拉到 10 才压
+        // 全局窗口极大：无覆盖时不压；覆盖把 window/reserve 拉到可触发才压
         let agent = AgentLoop::new(3)
             .with_compression(1_000_000, 5)
+            .with_context_window(2_000_000)
             .with_compression_overrides(m);
         let provider = named(
             "anthropic",
@@ -1971,7 +2147,7 @@ mod tests {
         );
         agent.maybe_compress(&provider, &mut session, &mem).await;
         assert!(session.summary.as_ref().unwrap().contains("SUMMARY-O"));
-        // keep_last=2：切点落在 total-keep-1 处（6-2-1=3），不是全局 keep=5 的切点 0
+        // keep_recent≈20 token：两条 padding 消息，切点仍在 path[3]（前 4 条被压）
         assert_eq!(
             session.summary_through.as_deref(),
             Some(session.current_path[3].as_str())
@@ -1985,8 +2161,13 @@ mod tests {
         let m = parse_compression_overrides(
             r#"{"anthropic/claude-x": {"threshold_chars": 30000, "keep_last": 10}}"#,
         );
-        assert_eq!(m["anthropic/claude-x"].threshold_chars, Some(30000));
-        assert_eq!(m["anthropic/claude-x"].keep_last, Some(10));
+        assert_eq!(m["anthropic/claude-x"].reserve_tokens, Some(30000));
+        assert_eq!(m["anthropic/claude-x"].keep_recent_tokens, Some(10));
+        let m = parse_compression_overrides(
+            r#"{"openai/gpt-x": {"reserveTokens": 8192, "keepRecentTokens": 4000}}"#,
+        );
+        assert_eq!(m["openai/gpt-x"].reserve_tokens, Some(8192));
+        assert_eq!(m["openai/gpt-x"].keep_recent_tokens, Some(4000));
         // 非法条目（未知字段/非对象/负数）逐条跳过，合法条保留，主循环不崩
         let m = parse_compression_overrides(
             r#"{"a/b": {"threshold_chars": 5}, "c/d": {"threshold": 1}, "e/f": "nope", "g/h": {"keep_last": -3}}"#,
@@ -2058,9 +2239,9 @@ mod tests {
 
     #[tokio::test]
     async fn overflow_forces_compress_and_retries_turn() {
-        // 默认阈值 60k：短消息不触发普通压实；首轮聊天报溢出 → 强制压实 → 重发成功。
-        // 25 条 > keep 20，force 切得动（cut=5/6）。
-        let agent = AgentLoop::new(3);
+        // 短消息不触发普通压实；首轮聊天报溢出 → 强制压实 → 重发成功。
+        // 25 条 × ~1 token，keepRecent=10 才能切（默认 20k 切不动）。
+        let agent = AgentLoop::new(3).with_compression(16_384, 10);
         let provider = FlakyOverflow {
             fail_times: 1,
             calls: std::sync::Mutex::new(0),
@@ -2089,7 +2270,7 @@ mod tests {
                 anyhow::bail!("anthropic 401: invalid x-api-key")
             }
         }
-        let agent = AgentLoop::new(3);
+        let agent = AgentLoop::new(3).with_compression(16_384, 10);
         let mut session = long_session(25);
         let tools = ToolRegistry::with_builtins();
         let home =
@@ -2117,7 +2298,7 @@ mod tests {
 
     #[tokio::test]
     async fn overflow_gives_up_after_bounded_recoveries() {
-        let agent = AgentLoop::new(3);
+        let agent = AgentLoop::new(3).with_compression(16_384, 10);
         let provider = FlakyOverflow {
             fail_times: 99,
             calls: std::sync::Mutex::new(0),
@@ -2186,7 +2367,10 @@ mod tests {
             MockProvider::text_response("final"),
         ];
         let provider = MockProvider::new(script);
-        let agent = AgentLoop::new(5).with_compression(10, 1);
+        // 工具结果入树后约 15 token；window=20 / reserve=10 → used>10 才触发轮中压实。
+        let agent = AgentLoop::new(5)
+            .with_compression(10, 8)
+            .with_context_window(20);
         let mut session = SessionTree::new();
         let tools = ToolRegistry::with_builtins();
         let home = std::env::temp_dir().join("rupi-agent-midrun");
