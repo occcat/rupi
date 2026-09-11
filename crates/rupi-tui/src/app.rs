@@ -3,10 +3,15 @@
 //! 排空事件 channel、响应滚动/退出——流式 delta 到达即渲染。
 
 use crate::complete;
-use crate::view::{ChatView, InputBuffer, Line};
+use crate::theme::Theme;
+use crate::tree_nav::TreeNavigator;
+use crate::view::{ChatView, InputBuffer};
 use anyhow::Context;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,7 +19,7 @@ use futures::{Stream, StreamExt as _};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line as RLine, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
@@ -85,7 +90,32 @@ struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FooterState {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub model: String,
+}
+
+pub struct UiChrome {
+    pub theme: Theme,
+    pub tools_folded: bool,
+    pub thinking_folded: bool,
+    pub footer: FooterState,
+}
+
+impl Default for UiChrome {
+    fn default() -> Self {
+        Self {
+            theme: Theme::from_env(),
+            tools_folded: true,
+            thinking_folded: true,
+            footer: FooterState::default(),
+        }
     }
 }
 
@@ -139,33 +169,35 @@ pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
     }
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = Guard; // panic/返回时必恢复终端
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     run_loop(&mut terminal, ctx).await
 }
 
-/// 回合内按键收集：运行中继续打字则排队为 follow-up（对标上游 `followUpMode`
-/// 默认全量注入），本轮结束后自动作为下一轮输入发出；`Esc` 中止 + 排队并存
-/// （先停本轮再跑排队≈转向）。返回 true 表示该键已消费。
-/// 纯逻辑（无终端依赖），可单测。调用方在 false 时走原有分支（Ctrl-C/Esc/滚动）。
-fn collect_followup(buf: &mut String, key: &KeyEvent) -> bool {
+/// 运行中按键：打字进缓冲；Enter 提交转向，Alt+Enter 提交 follow-up。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyKey {
+    Typed,
+    SubmitSteer,
+    SubmitFollowUp,
+    NotMine,
+}
+
+fn collect_busy(buf: &mut String, key: &KeyEvent) -> BusyKey {
     match key.code {
-        // 修饰键组合（Ctrl-C 等）留给调用方，不吞
         KeyCode::Char(c) if key.modifiers.is_empty() => {
             buf.push(c);
-            true
+            BusyKey::Typed
         }
-        KeyCode::Enter => {
-            buf.push('\n');
-            true
-        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => BusyKey::SubmitFollowUp,
+        KeyCode::Enter => BusyKey::SubmitSteer,
         KeyCode::Backspace => {
             buf.pop();
-            true
+            BusyKey::Typed
         }
-        _ => false,
+        _ => BusyKey::NotMine,
     }
 }
 
@@ -183,6 +215,7 @@ enum Builtin {
         tree: SessionTree,
         note: String,
     },
+    TreeNav,
     Pass,
 }
 
@@ -304,7 +337,7 @@ fn dispatch_builtin(
         return Builtin::Done(block);
     }
     if t == "/tree" {
-        return Builtin::Done(session.tree_view());
+        return Builtin::TreeNav;
     }
     if t == "/sessions" {
         // 最近会话列表（与 CLI `sessions` 同列）；库不可用（单测/内嵌）给提示。
@@ -549,10 +582,13 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/sessions 看会话，/resume <短id> 切换会话，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/export /import /fork /clone /name，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+O/T 折叠，Ctrl+G 编辑，!cmd，/tree 导航，/sessions /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
+    let mut chrome = UiChrome::default();
+    chrome.footer.model = ctx.provider.name().to_string();
+    let mut tree: Option<TreeNavigator> = None;
 
     loop {
         // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
@@ -576,25 +612,88 @@ async fn run_loop(
         };
         draw(
             terminal,
-            &view,
+            &mut view,
             &input,
             scroll,
             false,
             0,
             &completion,
             completion_prefix,
-            &status_footer(
-                false,
-                0,
-                ctx.meter.as_ref().map(|a| a.as_ref()),
-                ctx.session.history_tokens(),
-            ),
+            &chrome,
+            tree.as_ref(),
         )?;
-        let Some(Ok(Event::Key(key))) = reader.next().await else {
-            continue;
+        let ev = match reader.next().await {
+            Some(Ok(ev)) => ev,
+            _ => continue,
         };
+        if let Event::Mouse(m) = ev {
+            match m.kind {
+                MouseEventKind::ScrollUp => scroll = scroll.saturating_add(3),
+                MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
+                _ => {}
+            }
+            continue;
+        }
+        let Event::Key(key) = ev else { continue };
+        if let Some(nav) = tree.as_mut() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') if !nav.filtering => {
+                    tree = None;
+                    continue;
+                }
+                KeyCode::Esc if nav.filtering => {
+                    nav.filtering = false;
+                    continue;
+                }
+                KeyCode::Char('/') if !nav.filtering => {
+                    nav.filtering = true;
+                    nav.query.clear();
+                    continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') if !nav.filtering => {
+                    nav.move_by(-1);
+                    continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') if !nav.filtering => {
+                    nav.move_by(1);
+                    continue;
+                }
+                KeyCode::Enter => {
+                    if let Some(id) = nav.selected_id().map(str::to_string) {
+                        if ctx.session.goto_node(&id) {
+                            view.push_system(format!("[goto {}]", &id[..8.min(id.len())]));
+                        }
+                    }
+                    tree = None;
+                    continue;
+                }
+                KeyCode::Char(c) if nav.filtering => {
+                    nav.type_char(c);
+                    nav.clamp_selected();
+                    continue;
+                }
+                KeyCode::Backspace if nav.filtering => {
+                    nav.backspace();
+                    nav.clamp_selected();
+                    continue;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                chrome.tools_folded = !chrome.tools_folded;
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                chrome.thinking_folded = !chrome.thinking_folded;
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match open_external_editor(&input.text()) {
+                    Ok(s) => input.set_text(&s),
+                    Err(e) => view.push_system(format!("[editor] {e:#}")),
+                }
+            }
             KeyCode::PageUp => scroll = scroll.saturating_add(5),
             KeyCode::PageDown => scroll = scroll.saturating_sub(5),
             KeyCode::Tab => {
@@ -617,6 +716,9 @@ async fn run_loop(
                 scroll = 0;
                 input.push_char(c);
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                input.push_char('\n');
+            }
             KeyCode::Enter if !input.is_empty() => {
                 // follow-up 自动跟进：drive_turn 带回运行中排队的输入，非空则直接作为
                 // 下一轮发出（dispatch/展开/落盘全走同一路径；Quit 在内层直接返回）。
@@ -637,6 +739,20 @@ async fn run_loop(
                                 }
                             }
                         }
+                    }
+                    if let Some(cmd) = text.strip_prefix('!') {
+                        match run_bang_cmd(cmd.trim()) {
+                            Ok(out) => {
+                                view.push_system(format!("$ {cmd}"));
+                                view.push_system(out.clone());
+                                ctx.session.push(Message::text(
+                                    Role::User,
+                                    format!("Ran `{cmd}`\n```\n{out}\n```"),
+                                ));
+                            }
+                            Err(e) => view.push_system(format!("[!] {e:#}")),
+                        }
+                        continue;
                     }
                     // 锁守卫只活在派发语句内：守卫跨 await 会触发 await_holding_lock，
                     // 故先求值出 owned 的 Builtin 再 match（后续臂有 await）。
@@ -659,6 +775,10 @@ async fn run_loop(
                     };
                     match builtin {
                         Builtin::Quit => return Ok(()),
+                        Builtin::TreeNav => {
+                            tree = Some(TreeNavigator::from_session(ctx.session));
+                            continue;
+                        }
                         Builtin::Done(msg) => {
                             if msg.contains("model switched") {
                                 if let (Some(cell), Some(id)) =
@@ -810,6 +930,7 @@ async fn run_loop(
                         .as_ref()
                         .map(|s| s.extension_arcs())
                         .unwrap_or_default();
+                    chrome.footer.model = ctx.provider.name().to_string();
                     let turn = drive_turn(
                         terminal,
                         ctx.agent,
@@ -826,6 +947,7 @@ async fn run_loop(
                         user,
                         &ext_arcs,
                         ctx.meter.as_ref().map(|a| a.as_ref()),
+                        &mut chrome,
                     )
                     .await?;
                     if let Some(set) = ctx.ext_set.as_ref() {
@@ -838,7 +960,17 @@ async fn run_loop(
                     }
                     match turn {
                         (Control::Continue, followup) => {
-                            let q = followup.trim().to_string();
+                            let mut q = followup.trim().to_string();
+                            if let Some(inbox) = &ctx.agent.inbox {
+                                let more = inbox.take_follow_up();
+                                if !more.is_empty() {
+                                    if q.is_empty() {
+                                        q = more.join("\n\n");
+                                    } else {
+                                        q = format!("{q}\n\n{}", more.join("\n\n"));
+                                    }
+                                }
+                            }
                             if q.is_empty() {
                                 break;
                             }
@@ -879,6 +1011,7 @@ async fn drive_turn<B, S>(
     user: Message,
     extensions: &[Arc<dyn Extension>],
     meter: Option<&Mutex<rupi_agent::TokenMeter>>,
+    chrome: &mut UiChrome,
 ) -> anyhow::Result<(Control, String)>
 where
     B: Backend,
@@ -888,8 +1021,6 @@ where
     let on_event = move |e: AgentEvent| {
         let _ = tx.send(e);
     };
-    // fut 持有 `&mut session`：忙时状态栏用快照，避免与 future 重复借用。
-    let ctx_tokens = session.history_tokens();
     // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
     let before = session.current_path.len();
     let user_text = user.full_text();
@@ -910,38 +1041,81 @@ where
     let end: End = {
         tokio::pin!(fut);
         loop {
-            flush_turn_view(&mut rx, review_lines, view);
-            paint_busy(terminal, view, &qb, scroll, &followup, meter, ctx_tokens)?;
+            flush_turn_view(&mut rx, review_lines, view, chrome);
+            paint_busy(terminal, view, &qb, scroll, &followup, chrome)?;
             tokio::select! {
                 biased;
                 res = &mut fut => {
-                    flush_turn_view(&mut rx, review_lines, view);
+                    flush_turn_view(&mut rx, review_lines, view, chrome);
                     // 收尾再画一帧：与 fut 竞速的最后几个 delta 也落到 TestBackend / 屏幕上。
-                    paint_busy(terminal, view, &qb, scroll, &followup, meter, ctx_tokens)?;
+                    paint_busy(terminal, view, &qb, scroll, &followup, chrome)?;
                     break End::Finished(res);
                 }
-                maybe_key = reader.next() => {
-                    if let Some(Ok(Event::Key(key))) = maybe_key {
-                        if collect_followup(&mut followup, &key) {
-                            qb.set_text(&followup);
-                        } else {
-                            match key.code {
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    break End::Quit;
+                maybe_ev = reader.next() => {
+                    match maybe_ev {
+                        Some(Ok(Event::Mouse(m))) => match m.kind {
+                            MouseEventKind::ScrollUp => scroll = scroll.saturating_add(3),
+                            MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
+                            _ => {}
+                        },
+                        Some(Ok(Event::Key(key))) => {
+                            match collect_busy(&mut followup, &key) {
+                                BusyKey::Typed => qb.set_text(&followup),
+                                BusyKey::SubmitSteer => {
+                                    let msg = followup.trim().to_string();
+                                    followup.clear();
+                                    qb.set_text("");
+                                    if !msg.is_empty() {
+                                        if let Some(inbox) = &agent.inbox {
+                                            inbox.steer(&msg);
+                                            view.push_system(format!("[steer] {msg}"));
+                                        } else {
+                                            followup = msg;
+                                            followup.push('\n');
+                                            qb.set_text(&followup);
+                                        }
+                                    }
                                 }
-                                // 中止本轮：只置位不 drop future，会话停在一致点，
-                                // TurnEnd/RunEnd{Aborted} 照常进视图。排队保留，
-                                // 中止后自动跑排队≈转向。
-                                KeyCode::Esc => {
-                                    cancel.cancel();
+                                BusyKey::SubmitFollowUp => {
+                                    let msg = followup.trim().to_string();
+                                    followup.clear();
+                                    qb.set_text("");
+                                    if !msg.is_empty() {
+                                        if let Some(inbox) = &agent.inbox {
+                                            inbox.follow_up(&msg);
+                                            view.push_system(format!("[follow-up] {msg}"));
+                                        } else {
+                                            followup = msg;
+                                            qb.set_text(&followup);
+                                        }
+                                    }
                                 }
-                                KeyCode::PageUp => scroll = scroll.saturating_add(5),
-                                KeyCode::PageDown => scroll = scroll.saturating_sub(5),
-                                _ => {}
+                                BusyKey::NotMine => match key.code {
+                                    KeyCode::Char('c')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        break End::Quit;
+                                    }
+                                    KeyCode::Char('o')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        chrome.tools_folded = !chrome.tools_folded;
+                                    }
+                                    KeyCode::Char('t')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        chrome.thinking_folded = !chrome.thinking_folded;
+                                    }
+                                    KeyCode::Esc => {
+                                        cancel.cancel();
+                                    }
+                                    KeyCode::PageUp => scroll = scroll.saturating_add(5),
+                                    KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+                                    _ => {}
+                                },
                             }
                         }
+                        _ => {}
                     }
                 }
                 // delta / 工具事件到达即醒：下一圈 flush + draw，不必等按键或整轮结束。
@@ -960,9 +1134,11 @@ where
                                 *input_tokens,
                             );
                         }
+                        chrome.footer.input_tokens = *input_tokens;
+                        chrome.footer.output_tokens = *output_tokens;
                     }
                     view.push_event(&e);
-                    flush_turn_view(&mut rx, review_lines, view);
+                    flush_turn_view(&mut rx, review_lines, view, chrome);
                 }
             }
         }
@@ -1025,8 +1201,17 @@ fn flush_turn_view(
     rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
     review_lines: &Option<Arc<std::sync::Mutex<Vec<String>>>>,
     view: &mut ChatView,
+    chrome: &mut UiChrome,
 ) {
     while let Ok(e) = rx.try_recv() {
+        if let AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } = &e
+        {
+            chrome.footer.input_tokens = *input_tokens;
+            chrome.footer.output_tokens = *output_tokens;
+        }
         view.push_event(&e);
     }
     if let Some(buf) = review_lines {
@@ -1038,23 +1223,24 @@ fn flush_turn_view(
 
 fn paint_busy<B: Backend>(
     terminal: &mut Terminal<B>,
-    view: &ChatView,
+    view: &mut ChatView,
     input: &InputBuffer,
     scroll: u16,
     followup: &str,
-    meter: Option<&Mutex<rupi_agent::TokenMeter>>,
-    ctx_tokens: u64,
+    chrome: &UiChrome,
 ) -> anyhow::Result<()> {
+    let queued = followup.chars().count();
     draw(
         terminal,
         view,
         input,
         scroll,
         true,
-        followup.chars().count(),
+        queued,
         &[],
         '/',
-        &status_footer(true, followup.chars().count(), meter, ctx_tokens),
+        chrome,
+        None,
     )
 }
 
@@ -1081,19 +1267,95 @@ fn status_footer(
     format!("{base}  {}", g.footer(ctx))
 }
 
+fn footer_text(busy: bool, queued: usize, chrome: &UiChrome) -> String {
+    let usage = if chrome.footer.input_tokens + chrome.footer.output_tokens > 0 {
+        format!(
+            " ↑{} ↓{}",
+            chrome.footer.input_tokens, chrome.footer.output_tokens
+        )
+    } else {
+        String::new()
+    };
+    let model = if chrome.footer.model.is_empty() {
+        String::new()
+    } else {
+        format!(" │ {}", chrome.footer.model)
+    };
+    if busy {
+        if queued > 0 {
+            format!("… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出){model}{usage}")
+        } else {
+            format!("… thinking (Esc 中断本轮 · Ctrl-C 退出){model}{usage}")
+        }
+    } else {
+        format!("ready{model}{usage} │ Ctrl+O/T 折叠 · Ctrl+G 编辑 · !cmd")
+    }
+}
+
+fn open_external_editor(initial: &str) -> anyhow::Result<String> {
+    let path = std::env::temp_dir().join(format!("rupi-compose-{}.md", std::process::id()));
+    std::fs::write(&path, initial)?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} {}", path.display()))
+        .status();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    let _ = enable_raw_mode();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    status?;
+    Ok(text)
+}
+
+fn run_bang_cmd(cmd: &str) -> anyhow::Result<String> {
+    if cmd.is_empty() {
+        anyhow::bail!("empty command");
+    }
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()?;
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.stderr.is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    if s.chars().count() > 8_000 {
+        s = s.chars().take(8_000).collect();
+        s.push_str("\n…[truncated]");
+    }
+    if s.is_empty() {
+        s = format!("(exit {})", out.status.code().unwrap_or(-1));
+    }
+    Ok(s)
+}
+
 /// 全屏绘制（Backend 泛型：生产走 Crossterm，单测走 TestBackend 真画一遍断言像素行）。
 #[allow(clippy::too_many_arguments)]
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
-    view: &ChatView,
+    view: &mut ChatView,
     input: &InputBuffer,
     scroll: u16,
     busy: bool,
     queued: usize,
     completion: &[String],
     completion_prefix: char,
-    status: &str,
+    chrome: &UiChrome,
+    tree: Option<&TreeNavigator>,
 ) -> anyhow::Result<()> {
+    let lines = view
+        .visual_lines(&chrome.theme, chrome.tools_folded, chrome.thinking_folded)
+        .to_vec();
+    let footer = footer_text(busy, queued, chrome);
+    let theme = chrome.theme.clone();
     terminal
         .draw(|f| {
             let area = f.area();
@@ -1105,31 +1367,47 @@ fn draw<B: Backend>(
                     Constraint::Length(1),
                 ])
                 .split(area);
-            let lines: Vec<RLine> = view.lines.iter().map(render_line).collect();
             let total = lines.len() as u16;
-            let visible = chunks[0].height as usize;
-            let start = total.saturating_sub(visible as u16 + scroll) as usize;
-            let msgs = Paragraph::new(lines[start..].to_vec())
-                .block(Block::default().borders(Borders::ALL).title("rupi"))
+            let start = total.saturating_sub(chunks[0].height.saturating_add(scroll)) as usize;
+            let title = if let Some(nav) = tree {
+                format!("rupi /tree  {}/{}", nav.selected + 1, nav.visible().len())
+            } else {
+                "rupi".into()
+            };
+            let body = if let Some(nav) = tree {
+                tree_lines(nav, &theme)
+            } else {
+                lines.get(start..).unwrap_or(&[]).to_vec()
+            };
+            let msgs = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.border))
+                        .title(title),
+                )
                 .wrap(Wrap { trim: false });
             f.render_widget(msgs, chunks[0]);
             let (pre, post) = input.split_for_render();
             let prompt = Paragraph::new(RLine::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Green)),
+                Span::styled("> ", Style::default().fg(theme.prompt)),
                 Span::raw(pre.clone()),
                 Span::raw(post),
             ]))
-            .block(Block::default().borders(Borders::ALL));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            );
             f.render_widget(prompt, chunks[1]);
-            // 补全弹窗：输入框上方浮层，多候选时展示（Tab 补全/公共前缀）
-            if !completion.is_empty() {
+            if !completion.is_empty() && tree.is_none() {
                 let shown: Vec<RLine> = completion
                     .iter()
                     .take(8)
                     .map(|c| {
                         RLine::from(vec![Span::styled(
                             format!("{completion_prefix}{c}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(theme.accent),
                         )])
                     })
                     .collect();
@@ -1153,21 +1431,7 @@ fn draw<B: Backend>(
                 );
             }
             f.render_widget(
-                Paragraph::new(if status.is_empty() {
-                    if busy {
-                        if queued > 0 {
-                            format!(
-                                "… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出)"
-                            )
-                        } else {
-                            "… thinking (Esc 中断本轮 · Ctrl-C 退出)".to_string()
-                        }
-                    } else {
-                        "ready".to_string()
-                    }
-                } else {
-                    status.to_string()
-                }),
+                Paragraph::new(footer).style(Style::default().fg(theme.footer)),
                 chunks[2],
             );
             f.set_cursor_position((
@@ -1179,27 +1443,50 @@ fn draw<B: Backend>(
     Ok(())
 }
 
-fn render_line(l: &Line) -> RLine<'static> {
-    match l {
-        Line::User(t) => RLine::from(vec![
-            Span::styled("you: ", Style::default().fg(Color::Cyan)),
-            Span::raw(t.clone()),
-        ]),
-        Line::AssistantText(t) => RLine::from(Span::raw(t.clone())),
-        Line::Tool(t) => RLine::from(vec![Span::styled(
-            t.clone(),
-            Style::default().fg(Color::Yellow),
-        )]),
-        Line::System(t) => RLine::from(vec![Span::styled(
-            t.clone(),
-            Style::default().fg(Color::DarkGray),
-        )]),
+fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
+    let vis = nav.visible();
+    if vis.is_empty() {
+        return vec![RLine::from(Span::styled(
+            if nav.entries.is_empty() {
+                "(empty session — send a message first)"
+            } else {
+                "(no matches)"
+            }
+            .to_string(),
+            Style::default().fg(theme.system),
+        ))];
     }
+    let mut out = Vec::new();
+    if nav.filtering {
+        out.push(RLine::from(Span::styled(
+            format!("/{}", nav.query),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    for (i, e) in vis.iter().enumerate() {
+        let mark = if e.on_path { '*' } else { '+' };
+        let prefix = if i == nav.selected { "▸ " } else { "  " };
+        let indent = "  ".repeat(e.depth);
+        let line = format!(
+            "{prefix}{indent}{mark} {} {:?}: {}",
+            &e.id[..8.min(e.id.len())],
+            e.role,
+            e.preview
+        );
+        let style = if i == nav.selected {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.assistant)
+        };
+        out.push(RLine::from(Span::styled(line, style)));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::Line;
     use rupi_core::{Message, Role};
 
     fn harness() -> (AgentLoop, SessionTree, Arc<dyn LlmProvider>, SkillRegistry) {
@@ -1236,31 +1523,52 @@ mod tests {
 
     #[test]
     fn followup_collects_text_enter_backspace() {
-        // 运行中打字排队：字符追加、Enter 换行、Backspace 删除
         let mut buf = String::new();
-        assert!(collect_followup(&mut buf, &key(KeyCode::Char('h'))));
-        assert!(collect_followup(&mut buf, &key(KeyCode::Char('i'))));
-        assert!(collect_followup(&mut buf, &key(KeyCode::Enter)));
-        assert_eq!(buf, "hi\n");
-        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
-        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::Char('h'))),
+            BusyKey::Typed
+        );
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::Char('i'))),
+            BusyKey::Typed
+        );
+        assert_eq!(buf, "hi");
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::Enter)),
+            BusyKey::SubmitSteer
+        );
+        assert_eq!(
+            collect_busy(&mut buf, &KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            BusyKey::SubmitFollowUp
+        );
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::Backspace)),
+            BusyKey::Typed
+        );
         assert_eq!(buf, "h");
     }
 
     #[test]
     fn followup_leaves_control_keys_to_caller() {
-        // Esc/Ctrl-C/功能键不消费，留给调用方的取消/退出/滚动分支
         let mut buf = String::new();
-        assert!(!collect_followup(&mut buf, &key(KeyCode::Esc)));
-        assert!(!collect_followup(
-            &mut buf,
-            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
-        ));
-        assert!(!collect_followup(&mut buf, &key(KeyCode::PageUp)));
-        assert!(!collect_followup(&mut buf, &key(KeyCode::Tab)));
+        assert_eq!(collect_busy(&mut buf, &key(KeyCode::Esc)), BusyKey::NotMine);
+        assert_eq!(
+            collect_busy(
+                &mut buf,
+                &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            BusyKey::NotMine
+        );
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::PageUp)),
+            BusyKey::NotMine
+        );
+        assert_eq!(collect_busy(&mut buf, &key(KeyCode::Tab)), BusyKey::NotMine);
         assert!(buf.is_empty());
-        // 空缓冲退格不 panic
-        assert!(collect_followup(&mut buf, &key(KeyCode::Backspace)));
+        assert_eq!(
+            collect_busy(&mut buf, &key(KeyCode::Backspace)),
+            BusyKey::Typed
+        );
         assert!(buf.is_empty());
     }
 
@@ -1278,16 +1586,18 @@ mod tests {
         }
         let completion = vec!["help".to_string(), "history".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let chrome = UiChrome::default();
         draw(
             &mut terminal,
-            &view,
+            &mut view,
             &input,
             0,
             false,
             0,
             &completion,
             '/',
-            "",
+            &chrome,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -1318,20 +1628,22 @@ mod tests {
     fn draw_at_completion_uses_at_prefix() {
         // @路径候选弹窗以前缀 @ 展示（与斜杠 / 区分）。
         use ratatui::{backend::TestBackend, Terminal};
-        let view = ChatView::default();
+        let mut view = ChatView::default();
         let input = InputBuffer::default();
         let completion = vec!["src/main.rs".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let chrome = UiChrome::default();
         draw(
             &mut terminal,
-            &view,
+            &mut view,
             &input,
             0,
             false,
             0,
             &completion,
             '@',
-            "",
+            &chrome,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -1348,10 +1660,23 @@ mod tests {
     fn draw_busy_status_hints_steer_and_quit() {
         // 运行中状态栏即 steering 说明书：排队时提示 Esc 中断并转向，无排队只提示中断。
         use ratatui::{backend::TestBackend, Terminal};
-        let view = ChatView::default();
+        let mut view = ChatView::default();
         let input = InputBuffer::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 2, &[], '/', "").unwrap();
+        let chrome = UiChrome::default();
+        draw(
+            &mut terminal,
+            &mut view,
+            &input,
+            0,
+            true,
+            2,
+            &[],
+            '/',
+            &chrome,
+            None,
+        )
+        .unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1362,7 +1687,19 @@ mod tests {
         assert!(screen.contains("2 queued"), "缺排队数:\n{screen}");
         assert!(screen.contains("Esc"), "缺转向提示:\n{screen}");
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 0, &[], '/', "").unwrap();
+        draw(
+            &mut terminal,
+            &mut view,
+            &input,
+            0,
+            true,
+            0,
+            &[],
+            '/',
+            &chrome,
+            None,
+        )
+        .unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1501,6 +1838,7 @@ mod tests {
         let skills = SkillRegistry::default();
         let mut view = ChatView::default();
         view.push_user("ping".into());
+        let mut chrome = UiChrome::default();
         let (ctrl, followup) = drive_turn(
             &mut terminal,
             &agent,
@@ -1517,6 +1855,7 @@ mod tests {
             Message::text(Role::User, "ping"),
             &[],
             None,
+            &mut chrome,
         )
         .await
         .unwrap();
@@ -2022,36 +2361,39 @@ mod tests {
             false,
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
-        // 空树也有视图（不空返回、不漏进模型）
-        let msg = done_text(dispatch_builtin(
-            "/tree",
-            &mut agent,
-            &mut session,
-            &mut provider,
-            &skills,
-            &[],
-            "t-sess",
-            &mut ToolRegistry::default(),
-            None,
-            None,
-            false,
+        assert!(matches!(
+            dispatch_builtin(
+                "/tree",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+                None,
+                false,
+            ),
+            Builtin::TreeNav
         ));
-        assert!(!msg.is_empty(), "空树视图不应为空");
         session.push(Message::text(rupi_core::Role::User, "hi"));
-        let msg2 = done_text(dispatch_builtin(
-            "/tree",
-            &mut agent,
-            &mut session,
-            &mut provider,
-            &skills,
-            &[],
-            "t-sess",
-            &mut ToolRegistry::default(),
-            None,
-            None,
-            false,
+        assert!(matches!(
+            dispatch_builtin(
+                "/tree",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+                None,
+                false,
+            ),
+            Builtin::TreeNav
         ));
-        assert_ne!(msg, msg2, "有节点后视图应变化");
     }
 
     fn sess_home(tag: &str) -> std::path::PathBuf {

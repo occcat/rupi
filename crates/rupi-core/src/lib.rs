@@ -118,6 +118,16 @@ impl Message {
     }
 }
 
+/// `/tree` 导航器条目（与文本树同行顺序）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub id: String,
+    pub depth: usize,
+    pub on_path: bool,
+    pub role: Role,
+    pub preview: String,
+}
+
 /// 会话树节点：Pi sessions are trees —— 支持 branch / rewind / summary。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionNode {
@@ -310,15 +320,13 @@ impl SessionTree {
         hit
     }
 
-    /// 树视图（Pi `/tree` 对齐）：从 roots DFS，全分支可见；
-    /// `*` 为当前游标路径，`+` 为废弃分支节点。每行：标记 短id role: 预览。
-    pub fn tree_view(&self) -> String {
+    /// `/tree` 导航器用的结构化条目（DFS，与 [`tree_view`] 同行顺序）。
+    pub fn tree_entries(&self) -> Vec<TreeEntry> {
         use std::collections::HashMap;
         let on_path: std::collections::HashSet<&str> =
             self.current_path.iter().map(|s| s.as_str()).collect();
         let mut children: HashMap<Option<String>, Vec<String>> = HashMap::new();
         let mut roots: Vec<String> = vec![];
-        // 确定性输出：按创建时间排序
         let mut ids: Vec<&String> = self.nodes.keys().collect();
         ids.sort_by_key(|id| self.nodes[*id].created_at);
         for id in ids {
@@ -329,17 +337,16 @@ impl SessionTree {
                 roots.push(id.clone());
             }
         }
-        let mut out = String::new();
+        let mut out = Vec::new();
         fn dfs(
             tree: &SessionTree,
             children: &HashMap<Option<String>, Vec<String>>,
             on_path: &std::collections::HashSet<&str>,
             id: &str,
             depth: usize,
-            out: &mut String,
+            out: &mut Vec<TreeEntry>,
         ) {
             if let Some(n) = tree.nodes.get(id) {
-                let mark = if on_path.contains(id) { '*' } else { '+' };
                 let preview: String = n
                     .message
                     .full_text()
@@ -349,14 +356,15 @@ impl SessionTree {
                     .chars()
                     .take(60)
                     .collect();
-                out.push_str(&format!(
-                    "{mark} {} {:?}: {preview}\n",
-                    &id[..8.min(id.len())],
-                    n.message.role,
-                ));
+                out.push(TreeEntry {
+                    id: id.to_string(),
+                    depth,
+                    on_path: on_path.contains(id),
+                    role: n.message.role.clone(),
+                    preview,
+                });
                 if let Some(kids) = children.get(&Some(id.to_string())) {
                     for k in kids {
-                        out.push_str(&"  ".repeat(depth + 1));
                         dfs(tree, children, on_path, k, depth + 1, out);
                     }
                 }
@@ -365,9 +373,28 @@ impl SessionTree {
         for r in &roots {
             dfs(self, &children, &on_path, r, 0, &mut out);
         }
-        // 空树不回空串：调用方（REPL/TUI）直接打印，空串等于零输出
-        if out.is_empty() {
-            out.push_str("(empty session — send a message first)");
+        out
+    }
+
+    /// 树视图（Pi `/tree` 对齐）：从 roots DFS，全分支可见；
+    /// `*` 为当前游标路径，`+` 为废弃分支节点。每行：标记 短id role: 预览。
+    pub fn tree_view(&self) -> String {
+        let entries = self.tree_entries();
+        if entries.is_empty() {
+            return "(empty session — send a message first)".into();
+        }
+        let mut out = String::new();
+        for e in entries {
+            let mark = if e.on_path { '*' } else { '+' };
+            if e.depth > 0 {
+                out.push_str(&"  ".repeat(e.depth));
+            }
+            out.push_str(&format!(
+                "{mark} {} {:?}: {}\n",
+                &e.id[..8.min(e.id.len())],
+                e.role,
+                e.preview
+            ));
         }
         out
     }
@@ -443,6 +470,15 @@ pub enum AgentEvent {
         kind: String,
         message: String,
     },
+    /// 助手思考块（Anthropic thinking 等）：流结束后整段透出，供 TUI 折叠。
+    Thinking {
+        text: String,
+    },
+    /// 运行中转向：工具间隙（或无工具收尾前）注入的用户消息。
+    SteeringInjected {
+        count: usize,
+        messages: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -499,6 +535,13 @@ impl CancelFlag {
             }
             self.inner.notify.notified().await;
         }
+    }
+
+    /// 清位以便同一旗标服务下一轮（RPC / AgentSession 复用）。
+    pub fn reset(&self) {
+        self.inner
+            .cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

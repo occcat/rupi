@@ -24,11 +24,15 @@ pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
 pub mod discovery;
 pub mod hooks;
+pub mod queue;
+pub mod session;
 pub mod tokens;
 pub use discovery::{default_always, DiscoveryConfig, ScoredHit};
 pub use hooks::{
     DenyToolsHook, HookDecision, RecordedCall, RecordingHook, RedirectCommandHook, ToolHook,
 };
+pub use queue::{MessageInbox, QueueMode};
+pub use session::{create_agent_session, AgentSession, AgentSessionBuilder, AgentSessionState};
 pub use tokens::{
     context_window_for, rates_for, TokenMeter, DEFAULT_CONTEXT_WINDOW, DEFAULT_KEEP_RECENT_TOKENS,
     DEFAULT_RESERVE_TOKENS,
@@ -223,6 +227,8 @@ pub struct AgentLoop {
     pub thinking: Option<ThinkingLevel>,
     /// 跨轮持久的已发现工具名（同 agent 多轮对话共享；clone 共享底表）。
     pub discovered: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// 运行中转向信箱：工具执行完、下一轮 LLM 之前注入用户消息。
+    pub inbox: Option<Arc<crate::MessageInbox>>,
 }
 
 impl AgentLoop {
@@ -249,6 +255,45 @@ impl AgentLoop {
             discovery: None,
             thinking: None,
             discovered: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            inbox: None,
+        }
+    }
+
+    pub fn with_inbox(mut self, inbox: Arc<crate::MessageInbox>) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// 按 `steeringMode` 取出排队消息，写入会话树并广播 `SteeringInjected`。
+    fn inject_steering(
+        &self,
+        session: &mut SessionTree,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+    ) -> usize {
+        let Some(inbox) = &self.inbox else {
+            return 0;
+        };
+        let msgs = inbox.take_steering();
+        if msgs.is_empty() {
+            return 0;
+        }
+        for m in &msgs {
+            session.push(Message::text(Role::User, m));
+        }
+        on_event(AgentEvent::SteeringInjected {
+            count: msgs.len(),
+            messages: msgs.clone(),
+        });
+        msgs.len()
+    }
+
+    fn emit_thinking(message: &Message, on_event: &(dyn Fn(AgentEvent) + Sync)) {
+        for b in &message.blocks {
+            if let ContentBlock::Thinking { text, .. } = b {
+                if !text.is_empty() {
+                    on_event(AgentEvent::Thinking { text: text.clone() });
+                }
+            }
         }
     }
 
@@ -668,8 +713,24 @@ impl AgentLoop {
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolCall { .. }));
             session.push(resp.message.clone());
+            Self::emit_thinking(&resp.message, on_event);
 
             if !has_calls {
+                // 无工具本应收尾：若有转向则注入后继续下一轮 LLM（对标 Pi steering）。
+                if self.inject_steering(session, on_event) > 0 {
+                    on_event(AgentEvent::TurnEnd {
+                        turn,
+                        stop_reason: StopReason::Done,
+                    });
+                    for e in extensions {
+                        e.on_event(&AgentEvent::TurnEnd {
+                            turn,
+                            stop_reason: StopReason::Done,
+                        })
+                        .await?;
+                    }
+                    continue;
+                }
                 // 后台记忆 sync（fire-and-forget 语义：失败只 warning）
                 mem.sync_all(&user_input, &resp.message.full_text()).await;
                 self.run_review(&user_input, &resp.message.full_text(), &tool_names)
@@ -917,6 +978,8 @@ impl AgentLoop {
             // 否则超窗历史先发出去才壓缩（上游 #6879 同修）。
             self.maybe_compress_with_event(provider, session, mem, on_event)
                 .await;
+            // 工具结果已落盘：在下一轮 LLM 前注入转向（Pi：after tool calls, before next LLM）。
+            self.inject_steering(session, on_event);
             on_event(AgentEvent::TurnEnd {
                 turn,
                 stop_reason: StopReason::Done,
@@ -3136,5 +3199,159 @@ mod tests {
         assert_eq!(texts.len(), 2);
         assert!(texts[0].contains("- memory_search:"), "{}", texts[0]);
         assert!(texts[0].contains("- memory:"), "{}", texts[0]);
+    }
+
+    #[tokio::test]
+    async fn steering_injects_user_message_between_tool_and_next_llm() {
+        let inbox = Arc::new(crate::MessageInbox::new());
+        inbox.steer("do this instead");
+        let provider = MockProvider::new(vec![
+            tool_call_response("c1", "think", serde_json::json!({"thought": "planning"})),
+            MockProvider::text_response("steered-ok"),
+        ]);
+        let agent = AgentLoop::new(5).with_inbox(inbox);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join(format!(
+            "rupi-agent-steer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mem = MemoryManager::new(MemoryStore::new(home.clone()));
+        let events = std::sync::Mutex::new(vec![]);
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "go",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|e| events.lock().unwrap().push(e),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let hist: Vec<(rupi_core::Role, String)> = session
+            .history()
+            .iter()
+            .map(|m| (m.role.clone(), m.full_text()))
+            .collect();
+        assert!(
+            hist.iter()
+                .any(|(r, t)| matches!(r, rupi_core::Role::User) && t.contains("do this instead")),
+            "{hist:?}"
+        );
+        assert!(
+            hist.iter().any(|(_, t)| t.contains("steered-ok")),
+            "{hist:?}"
+        );
+        let ev = events.lock().unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::SteeringInjected { count: 1, .. })),
+            "{ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_one_at_a_time_on_text_only_turn() {
+        let inbox = Arc::new(crate::MessageInbox::new());
+        inbox.set_steering_mode(crate::QueueMode::OneAtATime);
+        inbox.steer("first-steer");
+        inbox.steer("second-steer");
+        let provider = MockProvider::new(vec![
+            MockProvider::text_response("a"),
+            MockProvider::text_response("b"),
+            MockProvider::text_response("c"),
+        ]);
+        let agent = AgentLoop::new(5).with_inbox(inbox);
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join(format!(
+            "rupi-agent-steer-text-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mem = MemoryManager::new(MemoryStore::new(home.clone()));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let users: Vec<String> = session
+            .history()
+            .iter()
+            .filter(|m| m.role == rupi_core::Role::User)
+            .map(|m| m.full_text())
+            .collect();
+        assert!(users.iter().any(|t| t.contains("first-steer")), "{users:?}");
+        assert!(
+            users.iter().any(|t| t.contains("second-steer")),
+            "{users:?}"
+        );
+        assert_eq!(provider.seen_tools.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn steering_all_mode_dumps_queue_once() {
+        let inbox = Arc::new(crate::MessageInbox::new());
+        inbox.set_steering_mode(crate::QueueMode::All);
+        inbox.steer("s1");
+        inbox.steer("s2");
+        let provider = MockProvider::new(vec![
+            MockProvider::text_response("only"),
+            MockProvider::text_response("after-all"),
+        ]);
+        let agent = AgentLoop::new(5).with_inbox(inbox.clone());
+        let mut session = SessionTree::new();
+        let tools = ToolRegistry::with_builtins();
+        let home = std::env::temp_dir().join(format!(
+            "rupi-agent-steer-all-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mem = MemoryManager::new(MemoryStore::new(home.clone()));
+        agent
+            .run(
+                &provider,
+                &mut session,
+                "hi",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &|_| {},
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(inbox.pending_count(), 0);
+        assert_eq!(provider.seen_tools.lock().unwrap().len(), 2);
     }
 }

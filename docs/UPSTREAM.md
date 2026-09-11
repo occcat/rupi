@@ -17,7 +17,7 @@
 | `toolExecution: parallel \| sequential` | `--parallel-tools`，默认串行 | 并行 `join_all`，事件与结果保原序；审批问询永远串行发生在执行前 |
 | 取消（effect gate） | `CancelFlag`（Atomic + Notify） | turn 边界、流中、串行工具间隙三处检查点；bash 进程组 SIGKILL |
 | 溢出恢复（`isContextOverflow` → 强制压实重发） | `overflow.rs` + `MAX_OVERFLOW_RECOVERIES=2` | 现在对 OpenAI-compat 也生效：非 2xx 回包读出 body 后再匹配（见"本次合并"） |
-| steering / follow-up 队列 | 部分：TUI 运行中输入自动排队为下一轮 | 未实现 Pi 的运行中注入（mid-run steering） |
+| steering / follow-up 队列 | `MessageInbox` + `steeringMode`/`followUpMode`；工具间隙注入用户消息 | TUI 运行中 Enter 转向、Alt+Enter 跟进；RPC `steer`/`follow_up` |
 | `stopReason=error` 转助手消息 | 直接返回 `Err`，调用方决定 | REPL 打印错误并回滚本轮；`run` 非零退出；错误轮**不落盘**（对比 2c40 分支会污染会话） |
 
 ## Compaction（`packages/agent/src/harness/compaction` → `AgentLoop::compress_inner`）
@@ -92,14 +92,15 @@
 |---|---|
 | `pi` 交互 | `rupi chat`（REPL）与 `rupi tui`（ratatui：Tab 补全、`@path`、`/sessions` `/resume`、运行中排队） |
 | `pi -p` | `rupi run "..."` |
-| `pi --mode json` | `rupi run --json "..."`（本次合并）：stdout 每行一个 `AgentEvent`（`{"type":"text_delta",...}`），末行 `run_result`，出错 `error` 行 + 非零退出 |
+| `pi --mode json` | `rupi run --json "..."`：stdout 每行一个 `AgentEvent`，末行 `run_result` |
+| `pi --mode rpc` / `createAgentSession` | `rupi --mode rpc` JSONL + `rupi_agent::create_agent_session` |
 | `pi --continue/--resume` | `--continue`/`-c` 最近会话、`--resume <id>`，`rupi sessions` / `session-show` |
 | `/export` `/import` `/fork` `/clone` `/name` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页） |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
 | `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；`--tools/--exclude-tools/--no-tools`、`--system-prompt/--append-system-prompt` |
 | 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`；`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute` |
 | `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本） |
-| 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题热重载/差分渲染器 |
+| TUI | Markdown、工具/思考折叠、主题、`!cmd`、Ctrl+G、鼠标、`/tree` 导航器、footer、增量渲染 |
 
 ## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复
 
