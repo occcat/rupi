@@ -70,8 +70,7 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
 #[command(
     name = "rupi",
     version,
-    about = "rupi — Pi Agent 的 Rust 复刻：最小 Harness + MCP + 记忆 + Skills",
-    args_conflicts_with_subcommands = true
+    about = "rupi — Pi Agent 的 Rust 复刻：最小 Harness + MCP + 记忆 + Skills"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -968,6 +967,8 @@ async fn main() -> anyhow::Result<()> {
             run_tui_or_fallback(&cli, &home, &prompt.join(" ")).await?;
         }
         None => {
+            // 不用 args_conflicts_with_subcommands：否则 `--no-approve chat`
+            // 会把 `chat` 吃进 rest，非 TTY 就走 run 而不是 REPL。
             let p = cli.rest.join(" ");
             if cli.print {
                 let p = append_stdin_if_piped(p);

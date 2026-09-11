@@ -462,21 +462,17 @@ fn no_memory_run_still_works() {
     assert!(out.contains("demo mode"));
 }
 
-/// chat 子进程：全局 flag 在子命令前，stdin 喂整段输入后 EOF。
+/// REPL 冒烟必须显式 `rupi chat`：无子命令默认 TUI；非 TTY 且有 rest 会走 `run`。
+/// 全局 flag 在子命令前，stdin 喂整段输入后 EOF。
 fn chat_with(home: &Path, global: &[&str], input: &[u8]) -> Output {
     let mut args: Vec<&str> = global.to_vec();
     args.push("chat");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rupi"));
-    child
-        .env("RUPI_HOME", home)
-        .current_dir(home)
-        .args(&args)
+    let mut child = rupi(home, &args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_remove("RUPI_API_KEY")
-        .env_remove("OPENAI_API_KEY");
-    let mut child = child.spawn().unwrap();
+        .spawn()
+        .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -1066,12 +1062,7 @@ fn stdin_print_atfile_session_fork_and_slash() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"hi-from-pipe")
-        .unwrap();
+    child.stdin.take().unwrap().write_all(b"pipehi99").unwrap();
     let o = child.wait_with_output().unwrap();
     let (out, err) = out_text(&o);
     assert!(
@@ -1097,21 +1088,21 @@ fn stdin_print_atfile_session_fork_and_slash() {
         "@file run 失败:\nstdout={out}\nstderr={err}"
     );
 
-    let o = rupi(&home, &["sessions"]).output().unwrap();
-    let (sess, _) = out_text(&o);
-    let sid = sess
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .expect("session id")
-        .to_string();
-
-    let o = rupi(&home, &["session-show", &sid]).output().unwrap();
-    let (show, _) = out_text(&o);
-    assert!(show.contains("hi-from-pipe"), "stdin 未进会话:\n{show}");
+    let o = rupi(&home, &["session-search", "pipehi99"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
     assert!(
-        show.contains("PIPEFILE unique-readme-body") || show.contains("README.md"),
-        "@file 未进会话:\n{show}"
+        o.status.success() && hit.contains("pipehi99"),
+        "stdin 未进会话:\n{hit}\n{err}"
+    );
+    let o = rupi(&home, &["session-search", "PIPEFILE"])
+        .output()
+        .unwrap();
+    let (hit, err) = out_text(&o);
+    assert!(
+        o.status.success() && hit.contains("PIPEFILE"),
+        "@file 未进会话:\n{hit}\n{err}"
     );
 
     // 无子命令位置参数：非 TTY 走 run（对标 `rupi @README.md 总结`）
@@ -1134,7 +1125,7 @@ fn stdin_print_atfile_session_fork_and_slash() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"hi-from-print-pipe")
+        .write_all(b"printpipe99")
         .unwrap();
     let o = child.wait_with_output().unwrap();
     let (out, err) = out_text(&o);
@@ -1142,12 +1133,12 @@ fn stdin_print_atfile_session_fork_and_slash() {
         o.status.success(),
         "-p 管道失败:\nstdout={out}\nstderr={err}"
     );
-    let o = rupi(&home, &["session-search", "hi-from-print-pipe"])
+    let o = rupi(&home, &["session-search", "printpipe99"])
         .output()
         .unwrap();
     let (hit, err) = out_text(&o);
     assert!(
-        o.status.success() && hit.contains("hi-from-print-pipe"),
+        o.status.success() && hit.contains("printpipe99"),
         "-p stdin 未进会话:\n{hit}\n{err}"
     );
 
@@ -1251,7 +1242,15 @@ fn stdin_print_atfile_session_fork_and_slash() {
     assert!(o.status.success(), "chat /session /new 失败:\n{out}\n{err}");
     assert!(out.contains("id:"), "/session 无 id:\n{out}");
     assert!(out.contains("[new "), "/new 无新 id:\n{out}");
-    let ids: Vec<_> = out.lines().filter(|l| l.starts_with("id: ")).collect();
+    let ids: Vec<_> = out
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .trim_start_matches("> ")
+                .strip_prefix("id: ")
+                .map(str::to_string)
+        })
+        .collect();
     assert!(ids.len() >= 2, "应打印两个 /session:\n{out}");
     assert_ne!(ids[0], ids[1], "/new 后 /session 应是新 id:\n{out}");
 }
