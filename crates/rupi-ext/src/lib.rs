@@ -239,11 +239,7 @@ impl ExternalTool {
                 if out.status.success() {
                     rupi_tools::ToolOutput::ok(text)
                 } else {
-<<<<<<< HEAD
                     let err = rupi_tools::decode_utf8(&out.stderr).trim().to_string();
-=======
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
->>>>>>> 672ddfe (修 #9 变基后 CI：Image 匹配与 rustfmt)
                     rupi_tools::ToolOutput::err(format!("exit {}: {err}", out.status))
                 }
             }
@@ -590,16 +586,25 @@ mod tests {
 
     #[tokio::test]
     async fn zero_timeout_is_clamped_not_instant() {
+        // 0 必须钳到默认秒数：`timeout(0)` 会立刻 Elapsed，跟调度无关。
+        let secs = effective_timeout_secs(0);
+        assert!(secs >= 1, "zero timeout must clamp, got {secs}");
+        // 读完 stdin 再打印：不依赖 echo 是否在 write 前退出（macOS 上会 EPIPE）。
         let m: ExtensionManifest = serde_json::from_str(
-            r#"{"name": "z", "description": "x", "input_schema": {}, "command": "echo", "args": ["hi"], "timeout_secs": 0}"#,
+            r#"{"name":"z","description":"x","input_schema":{},"command":"sh","args":["-c","cat >/dev/null; printf hi"],"timeout_secs":0}"#,
         )
         .unwrap();
         let out = ExternalTool::new(m)
             .execute(serde_json::json!({}))
             .await
             .unwrap();
-        assert!(!out.is_error);
-        assert!(out.content.contains("hi"));
+        assert!(
+            !out.content.contains("timed out after 0s"),
+            "0 must not instant-timeout: {}",
+            out.content
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("hi"), "{}", out.content);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1765,10 +1765,7 @@ mod tests {
     async fn bash_decodes_utf8_incrementally() {
         let r = ToolRegistry::with_builtins();
         let out = r
-            .execute(
-                "bash",
-                serde_json::json!({"command": "printf '%s' '你好'"}),
-            )
+            .execute("bash", serde_json::json!({"command": "printf '%s' '你好'"}))
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
