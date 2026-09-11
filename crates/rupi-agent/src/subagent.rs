@@ -93,7 +93,8 @@ pub async fn run_subagents(
 }
 
 /// 模型可调用的委托工具：自包含子任务（无父会话上下文），跑完只回摘要。
-/// 非交互：无审批器，Ask 一律拒绝；递归深度达 `max_depth` 时子会话不再配 `subagent` 工具。
+/// 权限门/审批器默认与父循环一致（[`Self::inherit_from`]）；未装配时 Ask 仍拒绝。
+/// 递归深度达 `max_depth` 时子会话不再配 `subagent` 工具。
 /// 父取消经 `execute_with_cancel` 直透内层循环（Esc/Ctrl-C 下一检查点停，不再跑到头）。
 pub struct SubagentTool {
     provider: Arc<dyn LlmProvider>,
@@ -106,6 +107,9 @@ pub struct SubagentTool {
     /// 父会话思考强度快照（构造时传入；`run_subagents` 扇出走 agent clone 自动继承，
     /// 这里委托工具自建循环，需显式透传，否则子任务永远跑 provider 默认档）。
     thinking: Option<rupi_llm::ThinkingLevel>,
+    /// 父循环权限门快照；默认 `AllowAll`，与「未接线」时主循环一致。
+    policy: Arc<dyn crate::Policy>,
+    approver: Option<Arc<dyn crate::Approver>>,
     depth: u8,
     max_depth: u8,
 }
@@ -129,6 +133,8 @@ impl SubagentTool {
             max_turns,
             plan_mode: false,
             thinking: None,
+            policy: Arc::new(crate::policy::AllowAll),
+            approver: None,
             depth: 0,
             max_depth: 2,
         }
@@ -147,6 +153,26 @@ impl SubagentTool {
 
     pub fn with_thinking(mut self, thinking: Option<rupi_llm::ThinkingLevel>) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: Arc<dyn crate::Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Arc<dyn crate::Approver>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// 从父循环拷贝权限门、审批器、计划模式、思考档。
+    /// 委托工具自建 `AgentLoop`，不像 [`run_subagents`] 那样能靠 clone 继承。
+    pub fn inherit_from(mut self, parent: &AgentLoop) -> Self {
+        self.policy = parent.policy.clone();
+        self.approver = parent.approver.clone();
+        self.plan_mode = parent.plan_mode;
+        self.thinking = parent.thinking;
         self
     }
 }
@@ -213,13 +239,20 @@ impl SubagentTool {
                 max_turns: self.max_turns,
                 plan_mode: self.plan_mode,
                 thinking: self.thinking,
+                policy: self.policy.clone(),
+                approver: self.approver.clone(),
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
             }) as Arc<dyn rupi_tools::Tool>);
         } else {
             child_registry.unregister(SUBAGENT_TOOL_NAME);
         }
-        let mut agent = AgentLoop::new(self.max_turns).with_plan_mode(self.plan_mode);
+        let mut agent = AgentLoop::new(self.max_turns)
+            .with_plan_mode(self.plan_mode)
+            .with_policy(self.policy.clone());
+        if let Some(a) = &self.approver {
+            agent = agent.with_approver(a.clone());
+        }
         if let Some(t) = self.thinking {
             agent = agent.with_thinking(t);
         }
@@ -387,7 +420,8 @@ mod tests {
 
     /// 子任务思考强度透传：父档位进子循环请求，默认 None 不干预。
     #[tokio::test]
-    async fn thinking_level_reaches_child_loop() {        struct Capture {
+    async fn thinking_level_reaches_child_loop() {
+        struct Capture {
             seen: std::sync::Mutex<Vec<Option<rupi_llm::ThinkingLevel>>>,
         }
         #[async_trait::async_trait]
@@ -484,5 +518,134 @@ mod tests {
             .all(|r| matches!(r.stop_reason, StopReason::Done)));
         // 主会话不受污染
         assert_eq!(base.history().len(), 0);
+    }
+
+    /// 委托工具自建循环必须带上父 policy/approver，否则子任务绕过权限门。
+    /// 回执只含摘要+工具名，用写文件副作用判断是否真执行。
+    #[tokio::test]
+    async fn subagent_inherits_parent_policy_and_approver() {
+        use crate::{Approver, RulePolicy};
+        use rupi_core::{ContentBlock, Message, Role};
+        use rupi_llm::ChatResponse;
+        use std::path::PathBuf;
+
+        struct Deny;
+        impl Approver for Deny {
+            fn approve(&self, _t: &str, _a: &serde_json::Value, _r: &str) -> bool {
+                false
+            }
+        }
+        struct Allow;
+        impl Approver for Allow {
+            fn approve(&self, _t: &str, _a: &serde_json::Value, _r: &str) -> bool {
+                true
+            }
+        }
+
+        fn write_call(path: &std::path::Path) -> ChatResponse {
+            ChatResponse {
+                message: Message {
+                    id: "m1".into(),
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": path.to_string_lossy(),
+                            "content": "leaked"
+                        }),
+                    }],
+                    provider: None,
+                    created_at: chrono::Utc::now(),
+                },
+                stop_reason: "tool_calls".into(),
+            }
+        }
+
+        async fn run(tool: SubagentTool) -> String {
+            tool.execute(serde_json::json!({"goal": "x"}))
+                .await
+                .unwrap()
+                .content
+        }
+
+        fn probe(tag: &str) -> PathBuf {
+            let p = std::env::temp_dir().join(format!(
+                "rupi-sub-policy-{}-{}-{tag}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_file(&p);
+            p
+        }
+
+        let (_p, t, m, f, s) = ctx();
+        let deny_path = probe("deny");
+        let denied = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&deny_path),
+                MockProvider::text_response("done"),
+            ])),
+            t.clone(),
+            m.clone(),
+            f.clone(),
+            s.clone(),
+            3,
+        )
+        .with_policy(Arc::new(RulePolicy {
+            deny_tools: vec!["write".into()],
+            ..Default::default()
+        })))
+        .await;
+        assert!(denied.contains("write!"), "{denied}");
+        assert!(!deny_path.exists(), "deny policy still executed write");
+
+        let ask_path = probe("ask");
+        let asked = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&ask_path),
+                MockProvider::text_response("done"),
+            ])),
+            t.clone(),
+            m.clone(),
+            f.clone(),
+            s.clone(),
+            3,
+        )
+        .with_policy(Arc::new(RulePolicy {
+            ask_tools: vec!["write".into()],
+            ..Default::default()
+        }))
+        .with_approver(Arc::new(Deny)))
+        .await;
+        assert!(asked.contains("write!"), "{asked}");
+        assert!(!ask_path.exists(), "denied approver still executed write");
+
+        let allow_path = probe("allow");
+        let parent = AgentLoop::new(3)
+            .with_policy(Arc::new(RulePolicy {
+                ask_tools: vec!["write".into()],
+                ..Default::default()
+            }))
+            .with_approver(Arc::new(Allow));
+        let allowed = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&allow_path),
+                MockProvider::text_response("done"),
+            ])),
+            t,
+            m,
+            f,
+            s,
+            3,
+        )
+        .inherit_from(&parent))
+        .await;
+        assert!(allowed.contains("write"), "{allowed}");
+        assert_eq!(std::fs::read_to_string(&allow_path).unwrap(), "leaked");
+        let _ = std::fs::remove_file(&allow_path);
     }
 }

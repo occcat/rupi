@@ -393,7 +393,12 @@ fn apply_cli_secrets(cli: &Cli) {
     let Some(k) = cli.api_key.as_deref() else {
         return;
     };
-    match cli.provider.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+    match cli
+        .provider
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("anthropic") => std::env::set_var("RUPI_ANTHROPIC_KEY", k),
         Some("gemini") => std::env::set_var("RUPI_GEMINI_KEY", k),
         Some("openrouter") => std::env::set_var("RUPI_OPENROUTER_KEY", k),
@@ -445,18 +450,15 @@ async fn build_provider(
     let mut p = match rupi_llm::provider_from_spec(&spec, opts) {
         Ok(p) => p,
         Err(e) => {
-            let hint = spec
-                .provider
-                .as_deref()
-                .unwrap_or_else(|| {
-                    if spec.model.starts_with("claude-") {
-                        "anthropic"
-                    } else if spec.model.starts_with("gemini-") {
-                        "gemini"
-                    } else {
-                        "openai"
-                    }
-                });
+            let hint = spec.provider.as_deref().unwrap_or_else(|| {
+                if spec.model.starts_with("claude-") {
+                    "anthropic"
+                } else if spec.model.starts_with("gemini-") {
+                    "gemini"
+                } else {
+                    "openai"
+                }
+            });
             let demo = match hint {
                 "anthropic" => {
                     eprintln!("[rupi] {e:#} — using mock provider (demo mode)");
@@ -909,7 +911,10 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     // provider 在会话 id 落定后构造：亲和头荷载即 sessions.db 会话 id，
     // --resume 同 id 即同一下游（实例级随机 id 只保同进程粘滞）。
-    let provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid), &provider_options(cli)).await?.into();
+    let provider: Arc<dyn LlmProvider> =
+        build_provider(&cli.model, Some(&sid), &provider_options(cli))
+            .await?
+            .into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
@@ -940,8 +945,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }
@@ -1142,7 +1146,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let sess_db = SessionStore::open(home)?;
     let (mut session, sid) = restore_or_new(cli, &sess_db)?;
     // provider 与 reviewer 在会话 id 落定后装配：亲和头荷载即 sessions.db 会话 id
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&model, Some(&sid), &provider_options(cli)).await?.into();
+    let mut provider: Arc<dyn LlmProvider> =
+        build_provider(&model, Some(&sid), &provider_options(cli))
+            .await?
+            .into();
     if cli.review_enabled() {
         let pending_clone = pending.clone();
         // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
@@ -1185,8 +1192,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         println!("[subagents] subagent tool enabled");
     }
@@ -1521,7 +1527,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         restore_or_new(cli, &db)?
     };
     // provider 在会话 id 落定后构造（与 run/chat 同序，亲和头荷载即本会话 id）
-    let mut provider: Arc<dyn LlmProvider> = build_provider(&cli.model, Some(&sid), &provider_options(cli)).await?.into();
+    let mut provider: Arc<dyn LlmProvider> =
+        build_provider(&cli.model, Some(&sid), &provider_options(cli))
+            .await?
+            .into();
     let mut agent = AgentLoop::new(cli.max_turns)
         .with_compression(cli.compress_threshold, cli.compress_keep)
         .with_compression_overrides(load_compression_overrides());
@@ -1557,8 +1566,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             skills.clone(),
             cli.max_turns,
         )
-        .with_plan_mode(cli.plan)
-        .with_thinking(agent.thinking);
+        .inherit_from(&agent);
         tools.register(Arc::new(sub));
         eprintln!("[subagents] subagent tool enabled");
     }

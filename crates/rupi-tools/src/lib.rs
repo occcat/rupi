@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod truncate;
+mod utf8;
 pub use truncate::{
     format_size, truncate_head, truncate_tail, TruncationResult, DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
 };
+pub use utf8::{decode_utf8, Utf8Decoder};
 
 /// 工具回包里的图片（read/@file 读到 png/jpg 等）：主循环写入 `ContentBlock::Image`。
 #[derive(Debug, Clone)]
@@ -174,7 +176,8 @@ impl ToolRegistry {
 }
 
 /// 工作区沙箱守卫：`path` 参数解析（相对→root 下，绝对→原样），canonicalize 消解
-/// `..` 与符号链接后必须仍在 `root` 内，否则拒绝执行。缺 `path` 参数透传给内层判错。
+/// `..` 与符号链接后必须仍在 `root` 内，否则拒绝执行。悬空符号链接跟随目标
+/// （不能把链接名当成「新建文件」而放行）。缺 `path` 参数透传给内层判错。
 pub struct SandboxedTool {
     inner: Arc<dyn Tool>,
     root: std::path::PathBuf,
@@ -197,13 +200,63 @@ impl SandboxedTool {
         } else {
             self.root.join(p)
         };
-        // 存在文件直接 canonicalize；新建文件则 canonicalize 父目录后拼回文件名
-        if let Ok(c) = joined.canonicalize() {
-            return Some(c);
+        resolve_sandbox_path(&joined, 0)
+    }
+}
+
+/// 消 `.` / `..`，不碰磁盘。悬空符号链接的目标靠这个落到真实意图路径，
+/// 再和 root 做前缀比较——不能把「链接名本身」当成新建文件。
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    let _ = out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => {
+                    if !out.has_root() {
+                        out.push(c);
+                    }
+                }
+            },
+            Component::Normal(_) => out.push(c),
         }
-        let parent = joined.parent()?;
-        let c = parent.canonicalize().ok()?;
-        Some(c.join(joined.file_name()?))
+    }
+    out
+}
+
+/// 跟随符号链接（含悬空）直到真实目标或「父目录 + 新文件名」。
+/// 深度封顶防环；canonicalize 只用于已存在的非链接节点。
+fn resolve_sandbox_path(path: &std::path::Path, depth: u8) -> Option<std::path::PathBuf> {
+    const SYMLINK_MAX: u8 = 32;
+    if depth > SYMLINK_MAX {
+        return None;
+    }
+    let path = normalize_path(path);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = std::fs::read_link(&path).ok()?;
+            let joined = if target.is_absolute() {
+                target
+            } else {
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .join(target)
+            };
+            resolve_sandbox_path(&joined, depth + 1)
+        }
+        Ok(_) => path.canonicalize().ok(),
+        Err(_) => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+            let name = path.file_name()?;
+            let parent_resolved = resolve_sandbox_path(parent, depth + 1)?;
+            Some(parent_resolved.join(name))
+        }
     }
 }
 
@@ -377,9 +430,7 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
             Ok(b) => b,
             Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
         };
-        let caption = format!(
-            "[image {media} · {file_len} bytes · attached to this tool result]"
-        );
+        let caption = format!("[image {media} · {file_len} bytes · attached to this tool result]");
         return ToolOutput::ok(caption).with_images(vec![ToolImage {
             media_type: media.to_string(),
             data: rupi_core::encode_base64(&bytes),
@@ -745,32 +796,9 @@ impl Tool for BashTool {
         }
     }
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
-        let (command, timeout_secs) = Self::parse_args(&arguments);
-        let run = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
-            Ok(Ok(out)) => {
-                let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-                if !out.stderr.is_empty() {
-                    s.push_str(&format!(
-                        "\n[stderr]\n{}",
-                        String::from_utf8_lossy(&out.stderr)
-                    ));
-                }
-                s = bound_bash_output(&s);
-                if out.status.success() {
-                    Ok(ToolOutput::ok(s))
-                } else {
-                    Ok(ToolOutput::err(format!("exit {}: {s}", out.status)))
-                }
-            }
-            Ok(Err(e)) => Ok(ToolOutput::err(format!("spawn failed: {e}"))),
-            Err(_) => Ok(ToolOutput::err(format!(
-                "command timed out after {timeout_secs}s"
-            ))),
-        }
+        // 与取消路径共用：超时杀进程组 + kill_on_drop，不丢 `.output()` future 留孤儿。
+        self.execute_with_cancel(arguments, &CancelFlag::new())
+            .await
     }
     /// 真抢占：取消置位即 kill 子进程并回收，已产出内容随取消错误一并返回。
     ///
@@ -790,6 +818,7 @@ impl Tool for BashTool {
         use std::os::unix::process::CommandExt as _;
         cmd.as_std_mut().process_group(0);
         let mut child = match cmd
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -978,7 +1007,7 @@ impl PipeTail {
 
     fn into_string(self) -> String {
         let v: Vec<u8> = self.buf.into_iter().collect();
-        String::from_utf8_lossy(&v).into_owned()
+        decode_utf8(&v)
     }
 }
 
@@ -1461,17 +1490,22 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.starts_with("row0\nrow1\nrow2"), "{}", out.content);
+        assert!(
+            out.content.starts_with("row0\nrow1\nrow2"),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains("truncated"), "{}", out.content);
         assert!(!out.content.contains("row79999"));
         // 图片：metadata 后整读，base64 进 images
         let png = dir.join("dot.png");
-        std::fs::write(&png, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 8, 7]).unwrap();
+        std::fs::write(
+            &png,
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 8, 7],
+        )
+        .unwrap();
         let img = r
-            .execute(
-                "read",
-                serde_json::json!({"path": png.to_string_lossy()}),
-            )
+            .execute("read", serde_json::json!({"path": png.to_string_lossy()}))
             .await
             .unwrap();
         assert!(!img.is_error, "{}", img.content);
@@ -1674,6 +1708,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_execute_timeout_kills_process_group_no_orphans() {
+        // 非取消路径：超时必须杀进程组，不能只 drop `.output()` 留孙进程。
+        if tokio::process::Command::new("which")
+            .arg("pgrep")
+            .output()
+            .await
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let tool = BashTool;
+        let probe = "sleep 59";
+        let pre = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '[s]leep 59' || true")
+            .output()
+            .await
+            .unwrap();
+        assert!(pre.stdout.is_empty(), "probe polluted: {pre:?}");
+        let out = tool
+            .execute(serde_json::json!({"command": probe, "timeout_secs": 1}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "{}",
+            out.content
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let post = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '[s]leep 59' || true")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            post.stdout.is_empty(),
+            "orphan sleep survived execute() timeout: {}",
+            String::from_utf8_lossy(&post.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_decodes_utf8_incrementally() {
+        let r = ToolRegistry::with_builtins();
+        let out = r
+            .execute(
+                "bash",
+                serde_json::json!({"command": "printf '%s' '你好'"}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("你好"), "{}", out.content);
+    }
+
+    #[tokio::test]
     async fn sandbox_blocks_escapes_allows_inside() {
         use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(format!("rupi-sbx-{}", std::process::id()));
@@ -1710,6 +1803,40 @@ mod tests {
             .await
             .unwrap();
         assert!(link.is_error);
+        // 悬空符号链接：canonicalize 失败时旧逻辑会把链接名当新建文件放行，
+        // write 跟随链接写到沙箱外。目标必须按链接指向判定。
+        let outside =
+            std::env::temp_dir().join(format!("rupi-sbx-dangle-out-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        symlink(&outside, root.join("sub/dangle")).unwrap();
+        let dangle = r
+            .execute(
+                "write",
+                serde_json::json!({"path": "sub/dangle", "content": "pwned"}),
+            )
+            .await
+            .unwrap();
+        assert!(dangle.is_error, "{}", dangle.content);
+        assert!(dangle.content.contains("escapes workspace root"));
+        assert!(
+            !outside.exists(),
+            "dangling symlink write escaped to {}",
+            outside.display()
+        );
+        // 指向沙箱内的悬空链接：解析到 root 内目标，放行
+        symlink("inside-new.txt", root.join("sub/oklink")).unwrap();
+        let ok_link = r
+            .execute(
+                "write",
+                serde_json::json!({"path": "sub/oklink", "content": "safe"}),
+            )
+            .await
+            .unwrap();
+        assert!(!ok_link.is_error, "{}", ok_link.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/inside-new.txt")).unwrap(),
+            "safe"
+        );
         // 不存在的新文件（父目录在内）放行，由内层 write 正常创建
         let fresh = r
             .execute(

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use rupi_core::ToolDefinition;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const USER_FILE: &str = "USER.md";
@@ -71,15 +72,41 @@ pub fn is_trivial_prompt(text: &str) -> bool {
     let lower = stripped.to_lowercase();
     let word = lower.trim_end_matches([
         ' ', '\t', '\n', '\r', '!', '?', '.', ':', ';', ',', '"', '\'', '~', '\u{2018}',
-        '\u{2019}', '\u{201c}', '\u{201d}', '\u{2014}', '\u{2013}', '\u{2026}', '(', ')', '[',
-        ']', '{', '}', '<', '>', '*', '&', '^', '%', '$', '#', '@', '+', '=', '`', '\u{a0}',
+        '\u{2019}', '\u{201c}', '\u{201d}', '\u{2014}', '\u{2013}', '\u{2026}', '(', ')', '[', ']',
+        '{', '}', '<', '>', '*', '&', '^', '%', '$', '#', '@', '+', '=', '`', '\u{a0}',
     ]);
     matches!(
         word,
-        "yes" | "no" | "ok" | "okay" | "sure" | "thanks" | "thank you" | "y" | "n"
-            | "yep" | "nope" | "yeah" | "nah" | "hi" | "hey" | "hello" | "yo" | "sup"
-            | "continue" | "go ahead" | "do it" | "proceed" | "got it" | "cool" | "nice"
-            | "great" | "done" | "next" | "lgtm" | "k"
+        "yes"
+            | "no"
+            | "ok"
+            | "okay"
+            | "sure"
+            | "thanks"
+            | "thank you"
+            | "y"
+            | "n"
+            | "yep"
+            | "nope"
+            | "yeah"
+            | "nah"
+            | "hi"
+            | "hey"
+            | "hello"
+            | "yo"
+            | "sup"
+            | "continue"
+            | "go ahead"
+            | "do it"
+            | "proceed"
+            | "got it"
+            | "cool"
+            | "nice"
+            | "great"
+            | "done"
+            | "next"
+            | "lgtm"
+            | "k"
     )
 }
 
@@ -90,7 +117,10 @@ pub fn is_trivial_prompt(text: &str) -> bool {
 pub fn core_tier(text: &str) -> (String, usize) {
     fn split_core(line: &str) -> Option<String> {
         let body = line.trim_start();
-        let body = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")).unwrap_or(body);
+        let body = body
+            .strip_prefix("- ")
+            .or_else(|| body.strip_prefix("* "))
+            .unwrap_or(body);
         let prefix = &line[..line.len() - body.len()];
         let tag = body.get(..6)?;
         if !tag.eq_ignore_ascii_case("[core]") {
@@ -270,7 +300,10 @@ impl MemoryStore {
         // 幂等：同纠正反复出现只记一条（行首 `- [日期] ` 前缀剥掉再比，日期不同也算重复）
         let want = entry.trim();
         let dup = content.lines().any(|l| {
-            let body = l.trim().strip_prefix("- [").and_then(|r| r.split_once("] "));
+            let body = l
+                .trim()
+                .strip_prefix("- [")
+                .and_then(|r| r.split_once("] "));
             match body {
                 Some((_, rest)) => rest.trim() == want,
                 None => l.trim() == want,
@@ -962,79 +995,104 @@ fn fts_phrase(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
+/// 当前 schema：v2 trigram FTS，v3 messages.blocks。已到此版本则跳过 DDL/回填。
+const SCHEMA_USER_VERSION: i64 = 3;
+
+fn apply_connection_pragmas(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    Ok(())
+}
+
+fn migrate_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
+         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT, blocks TEXT);
+         -- trigram 分词：中英文统一按子串可召回（unicode61 把中文整句当一个 token，
+         -- 子串永远查不到）；case_sensitive 0 保英文大小写不敏感
+         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+         -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
+         CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+           INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+         END;
+         -- 扩展记忆镜像（Hermes memories 对齐）：MEMORY.md / failures.md 写入即镜像一行，
+         -- `memory_search` 按需查，不注入每轮 prompt
+         CREATE TABLE IF NOT EXISTS memories(
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           target TEXT NOT NULL,
+           content TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+         CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+           INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+           INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+         END;
+         -- 存量补索引（老库升级路径）
+         INSERT INTO messages_fts(rowid, content)
+           SELECT rowid, content FROM messages
+           WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
+    )?;
+    // 分词器迁移（user_version<2 的 unicode61 老库）：FTS 表只是内容表的索引位，
+    // 删了按 trigram 重建再全量回填即可，触发器不受影响；新库建表即 trigram，直接标版本。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS messages_fts;
+             CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+             INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;
+             DROP TABLE IF EXISTS memory_fts;
+             CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
+             INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;
+             PRAGMA user_version = 2;",
+        )?;
+    }
+    // v3：messages.blocks —— 完整消息 JSON（含工具调用/结果/思考块），`--resume` 据此
+    // 结构化回填；老库补列（content 列语义不变，FTS 只索引 content）。
+    let has_blocks = {
+        let mut st = conn.prepare_cached("PRAGMA table_info(messages)")?;
+        let cols: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        cols.iter().any(|c| c == "blocks")
+    };
+    if !has_blocks {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN blocks TEXT;")?;
+    }
+    if version < SCHEMA_USER_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION};"))?;
+    }
+    Ok(())
+}
+
 impl SessionStore {
     pub fn open(home: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(home)?;
-        let conn = rusqlite::Connection::open(home.join("sessions.db"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile TEXT, created_at TEXT, summary TEXT);
-             CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT, blocks TEXT);
-             -- trigram 分词：中英文统一按子串可召回（unicode61 把中文整句当一个 token，
-             -- 子串永远查不到）；case_sensitive 0 保英文大小写不敏感
-             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-             -- 外部内容表必须靠触发器同步，否则 FTS 永远查不到
-             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-               INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-               INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-             END;
-             -- 扩展记忆镜像（Hermes memories 对齐）：MEMORY.md / failures.md 写入即镜像一行，
-             -- `memory_search` 按需查，不注入每轮 prompt
-             CREATE TABLE IF NOT EXISTS memories(
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               target TEXT NOT NULL,
-               content TEXT NOT NULL,
-               created_at TEXT NOT NULL
-             );
-             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-             CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-               INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-               INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-             END;
-             -- 存量补索引（老库升级路径）
-             INSERT INTO messages_fts(rowid, content)
-               SELECT rowid, content FROM messages
-               WHERE rowid NOT IN (SELECT rowid FROM messages_fts);",
-        )?;
-        // 分词器迁移（user_version<2 的 unicode61 老库）：FTS 表只是内容表的索引位，
-        // 删了按 trigram 重建再全量回填即可，触发器不受影响；新库建表即 trigram，直接标版本。
+        let db_path = home.join("sessions.db");
+        let conn = rusqlite::Connection::open(&db_path)?;
+        // 每条连接都要设：WAL / 同步级别 / 忙等。DDL 只在 schema 未到最新时跑
+        //（同进程反复 open 已迁库不再重放 CREATE/FTS 回填；删库重建 user_version=0 会重跑）。
+        apply_connection_pragmas(&conn)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 2 {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS messages_fts;
-                 CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-                 INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;
-                 DROP TABLE IF EXISTS memory_fts;
-                 CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='trigram case_sensitive 0');
-                 INSERT INTO memory_fts(rowid, content) SELECT rowid, content FROM memories;
-                 PRAGMA user_version = 2;",
-            )?;
-        }
-        // v3：messages.blocks —— 完整消息 JSON（含工具调用/结果/思考块），`--resume` 据此
-        // 结构化回填；老库补列（content 列语义不变，FTS 只索引 content）。
-        let has_blocks = {
-            let mut st = conn.prepare("PRAGMA table_info(messages)")?;
-            let cols: Vec<String> = st
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            cols.iter().any(|c| c == "blocks")
-        };
-        if !has_blocks {
-            conn.execute_batch("ALTER TABLE messages ADD COLUMN blocks TEXT;")?;
-        }
-        if version < 3 {
-            conn.execute_batch("PRAGMA user_version = 3;")?;
+        if version < SCHEMA_USER_VERSION {
+            migrate_schema(&conn)?;
         }
         Ok(Self { conn })
     }
 
+    fn execute_cached(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<usize> {
+        Ok(self.conn.prepare_cached(sql)?.execute(params)?)
+    }
+
     pub fn create_session(&self, profile: &str) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO sessions(id, profile, created_at, summary) VALUES(?,?,?,?)",
             rusqlite::params![id, profile, chrono::Utc::now().to_rfc3339(), String::new()],
         )?;
@@ -1043,7 +1101,7 @@ impl SessionStore {
 
     /// 写回压缩摘要（`sessions.summary`）。
     pub fn set_summary(&self, session_id: &str, summary: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "UPDATE sessions SET summary = ? WHERE id = ?",
             rusqlite::params![summary, session_id],
         )?;
@@ -1052,20 +1110,18 @@ impl SessionStore {
 
     /// 会话是否存在（`session-show` 未知 id 给提示，不与空会话混淆）。
     pub fn has_session(&self, session_id: &str) -> anyhow::Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE id = ?",
-            rusqlite::params![session_id],
-            |r| r.get::<_, i64>(0),
-        )? > 0)
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM sessions WHERE id = ?")?;
+        Ok(stmt.query_row(rusqlite::params![session_id], |r| r.get::<_, i64>(0))? > 0)
     }
 
     /// 读回压缩摘要（resume 时可预热窗口；当前 CLI 只展示）。
     pub fn get_summary(&self, session_id: &str) -> anyhow::Result<String> {
-        Ok(self.conn.query_row(
-            "SELECT summary FROM sessions WHERE id = ?",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )?)
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT summary FROM sessions WHERE id = ?")?;
+        Ok(stmt.query_row(rusqlite::params![session_id], |r| r.get(0))?)
     }
 
     pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
@@ -1093,7 +1149,7 @@ impl SessionStore {
         content: &str,
         blocks: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO messages(id, session_id, role, content, created_at, blocks) VALUES(?,?,?,?,?,?)",
             rusqlite::params![
                 id,
@@ -1110,7 +1166,7 @@ impl SessionStore {
     /// session_search：跨会话全文检索（FTS5），供 agent 回忆历史上下文。
     /// FTS 表只存 content，session_id 回 join messages 取。
     pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT m.session_id, snippet(messages_fts, 0, '<b>', '</b>', '...', 20)
              FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
@@ -1128,7 +1184,7 @@ impl SessionStore {
         &self,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT s.id, s.profile, s.created_at, COUNT(m.id)
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
              GROUP BY s.id ORDER BY s.created_at DESC LIMIT ?",
@@ -1147,7 +1203,7 @@ impl SessionStore {
 
     /// 扩展记忆镜像写入（target: 'memory' | 'failure'），供 `memory_search` 查询。
     pub fn mirror_memory_entry(&self, target: &str, content: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.execute_cached(
             "INSERT INTO memories(target, content, created_at) VALUES(?,?,?)",
             rusqlite::params![target, content, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -1161,7 +1217,7 @@ impl SessionStore {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT m.target, snippet(memory_fts, 0, '<b>', '</b>', '...', 20)
              FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
              WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
@@ -1181,7 +1237,7 @@ impl SessionStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
@@ -1203,7 +1259,7 @@ impl SessionStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<SessionRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, role, content, created_at, blocks FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
         )?;
         let rows = stmt
@@ -1242,7 +1298,9 @@ impl SessionRecord {
             }
         }
         match self.role.as_str() {
-            "assistant" => rupi_core::Message::text(rupi_core::Role::Assistant, self.content.clone()),
+            "assistant" => {
+                rupi_core::Message::text(rupi_core::Role::Assistant, self.content.clone())
+            }
             "tool" => rupi_core::Message::text(
                 rupi_core::Role::User,
                 format!("[tool result]\n{}", self.content),
@@ -1410,7 +1468,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jsonl_provider_prefetch_sync_recall() {        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
+    async fn jsonl_provider_prefetch_sync_recall() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let mut p = JsonlProvider::new(10);
         p.initialize(&home).await.unwrap();
@@ -1497,7 +1556,10 @@ mod tests {
         assert!(hit.contains("sess-old"), "{hit}");
         assert!(hit.contains("elephant"), "{hit}");
         let miss = mgr
-            .handle_tool_call("session_search", serde_json::json!({"query": "zzz-no-match"}))
+            .handle_tool_call(
+                "session_search",
+                serde_json::json!({"query": "zzz-no-match"}),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1583,9 +1645,10 @@ mod tests {
         let store = MemoryStore::new(home.clone());
         store.apply_write("add", "my editor is vim").unwrap();
         store.apply_write("add", "  my editor is vim  ").unwrap();
-        store.apply_write("add", "my editor is vim with plugins").unwrap();
-        let content =
-            std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
+        store
+            .apply_write("add", "my editor is vim with plugins")
+            .unwrap();
+        let content = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
         assert_eq!(content.matches("my editor is vim").count(), 2, "{content}");
         assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
         let _ = std::fs::remove_dir_all(&home);
@@ -1597,18 +1660,22 @@ mod tests {
         let home = std::env::temp_dir().join(format!("rupi-mem-faildup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.record_failure("wrong directory; check pwd first").unwrap();
-        store.record_failure("wrong directory; check pwd first").unwrap();
+        store
+            .record_failure("wrong directory; check pwd first")
+            .unwrap();
+        store
+            .record_failure("wrong directory; check pwd first")
+            .unwrap();
         store.record_failure("forgot to run tests").unwrap();
-        let content =
-            std::fs::read_to_string(home.join("memories").join("failures.md")).unwrap();
+        let content = std::fs::read_to_string(home.join("memories").join("failures.md")).unwrap();
         assert_eq!(content.matches("wrong directory").count(), 1, "{content}");
         assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn memory_writes_mirror_into_sqlite_and_searchable() {        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
+    fn memory_writes_mirror_into_sqlite_and_searchable() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
         store
@@ -1839,6 +1906,43 @@ mod tests {
         assert_eq!(store.get_summary(&sid).unwrap(), "talked tea");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn session_store_pragmas_reopen_and_recreate() {
+        let home = std::env::temp_dir().join(format!(
+            "rupi-mem-pragma-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let db = SessionStore::open(&home).unwrap();
+        let sync: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous should be NORMAL");
+        let busy: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
+        let sid = db.create_session("p").unwrap();
+        drop(db);
+        // 同进程再开：user_version 已是最新，跳过 DDL；pragma 仍要落到新连接上
+        let db2 = SessionStore::open(&home).unwrap();
+        assert!(db2.has_session(&sid).unwrap());
+        let sync2: i64 = db2
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync2, 1);
+        drop(db2);
+        let _ = std::fs::remove_dir_all(&home);
+        // 同路径删库再建：空库 user_version=0，必须重跑 DDL
+        let db3 = SessionStore::open(&home).unwrap();
+        assert!(db3.create_session("q").is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[cfg(test)]
@@ -1855,7 +1959,10 @@ mod merge_tests {
     #[test]
     fn core_tier_keeps_only_tagged_lines_and_counts_extended() {
         let (out, ext) = core_tier("- [core] prefers tabs\n- [CORE] repo uses cargo\n- some verbose note\n\n- another note\n");
-        assert!(out.starts_with("- prefers tabs\n- repo uses cargo\n"), "{out}");
+        assert!(
+            out.starts_with("- prefers tabs\n- repo uses cargo\n"),
+            "{out}"
+        );
         assert!(out.contains("2 extended entries not shown"), "{out}");
         assert_eq!(ext, 2);
         // 多字节字符不在字节边界上切（get(..6) 安全）
@@ -1865,15 +1972,23 @@ mod merge_tests {
 
     #[test]
     fn memory_text_applies_core_tier_and_grep_finds_extended() {
-        let home = std::env::temp_dir().join(format!("rupi-core-tier-{}-{}", std::process::id(), line!()));
+        let home =
+            std::env::temp_dir().join(format!("rupi-core-tier-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.apply_write("add", "[core] always run cargo test").unwrap();
-        store.apply_write("add", "the deploy script lives in ops/deploy.sh").unwrap();
+        store
+            .apply_write("add", "[core] always run cargo test")
+            .unwrap();
+        store
+            .apply_write("add", "the deploy script lives in ops/deploy.sh")
+            .unwrap();
         let text = store.memory_text();
         assert!(text.contains("always run cargo test"), "{text}");
         assert!(!text.contains("[core]"), "{text}");
-        assert!(!text.contains("ops/deploy.sh"), "extended must stay out of prompt: {text}");
+        assert!(
+            !text.contains("ops/deploy.sh"),
+            "extended must stay out of prompt: {text}"
+        );
         let hits = store.grep_memory_files("DEPLOY.sh", 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "memory");
@@ -1883,7 +1998,11 @@ mod merge_tests {
 
     #[test]
     fn session_records_roundtrip_blocks_and_legacy_rows() {
-        let home = std::env::temp_dir().join(format!("rupi-sess-blocks-{}-{}", std::process::id(), line!()));
+        let home = std::env::temp_dir().join(format!(
+            "rupi-sess-blocks-{}-{}",
+            std::process::id(),
+            line!()
+        ));
         let _ = std::fs::remove_dir_all(&home);
         let db = SessionStore::open(&home).unwrap();
         let sid = db.create_session("t").unwrap();
@@ -1904,19 +2023,38 @@ mod merge_tests {
             provider: None,
             created_at: chrono::Utc::now(),
         };
-        db.add_message_with_id("n0", &sid, "user", "legacy user row").unwrap();
-        db.add_message_full("n1", &sid, "assistant", &asst.full_text(), serde_json::to_string(&asst).ok().as_deref()).unwrap();
-        db.add_message_full("n2", &sid, "tool", &tool.full_text(), serde_json::to_string(&tool).ok().as_deref()).unwrap();
+        db.add_message_with_id("n0", &sid, "user", "legacy user row")
+            .unwrap();
+        db.add_message_full(
+            "n1",
+            &sid,
+            "assistant",
+            &asst.full_text(),
+            serde_json::to_string(&asst).ok().as_deref(),
+        )
+        .unwrap();
+        db.add_message_full(
+            "n2",
+            &sid,
+            "tool",
+            &tool.full_text(),
+            serde_json::to_string(&tool).ok().as_deref(),
+        )
+        .unwrap();
         let recs = db.session_records(&sid, 10).unwrap();
         assert_eq!(recs.len(), 3);
         assert!(recs[0].blocks.is_none());
         assert_eq!(recs[0].to_message().role, rupi_core::Role::User);
         let m1 = recs[1].to_message();
         assert_eq!(m1.role, rupi_core::Role::Assistant);
-        assert!(m1.blocks.iter().any(|b| matches!(b, rupi_core::ContentBlock::ToolCall { name, .. } if name == "read")));
+        assert!(m1.blocks.iter().any(
+            |b| matches!(b, rupi_core::ContentBlock::ToolCall { name, .. } if name == "read")
+        ));
         let m2 = recs[2].to_message();
         assert_eq!(m2.role, rupi_core::Role::Tool);
-        assert!(matches!(&m2.blocks[0], rupi_core::ContentBlock::ToolResult { content, .. } if content == "file body"));
+        assert!(
+            matches!(&m2.blocks[0], rupi_core::ContentBlock::ToolResult { content, .. } if content == "file body")
+        );
         // 老接口仍可用且 FTS 能搜到工具结果文本
         assert_eq!(db.session_messages(&sid, 10).unwrap().len(), 3);
         assert!(!db.search("file body", 5).unwrap().is_empty());
@@ -1925,7 +2063,8 @@ mod merge_tests {
 
     #[test]
     fn legacy_db_without_blocks_column_is_migrated() {
-        let home = std::env::temp_dir().join(format!("rupi-migrate3-{}-{}", std::process::id(), line!()));
+        let home =
+            std::env::temp_dir().join(format!("rupi-migrate3-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         {
@@ -1943,8 +2082,12 @@ mod merge_tests {
         let recs = db.session_records("s1", 10).unwrap();
         assert_eq!(recs.len(), 1);
         assert!(recs[0].blocks.is_none());
-        db.add_message_full("m2", "s1", "assistant", "new", Some("{}")).unwrap();
-        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        db.add_message_full("m2", "s1", "assistant", "new", Some("{}"))
+            .unwrap();
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, 3);
         let _ = std::fs::remove_dir_all(&home);
     }
