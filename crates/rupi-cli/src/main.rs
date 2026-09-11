@@ -1095,17 +1095,22 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             print!("{}", session.tree_view());
             continue;
         }
-        // 手动压实（对标上游 /compact）：阈值外的主动压缩，短历史给反馈不烧模型
-        if input == "/compact" {
+        // 手动压实（对标上游 /compact）：阈值外的主动压缩，短历史给反馈不烧模型；
+        // `/compact <prompt>` 追加自定义摘要指令（Additional focus）。
+        if input == "/compact" || input.starts_with("/compact ") {
+            let prompt = input
+                .strip_prefix("/compact")
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
             let before = session.summary.clone();
             agent
-                .force_compress_with_event(&*provider, &mut session, &mem, &|e| match e {
+                .force_compress_with_prompt(&*provider, &mut session, &mem, &|e| match e {
                     rupi_core::AgentEvent::CompactionStart => eprintln!("[compacting]…"),
                     rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
                         eprintln!("[compacted: summarized {summarized}, kept {kept}]")
                     }
                     _ => {}
-                })
+                }, prompt)
                 .await;
             if session.summary != before && session.summary.is_some() {
                 println!("[compacted]");

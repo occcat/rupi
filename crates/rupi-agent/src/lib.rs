@@ -824,7 +824,7 @@ impl AgentLoop {
         mem: &MemoryManager,
         on_event: &(dyn Fn(AgentEvent) + Sync),
     ) {
-        self.compress_inner(provider, session, mem, false, on_event)
+        self.compress_inner(provider, session, mem, false, on_event, None)
             .await;
     }
 
@@ -848,7 +848,22 @@ impl AgentLoop {
         mem: &MemoryManager,
         on_event: &(dyn Fn(AgentEvent) + Sync),
     ) {
-        self.compress_inner(provider, session, mem, true, on_event)
+        self.compress_inner(provider, session, mem, true, on_event, None)
+            .await;
+    }
+
+    /// 带自定义指令的强制压实（对标上游 `/compact [prompt]`）：`prompt` 拼到摘要
+    /// system 后（`Additional focus`），空串视为无指令。
+    pub async fn force_compress_with_prompt(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        mem: &MemoryManager,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+        prompt: Option<&str>,
+    ) {
+        let prompt = prompt.map(str::trim).filter(|p| !p.is_empty());
+        self.compress_inner(provider, session, mem, true, on_event, prompt)
             .await;
     }
 
@@ -859,6 +874,7 @@ impl AgentLoop {
         mem: &MemoryManager,
         force: bool,
         on_event: &(dyn Fn(AgentEvent) + Sync),
+        extra_prompt: Option<&str>,
     ) {
         // 压实参数先按模型覆盖解析：小模型窗口紧、旗舰可放宽，各走各的阈值。
         let (threshold_chars, keep_last) = self.compression_for(provider);
@@ -905,7 +921,12 @@ impl AgentLoop {
         }
         input.push_str(&chunk.join("\n---\n"));
         let req = ChatRequest {
-            system: "Summarize this conversation prefix concisely. Keep durable facts, decisions, and open loops. Be brief.".into(),
+            system: match extra_prompt {
+                Some(p) => format!(
+                    "Summarize this conversation prefix concisely. Keep durable facts, decisions, and open loops. Be brief.\n\nAdditional focus:\n{p}"
+                ),
+                None => "Summarize this conversation prefix concisely. Keep durable facts, decisions, and open loops. Be brief.".into(),
+            },
             messages: vec![Message::text(Role::User, input)],
             tools: vec![],
             max_tokens: None,
@@ -1650,6 +1671,41 @@ mod tests {
             )
             .await;
         assert!(tiny.summary.is_none(), "条数不够切时 force 应无操作");
+    }
+
+    #[tokio::test]
+    async fn force_compress_with_prompt_appends_focus() {
+        // `/compact <prompt>`：自定义指令拼进摘要 system（Additional focus），
+        // 空串回退默认指令。
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 2);
+        let home = std::env::temp_dir().join(format!("rupi-agent-cprompt-{}", std::process::id()));
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let mk_session = || {
+            let mut s = SessionTree::new();
+            for i in 0..6 {
+                s.push(Message::text(
+                    Role::User,
+                    format!("long message number {i} with padding xxxxxxxxxx"),
+                ));
+            }
+            s
+        };
+        let provider = MockProvider::new(vec![MockProvider::text_response("S")]);
+        let mut session = mk_session();
+        agent
+            .force_compress_with_prompt(&provider, &mut session, &mem, &|_| {}, Some("keep file list"))
+            .await;
+        let systems = provider.seen_systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 1);
+        assert!(systems[0].contains("Additional focus"), "{}", systems[0]);
+        assert!(systems[0].contains("keep file list"), "{}", systems[0]);
+        let provider = MockProvider::new(vec![MockProvider::text_response("S")]);
+        let mut session = mk_session();
+        agent
+            .force_compress_with_prompt(&provider, &mut session, &mem, &|_| {}, None)
+            .await;
+        let systems = provider.seen_systems.lock().unwrap().clone();
+        assert!(!systems[0].contains("Additional focus"), "{}", systems[0]);
     }
 
     #[tokio::test]

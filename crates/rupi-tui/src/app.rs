@@ -165,7 +165,7 @@ fn collect_followup(buf: &mut String, key: &KeyEvent) -> bool {
 enum Builtin {
     Quit,
     Done(String),
-    Compact,
+    Compact(Option<String>),
     Pass,
 }
 
@@ -277,9 +277,15 @@ fn dispatch_builtin(
             ),
         };
     }
-    if t == "/compact" {
-        // 压实调模型是 async：这里只做标记，run_loop 内 await 执行（与 REPL /compact 同反馈文案）
-        return Builtin::Compact;
+    if t == "/compact" || t.starts_with("/compact ") {
+        // 压实调模型是 async：这里只做标记（带自定义指令），run_loop 内 await 执行
+        // （与 REPL /compact 同反馈文案）。
+        let prompt = t
+            .strip_prefix("/compact")
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        return Builtin::Compact(prompt);
     }
     Builtin::Pass
 }
@@ -363,18 +369,19 @@ async fn run_loop(
                             view.push_system(msg);
                             continue;
                         }
-                        Builtin::Compact => {
+                        Builtin::Compact(prompt) => {
                             let before = ctx.session.summary.clone();
                             let buffered =
                                 std::sync::Mutex::new(Vec::<rupi_core::AgentEvent>::new());
                             ctx.agent
-                                .force_compress_with_event(
+                                .force_compress_with_prompt(
                                     &**ctx.provider,
                                     ctx.session,
                                     ctx.mem,
                                     &|e| {
                                         buffered.lock().unwrap().push(e);
                                     },
+                                    prompt.as_deref(),
                                 )
                                 .await;
                             for e in buffered.lock().unwrap().drain(..) {
@@ -1041,7 +1048,8 @@ mod tests {
 
     #[test]
     fn compact_maps_to_marker_not_model() {
-        // /compact 只做标记（async 压实由 run_loop 执行），绝不漏进模型
+        // /compact 只做标记（async 压实由 run_loop 执行），绝不漏进模型；
+        // 带参版本透传自定义指令。
         let (mut agent, mut session, mut provider, skills) = harness();
         assert!(matches!(
             dispatch_builtin(
@@ -1055,7 +1063,21 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
             ),
-            Builtin::Compact
+            Builtin::Compact(None)
+        ));
+        assert!(matches!(
+            dispatch_builtin(
+                "/compact focus on file list",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+            ),
+            Builtin::Compact(Some(_))
         ));
     }
 

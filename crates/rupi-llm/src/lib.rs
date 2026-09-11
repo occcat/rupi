@@ -638,6 +638,8 @@ pub struct MockProvider {
     pub script: std::sync::Mutex<Vec<ChatResponse>>,
     /// 每轮请求携带的工具数（断言工具可见性变化用，如渐进式发现）。
     pub seen_tools: std::sync::Mutex<Vec<usize>>,
+    /// 每轮请求的 system 提示（断言压实自定义指令等 system 拼装用）。
+    pub seen_systems: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockProvider {
@@ -645,6 +647,7 @@ impl MockProvider {
         Self {
             script: std::sync::Mutex::new(script),
             seen_tools: std::sync::Mutex::new(vec![]),
+            seen_systems: std::sync::Mutex::new(vec![]),
         }
     }
 
@@ -663,6 +666,7 @@ impl LlmProvider for MockProvider {
     }
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.seen_tools.lock().unwrap().push(req.tools.len());
+        self.seen_systems.lock().unwrap().push(req.system.clone());
         let mut g = self.script.lock().unwrap();
         if g.is_empty() {
             Ok(Self::text_response("done"))
