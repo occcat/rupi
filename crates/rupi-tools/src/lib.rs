@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use rupi_core::{CancelFlag, ToolDefinition};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 mod truncate;
@@ -636,6 +636,10 @@ impl Tool for BashTool {
         }
     }
     /// 真抢占：取消置位即 kill 子进程并回收，已产出内容随取消错误一并返回。
+    ///
+    /// stdout/stderr 自 spawn 起由两个 reader task 并发排空（有界 50KB 尾部 ring），
+    /// 避免子进程写满 ~64KB 管道缓冲后阻塞、`wait` 永远等不到（P0 死锁）。
+    /// 超时/取消同样先保证排空在跑，再杀进程组，最后回收 reader。
     async fn execute_with_cancel(
         &self,
         arguments: serde_json::Value,
@@ -656,26 +660,28 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::err(format!("spawn failed: {e}"))),
         };
+        // 先拿走管道再 wait：reader 与 wait/取消/超时并发，写满缓冲也不会堵死子进程。
+        let out_task = tokio::spawn(Self::read_pipe_tail(child.stdout.take(), DEFAULT_MAX_BYTES));
+        let err_task = tokio::spawn(Self::read_pipe_tail(child.stderr.take(), DEFAULT_MAX_BYTES));
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
         tokio::pin!(timeout);
-        // wait 只等退出（&mut，不移动 child，select 三分支借用互不冲突），
-        // stdout/stderr 随后手动排空（进程退出/kill 后读必到 EOF）。
         enum End {
             Done(std::process::ExitStatus),
             Cancelled,
             TimedOut,
+            WaitFailed(String),
         }
         let end = tokio::select! {
             _ = cancel.cancelled() => End::Cancelled,
             _ = &mut timeout => End::TimedOut,
             res = child.wait() => match res {
                 Ok(status) => End::Done(status),
-                Err(e) => return Ok(ToolOutput::err(format!("wait failed: {e}"))),
+                Err(e) => End::WaitFailed(e.to_string()),
             },
         };
         match end {
             End::Done(status) => {
-                let (out_text, err_text) = Self::drain(&mut child).await;
+                let (out_text, err_text) = Self::join_pipe_readers(out_task, err_task, None).await;
                 let mut s = out_text;
                 if !err_text.is_empty() {
                     s.push_str(&format!("\n[stderr]\n{err_text}"));
@@ -691,12 +697,12 @@ impl Tool for BashTool {
                 Self::kill_tree(&mut child).await;
                 // 残余输出只等 500ms：孙进程可能继承管道写端（如 sh -c fork 出子进程），
                 // 无限等会拖到命令自然结束，违背取消语义；超时则舍弃残余直接返回。
-                let (out_text, _) = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    Self::drain(&mut child),
+                let (out_text, _) = Self::join_pipe_readers(
+                    out_task,
+                    err_task,
+                    Some(std::time::Duration::from_millis(500)),
                 )
-                .await
-                .unwrap_or_default();
+                .await;
                 let partial = truncate_middle(&out_text, MAX_TOOL_OUTPUT);
                 let mut msg = String::from("cancelled by user");
                 if !partial.is_empty() {
@@ -706,9 +712,26 @@ impl Tool for BashTool {
             }
             End::TimedOut => {
                 Self::kill_tree(&mut child).await;
+                // 杀后再回收 reader：排空已入 ring 的尾部，避免管道/任务泄漏。
+                let _ = Self::join_pipe_readers(
+                    out_task,
+                    err_task,
+                    Some(std::time::Duration::from_millis(500)),
+                )
+                .await;
                 Ok(ToolOutput::err(format!(
                     "command timed out after {timeout_secs}s"
                 )))
+            }
+            End::WaitFailed(e) => {
+                Self::kill_tree(&mut child).await;
+                let _ = Self::join_pipe_readers(
+                    out_task,
+                    err_task,
+                    Some(std::time::Duration::from_millis(500)),
+                )
+                .await;
+                Ok(ToolOutput::err(format!("wait failed: {e}")))
             }
         }
     }
@@ -741,22 +764,83 @@ impl BashTool {
         let _ = child.wait().await;
     }
 
-    /// 排空子进程 stdout/stderr 管道。进程退出（或 kill+wait 回收）后读必到 EOF，
-    /// 故本函数必返回，不会挂起。
-    async fn drain(child: &mut tokio::process::Child) -> (String, String) {
+    /// 并发排空一条管道，只保留最后 `max_bytes`（对标 bash 50KB 尾部）。
+    async fn read_pipe_tail<R: tokio::io::AsyncRead + Unpin + Send>(
+        reader: Option<R>,
+        max_bytes: usize,
+    ) -> PipeTail {
         use tokio::io::AsyncReadExt as _;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        if let Some(mut o) = child.stdout.take() {
-            let _ = o.read_to_end(&mut out).await;
+        let mut tail = PipeTail::new(max_bytes);
+        let Some(mut r) = reader else {
+            return tail;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => tail.push(&chunk[..n]),
+            }
         }
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_end(&mut err).await;
+        tail
+    }
+
+    /// 回收两个 reader。`limit` 用于取消/超时：孙进程占着写端时不能无限等。
+    async fn join_pipe_readers(
+        out_task: tokio::task::JoinHandle<PipeTail>,
+        err_task: tokio::task::JoinHandle<PipeTail>,
+        limit: Option<std::time::Duration>,
+    ) -> (String, String) {
+        let join = async {
+            let (o, e) = tokio::join!(out_task, err_task);
+            (
+                o.unwrap_or_else(|_| PipeTail::new(0)).into_string(),
+                e.unwrap_or_else(|_| PipeTail::new(0)).into_string(),
+            )
+        };
+        match limit {
+            None => join.await,
+            Some(d) => tokio::time::timeout(d, join).await.unwrap_or_default(),
         }
-        (
-            String::from_utf8_lossy(&out).to_string(),
-            String::from_utf8_lossy(&err).to_string(),
-        )
+    }
+}
+
+/// 有界尾部 ring：只留最后 `max` 字节，避免排空管道时把整段输出读进内存。
+struct PipeTail {
+    buf: VecDeque<u8>,
+    max: usize,
+}
+
+impl PipeTail {
+    fn new(max: usize) -> Self {
+        Self {
+            buf: VecDeque::new(),
+            max,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if self.max == 0 {
+            return;
+        }
+        if chunk.len() >= self.max {
+            self.buf.clear();
+            self.buf
+                .extend(chunk[chunk.len() - self.max..].iter().copied());
+            return;
+        }
+        let next = self.buf.len() + chunk.len();
+        if next > self.max {
+            self.buf.drain(..next - self.max);
+        }
+        self.buf.extend(chunk.iter().copied());
+    }
+
+    fn into_string(self) -> String {
+        let v: Vec<u8> = self.buf.into_iter().collect();
+        String::from_utf8_lossy(&v).into_owned()
     }
 }
 
@@ -1140,6 +1224,87 @@ mod tests {
             .unwrap();
         assert!(!ok.is_error);
         assert!(ok.content.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_path_drains_large_pipes_without_deadlock() {
+        // P0：execute_with_cancel 若先 wait 再排空，stdout/stderr 超过 ~64KB 管道
+        // 缓冲就会死锁到 timeout。seq 1 20000 ≈ 110KB，必须秒级成功并保尾。
+        use rupi_core::CancelFlag;
+        let tool = BashTool;
+        let cancel = CancelFlag::new();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            tool.execute_with_cancel(
+                serde_json::json!({"command": "seq 1 20000", "timeout_secs": 30}),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("stdout pipe deadlock: execute_with_cancel hung")
+        .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("timed out"),
+            "large stdout must not hit timeout: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("20000"),
+            "tail must be kept: {}",
+            out.content
+        );
+        assert!(out.content.len() <= DEFAULT_MAX_BYTES + 256);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            tool.execute_with_cancel(
+                serde_json::json!({"command": "seq 1 20000 >&2", "timeout_secs": 30}),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("stderr pipe deadlock: execute_with_cancel hung")
+        .unwrap();
+        assert!(
+            !err.content.contains("timed out"),
+            "large stderr must not hit timeout: {}",
+            err.content
+        );
+        assert!(err.content.contains("20000"), "{}", err.content);
+        assert!(err.content.len() <= DEFAULT_MAX_BYTES + 256);
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_path_timeout_still_kills() {
+        use rupi_core::CancelFlag;
+        let tool = BashTool;
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute_with_cancel(
+                serde_json::json!({"command": "sleep 30", "timeout_secs": 1}),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(8));
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn pipe_tail_keeps_only_last_bytes() {
+        let mut t = PipeTail::new(8);
+        t.push(b"abcdefghij");
+        assert_eq!(t.into_string(), "cdefghij");
+        let mut t = PipeTail::new(8);
+        t.push(b"abcd");
+        t.push(b"efghij");
+        assert_eq!(t.into_string(), "cdefghij");
     }
 
     #[tokio::test]
