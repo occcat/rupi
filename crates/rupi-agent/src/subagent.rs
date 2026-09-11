@@ -94,8 +94,7 @@ pub async fn run_subagents(
 
 /// 模型可调用的委托工具：自包含子任务（无父会话上下文），跑完只回摘要。
 /// 非交互：无审批器，Ask 一律拒绝；递归深度达 `max_depth` 时子会话不再配 `subagent` 工具。
-/// 父循环的取消不继承：`Tool::execute` 无取消通道，子循环用 fresh flag 跑到头
-/// （`max_turns` 封顶），in-flight 子任务不受 Esc/Ctrl-C 打断。
+/// 父取消经 `execute_with_cancel` 直透内层循环（Esc/Ctrl-C 下一检查点停，不再跑到头）。
 pub struct SubagentTool {
     provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
@@ -247,8 +246,40 @@ impl SubagentTool {
             .find(|m| m.role == rupi_core::Role::Assistant)
             .map(|m| m.full_text())
             .unwrap_or_default();
+        // 子任务工具清单：父模型可见子 agent 动了哪些工具（只回摘要时黑盒，
+        // 父无法判断摘要可信度/是否需追问）；失败调用标 `!`（按 id 回查工具名）。
+        let mut names = std::collections::HashMap::new();
+        for m in session.history() {
+            for b in &m.blocks {
+                if let rupi_core::ContentBlock::ToolCall { id, name, .. } = b {
+                    names.insert(id.clone(), name.clone());
+                }
+            }
+        }
+        let mut calls: Vec<String> = vec![];
+        for m in session.history() {
+            for b in &m.blocks {
+                match b {
+                    rupi_core::ContentBlock::ToolCall { name, .. } => calls.push(name.clone()),
+                    rupi_core::ContentBlock::ToolResult {
+                        tool_call_id,
+                        is_error: true,
+                        ..
+                    } => {
+                        let n = names.get(tool_call_id).cloned().unwrap_or_default();
+                        calls.push(format!("{n}!"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let manifest = if calls.is_empty() {
+            "no tool calls".to_string()
+        } else {
+            format!("{} tool call(s): {}", calls.len(), calls.join(", "))
+        };
         Ok(rupi_tools::ToolOutput::ok(format!(
-            "[subagent {reason:?}]\n{summary}"
+            "[subagent {reason:?} | {manifest}]\n{summary}"
         )))
     }
 }
@@ -290,6 +321,50 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("sub done"));
+        // 无工具调用时清单明示（父模型不猜）
+        assert!(out.content.contains("no tool calls"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn subagent_receipt_lists_tool_calls() {
+        // 子任务调过工具：回执头带清单（含失败标记位），父模型可见子干了什么。
+        use rupi_core::{ContentBlock, Message, Role};
+        use rupi_llm::ChatResponse;
+        let read_call = ChatResponse {
+            message: Message {
+                id: "m1".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/no/such/file.txt"}),
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let (p, t, m, f, s) = ctx();
+        let tool = SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                read_call,
+                MockProvider::text_response("sub done"),
+            ])),
+            t,
+            m,
+            f,
+            s,
+            3,
+        );
+        let out = tool
+            .execute(serde_json::json!({"goal": "do thing"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        // read 不存在的文件：调用 + 失败标记双双进清单
+        assert!(out.content.contains("read"), "{}", out.content);
+        assert!(out.content.contains("read!"), "{}", out.content);
+        let _ = p;
     }
 
     /// 父取消直透子循环：预置位的 flag 进来，内层 run 起手即停，
