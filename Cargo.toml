@@ -11,6 +11,8 @@ members = [
   "crates/rupi-ext",
   "crates/rupi-tui",
   "crates/rupi-cli",
+  "crates/rupi-pkg",
+  "crates/rupi-benches",
 ]
 resolver = "2"
 

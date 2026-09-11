@@ -222,12 +222,47 @@ enum Cmd {
         #[arg(long)]
         url: Option<String>,
     },
+    /// 从 git:/npm:/本地路径安装 skill、command、extension（对标 `pi install`）
+    Install {
+        /// `git:host/user/repo[@ref]`、`npm:@scope/pkg[@ver]`、https/ssh URL、或本地路径
+        spec: String,
+        /// 写入项目 `.rupi/`（默认 `$RUPI_HOME` / `~/.rupi`）
+        #[arg(short = 'l', long)]
+        local: bool,
+        /// 只装一类：skill / command / extension（默认按包内资源全装）
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// 卸载 `install` 写入的包
+    Uninstall {
+        spec: String,
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
+    /// 列出已安装包
+    Packages {
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
 }
 
 fn home_dir() -> PathBuf {
     std::env::var("RUPI_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dirs_home().join(".rupi"))
+}
+
+fn pkg_opts(
+    home: &PathBuf,
+    local: bool,
+    kind: Option<&str>,
+) -> anyhow::Result<rupi_pkg::InstallOpts> {
+    Ok(rupi_pkg::InstallOpts {
+        home: home.clone(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| home.clone()),
+        local,
+        kind: rupi_pkg::ResourceKind::parse(kind)?,
+    })
 }
 
 fn dirs_home() -> PathBuf {
@@ -677,6 +712,35 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "== {role} @ {created} [{}] ==\n{content}",
                     &id[..8.min(id.len())]
+                );
+            }
+        }
+        Some(Cmd::Install { spec, local, kind }) => {
+            let opts = pkg_opts(&home, local, kind.as_deref())?;
+            let report = rupi_pkg::install(&spec, &opts).await?;
+            println!("{}", rupi_pkg::format_report(&report));
+        }
+        Some(Cmd::Uninstall { spec, local }) => {
+            let opts = pkg_opts(&home, local, None)?;
+            let rec = rupi_pkg::uninstall(&spec, &opts)?;
+            println!("removed {} ({})", rec.name, rec.id);
+        }
+        Some(Cmd::Packages { local }) => {
+            let opts = pkg_opts(&home, local, None)?;
+            let rows = rupi_pkg::list_installed(&opts);
+            if rows.is_empty() {
+                println!(
+                    "no packages. install with `rupi install git:host/user/repo` or `npm:@scope/pkg`"
+                );
+            }
+            for p in rows {
+                println!(
+                    "{}  {}  skills=[{}] commands=[{}] ext=[{}]",
+                    p.id,
+                    p.spec,
+                    p.skills.join(","),
+                    p.commands.join(","),
+                    p.extensions.join(",")
                 );
             }
         }

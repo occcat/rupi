@@ -1,0 +1,13 @@
+{
+  "name": "demo-echo",
+  "description": "Example oneshot extension from a rupi package",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string" }
+    }
+  },
+  "command": "true",
+  "args": [],
+  "timeout_secs": 5
+}

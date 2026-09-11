@@ -1,0 +1,14 @@
+[package]
+name = "rupi-pkg"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "rupi install git:/npm: — skills, commands, extensions"
+
+[dependencies]
+rupi-core = { path = "../rupi-core" }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

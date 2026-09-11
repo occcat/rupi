@@ -97,7 +97,8 @@
 | `/export` `/import` `/fork` `/clone` `/name` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页） |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
 | `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；`--tools/--exclude-tools/--no-tools`、`--system-prompt/--append-system-prompt` |
-| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`，`$ARGUMENTS`；JSON-RPC 扩展命令走 `commands/execute` |
+| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`；`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute` |
+| `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本） |
 | 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题热重载/差分渲染器 |
 
 ## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复

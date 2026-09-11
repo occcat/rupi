@@ -112,13 +112,36 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 ## 自定义斜杠命令
 
 - 文件即命令：`~/.rupi/commands/<name>.md`（或项目级 `.rupi/commands/<name>.md`）
-  即 `/name args`，正文为提示模板，`$ARGUMENTS` 替换为用户参数，无占位符则追加到末尾。
+  即 `/name args`，正文为提示模板。占位符：`$ARGUMENTS` / `$1` / `${1:-default}`，
+  以及 `{{var}}` / `{{var:-default}}`（`name=value` 或 `--name value`）；无占位符则追加到末尾。
 - 可选 YAML frontmatter（`description` 等）只做元信息，解析时剥离；空文件不展开。
 - 内建命令（`/quit`、`/tree`、`/goto` 等）优先；未知 `/foo` 先查自定义命令，
   命中则展开后发送（REPL 打印 `[command /foo]`，TUI 插一行同名系统提示），查不到才当普通消息。
 - 发现：`rupi commands` 子命令与 REPL/TUI 内 `/commands` 列出全部自定义命令
  （description 取自 frontmatter，无则取正文首行）。JSON-RPC 扩展注册的斜杠命令
   同表列出，未命中 `.md` / skill 时再走 `commands/execute`。
+
+## 包管理（`rupi install`）
+
+对标 `pi install`：从 npm / git / 本地路径装 skill、斜杠命令（prompts）、`*.json` 扩展。
+不执行 `npm install` 或包内脚本；TypeScript 扩展会跳过并提示。
+
+```bash
+rupi install git:github.com/user/repo
+rupi install git:github.com/user/repo@v1
+rupi install npm:@foo/bar@1.2.3
+rupi install ./examples/packages/demo          # 本地路径
+rupi install -l ./vendor/pkg                  # 写入项目 .rupi/
+rupi packages
+rupi uninstall npm:@foo/bar
+```
+
+包布局：`package.json` 的 `pi.skills` / `pi.prompts` / `pi.extensions`，或约定目录
+`skills/`、`prompts|commands/`、`extensions/`。物化到 `~/.rupi/skills|commands|extensions`
+（`-l` 则 `.rupi/`），锁文件 `packages.json`。
+
+仓内基准：`cargo bench -p rupi-benches`（SSE / edit / compaction / SessionStore）；
+启动脚本 `scripts/bench-startup.sh`（需 hyperfine + release 二进制）。
 
 ## Provider 广度与图片
 

@@ -1,0 +1,9 @@
+{
+  "name": "rupi-demo-package",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "extensions": ["./extensions"]
+  }
+}
