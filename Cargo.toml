@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/rupi-core",
+  "crates/rupi-config",
   "crates/rupi-llm",
   "crates/rupi-tools",
   "crates/rupi-agent",

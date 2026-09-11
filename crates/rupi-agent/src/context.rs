@@ -86,7 +86,8 @@ pub fn format_context_block(files: &[ContextFile]) -> String {
     if files.is_empty() {
         return String::new();
     }
-    let mut s = String::from("\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
+    let mut s =
+        String::from("\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
     for f in files {
         s.push_str(&format!(
             "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",

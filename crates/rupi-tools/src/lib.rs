@@ -103,6 +103,15 @@ impl ToolRegistry {
         self.tools.remove(name).is_some()
     }
 
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    /// `--tools` / `--exclude-tools` 过滤（不改工具实现，只改注册表可见集）。
+    pub fn retain<F: Fn(&str) -> bool>(&mut self, f: F) {
+        self.tools.retain(|k, _| f(k));
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|t| t.definition()).collect()
     }
@@ -1756,10 +1765,7 @@ mod tests {
     async fn bash_decodes_utf8_incrementally() {
         let r = ToolRegistry::with_builtins();
         let out = r
-            .execute(
-                "bash",
-                serde_json::json!({"command": "printf '%s' '你好'"}),
-            )
+            .execute("bash", serde_json::json!({"command": "printf '%s' '你好'"}))
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);

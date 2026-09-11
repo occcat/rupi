@@ -10,8 +10,8 @@ use std::path::Path;
 
 /// 与 REPL 同构的内建斜杠命令（`/quit` 单独处理，此处仅用于提示）。
 pub const BUILTINS: &[&str] = &[
-    "commands", "compact", "goto", "model", "plan", "quit", "reload", "resume", "rewind",
-    "sessions", "skills", "thinking", "tree",
+    "clone", "commands", "compact", "export", "fork", "goto", "import", "model", "name", "plan",
+    "quit", "reload", "resume", "rewind", "sessions", "skills", "thinking", "tree",
 ];
 
 /// 计算候选：`input` 以 `/` 开头且首 token 无空白时，按前缀过滤并排序去重；否则空。
@@ -199,12 +199,15 @@ mod tests {
     fn prefix_filters_builtins_and_customs() {
         assert_eq!(candidates("/sk", &[]), vec!["skills".to_string()]);
         assert_eq!(candidates("/th", &[]), vec!["thinking".to_string()]);
-        assert_eq!(candidates("/co", &[]), vec!["commands".to_string(), "compact".to_string()]);
+        assert_eq!(
+            candidates("/co", &[]),
+            vec!["commands".to_string(), "compact".to_string()]
+        );
         assert_eq!(candidates("/sess", &[]), vec!["sessions".to_string()]);
         assert_eq!(candidates("/res", &[]), vec!["resume".to_string()]);
         assert_eq!(
             candidates("/f", &customs()),
-            vec!["fix".to_string(), "format".to_string()]
+            vec!["fix".to_string(), "fork".to_string(), "format".to_string()]
         );
         // 自定义与内建同名去重
         let mut c = customs();

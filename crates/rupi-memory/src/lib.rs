@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use rupi_core::ToolDefinition;
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -151,7 +152,7 @@ pub fn core_tier(text: &str) -> (String, usize) {
     (s, extended)
 }
 /// 内建记忆文件：受 char limit 保护（默认 ~800 tokens / ~500 tokens），超限截断保尾部。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryStore {
     pub home: PathBuf,
     pub memory_enabled: bool,
@@ -160,6 +161,22 @@ pub struct MemoryStore {
     pub user_char_limit: usize,
     /// 项目根（`discover_project` 从 cwd 上溯 `.git` 得到）；项目记忆存 `<root>/.rupi/MEMORY.md`。
     pub project_root: Option<PathBuf>,
+    /// 复用 `sessions.db` 连接：`mirror_memory` / `memory_search` / `session_search`
+    /// 不再每次 `SessionStore::open`。
+    sessions: std::sync::Arc<std::sync::Mutex<Option<SessionStore>>>,
+}
+
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStore")
+            .field("home", &self.home)
+            .field("memory_enabled", &self.memory_enabled)
+            .field("user_profile_enabled", &self.user_profile_enabled)
+            .field("memory_char_limit", &self.memory_char_limit)
+            .field("user_char_limit", &self.user_char_limit)
+            .field("project_root", &self.project_root)
+            .finish()
+    }
 }
 
 impl MemoryStore {
@@ -171,7 +188,19 @@ impl MemoryStore {
             memory_char_limit: 5000,
             user_char_limit: 5000,
             project_root: None,
+            sessions: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn with_sessions<T>(
+        &self,
+        f: impl FnOnce(&SessionStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(SessionStore::open(&self.home)?);
+        }
+        f(g.as_ref().expect("session store just opened"))
     }
 
     pub fn with_project(mut self, root: PathBuf) -> Self {
@@ -511,15 +540,10 @@ impl MemoryStore {
     }
 
     /// SQLite 镜像（best-effort）：成功写入的记忆同步一行到 sessions.db，
-    /// 失败只 warning，绝不影响 markdown 主写入。
+    /// 失败只 warning，绝不影响 markdown 主写入。复用本 store 的连接。
     fn mirror_memory(&self, target: &str, content: &str) {
-        match SessionStore::open(&self.home) {
-            Ok(db) => {
-                if let Err(e) = db.mirror_memory_entry(target, content) {
-                    tracing::warn!("memory mirror failed: {e:#}");
-                }
-            }
-            Err(e) => tracing::warn!("memory mirror failed: {e:#}"),
+        if let Err(e) = self.with_sessions(|db| db.mirror_memory_entry(target, content)) {
+            tracing::warn!("memory mirror failed: {e:#}");
         }
     }
 }
@@ -765,43 +789,72 @@ impl MemoryManager {
         args: serde_json::Value,
     ) -> anyhow::Result<Option<String>> {
         if name == "memory" {
-            let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("add");
-            let entry = args.get("entry").and_then(|v| v.as_str()).unwrap_or("");
+            let op = args
+                .get("op")
+                .and_then(|v| v.as_str())
+                .unwrap_or("add")
+                .to_string();
+            let entry = args
+                .get("entry")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let scope = args
                 .get("scope")
                 .and_then(|v| v.as_str())
-                .unwrap_or("global");
-            let live = self.store.apply_write_scoped(scope, op, entry)?;
+                .unwrap_or("global")
+                .to_string();
+            let store = self.store.clone();
+            let live =
+                tokio::task::spawn_blocking(move || store.apply_write_scoped(&scope, &op, &entry))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("memory write join: {e}"))??;
             if let Some(e) = &self.external {
-                let _ = e.on_memory_write(op, entry).await;
+                let _ = e
+                    .on_memory_write(
+                        args.get("op").and_then(|v| v.as_str()).unwrap_or("add"),
+                        args.get("entry").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                    .await;
             }
             return Ok(Some(format!(
                 "memory updated (live). Takes effect in prompt next session.\n{live}"
             )));
         }
         if name == "memory_search" {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
                 .min(20) as usize;
-            let db = SessionStore::open(&self.store.home)?;
-            let mut hits = db.memory_search(query, limit)?;
-            // 文件层兜底：FTS 镜像只含工具写入；手工编辑与 `[core]` 分层的 extended 行靠子串扫
-            let norm = |s: &str| s.replace("<b>", "").replace("</b>", "").trim().to_string();
-            for (target, line) in self.store.grep_memory_files(query, limit) {
-                if hits.len() >= limit {
-                    break;
-                }
-                let l = norm(&line);
-                if !hits.iter().any(|(_, s)| {
-                    let n = norm(s);
-                    n == l || l.contains(&n) || n.contains(&l)
-                }) {
-                    hits.push((target, line));
-                }
-            }
+            let store = self.store.clone();
+            let hits = tokio::task::spawn_blocking(move || {
+                store.with_sessions(|db| {
+                    let mut hits = db.memory_search(&query, limit)?;
+                    let norm =
+                        |s: &str| s.replace("<b>", "").replace("</b>", "").trim().to_string();
+                    for (target, line) in store.grep_memory_files(&query, limit) {
+                        if hits.len() >= limit {
+                            break;
+                        }
+                        let l = norm(&line);
+                        if !hits.iter().any(|(_, s)| {
+                            let n = norm(s);
+                            n == l || l.contains(&n) || n.contains(&l)
+                        }) {
+                            hits.push((target, line));
+                        }
+                    }
+                    Ok(hits)
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("memory_search join: {e}"))??;
             if hits.is_empty() {
                 return Ok(Some("no matching memories".into()));
             }
@@ -813,14 +866,22 @@ impl MemoryManager {
         }
         if name == "session_search" {
             // 会话是“聊过的”：跨会话 FTS，按 session_id 分组展示，snippet 即上下文。
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
                 .min(20) as usize;
-            let db = SessionStore::open(&self.store.home)?;
-            let hits = db.search(query, limit)?;
+            let store = self.store.clone();
+            let hits = tokio::task::spawn_blocking(move || {
+                store.with_sessions(|db| db.search(&query, limit))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("session_search join: {e}"))??;
             if hits.is_empty() {
                 return Ok(Some("no matching sessions".into()));
             }
@@ -989,6 +1050,21 @@ pub struct SessionStore {
     conn: rusqlite::Connection,
 }
 
+/// 一轮落盘的一条消息（事务内批量 INSERT）。
+#[derive(Debug, Clone)]
+pub struct SessionMessageRow {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub blocks: Option<String>,
+}
+
+pub mod session_io;
+pub use session_io::{
+    export_store_html, export_store_jsonl, export_tree_html, export_tree_jsonl, import_into_store,
+    import_jsonl, persist_tree, remap_tree, tree_from_records, ImportedSession, SessionHeader,
+};
+
 /// 用户查询转 FTS5 短语：裸 `-` / `:` / `*` 等会被当运算符导致 syntax error，
 /// 包一层双引号按字面短语查（分词仍按 tokenizer 来，不影响中英文关键词）。
 fn fts_phrase(query: &str) -> String {
@@ -1083,6 +1159,27 @@ impl SessionStore {
         if version < SCHEMA_USER_VERSION {
             migrate_schema(&conn)?;
         }
+        // v4：会话展示名 / cwd / 更新时间 / 父会话（--continue / --name / /fork）
+        let sess_cols = {
+            let mut st = conn.prepare("PRAGMA table_info(sessions)")?;
+            let cols: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            cols
+        };
+        let add = |conn: &rusqlite::Connection, col: &str, decl: &str| -> anyhow::Result<()> {
+            if !sess_cols.iter().any(|c| c == col) {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} {decl};"))?;
+            }
+            Ok(())
+        };
+        add(&conn, "name", "TEXT")?;
+        add(&conn, "cwd", "TEXT")?;
+        add(&conn, "updated_at", "TEXT")?;
+        add(&conn, "parent_session", "TEXT")?;
+        if version < 4 {
+            conn.execute_batch("PRAGMA user_version = 4;")?;
+        }
         Ok(Self { conn })
     }
 
@@ -1091,12 +1188,94 @@ impl SessionStore {
     }
 
     pub fn create_session(&self, profile: &str) -> anyhow::Result<String> {
+        self.create_session_ex(profile, None, None, None)
+    }
+
+    pub fn create_session_ex(
+        &self,
+        profile: &str,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        parent_session: Option<&str>,
+    ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
         self.execute_cached(
-            "INSERT INTO sessions(id, profile, created_at, summary) VALUES(?,?,?,?)",
-            rusqlite::params![id, profile, chrono::Utc::now().to_rfc3339(), String::new()],
+            "INSERT INTO sessions(id, profile, created_at, summary, name, cwd, updated_at, parent_session)
+             VALUES(?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                id,
+                profile,
+                now,
+                String::new(),
+                name,
+                cwd,
+                now,
+                parent_session
+            ],
         )?;
         Ok(id)
+    }
+
+    pub fn set_name(&self, session_id: &str, name: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET name = ?, updated_at = ? WHERE id = ?",
+            rusqlite::params![name, chrono::Utc::now().to_rfc3339(), session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_name(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let n: Option<String> = self.conn.query_row(
+            "SELECT name FROM sessions WHERE id = ?",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.filter(|s| !s.is_empty()))
+    }
+
+    pub fn get_parent_session(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let n: Option<String> = self.conn.query_row(
+            "SELECT parent_session FROM sessions WHERE id = ?",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.filter(|s| !s.is_empty()))
+    }
+
+    pub fn touch(&self, session_id: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
+        )?;
+        Ok(())
+    }
+
+    /// 最近会话：优先同 cwd，否则按 `updated_at`/`created_at` 倒序。
+    pub fn latest_session(&self, cwd: Option<&str>) -> anyhow::Result<Option<String>> {
+        if let Some(cwd) = cwd {
+            let hit: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE cwd = ?
+                     ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 1",
+                    rusqlite::params![cwd],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        let hit = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit)
     }
 
     /// 写回压缩摘要（`sessions.summary`）。
@@ -1149,18 +1328,51 @@ impl SessionStore {
         content: &str,
         blocks: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.execute_cached(
-            "INSERT INTO messages(id, session_id, role, content, created_at, blocks) VALUES(?,?,?,?,?,?)",
-            rusqlite::params![
-                id,
-                session_id,
-                role,
-                content,
-                chrono::Utc::now().to_rfc3339(),
-                blocks
-            ],
+        self.persist_turn(
+            session_id,
+            &[SessionMessageRow {
+                id: id.to_string(),
+                role: role.to_string(),
+                content: content.to_string(),
+                blocks: blocks.map(str::to_string),
+            }],
+            None,
         )?;
         Ok(())
+    }
+
+    /// 一轮落盘：3–4 条 INSERT + touch（+ 可选 summary）合成一个事务。
+    pub fn persist_turn(
+        &self,
+        session_id: &str,
+        rows: &[SessionMessageRow],
+        summary: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        // Connection 在 `&self` 后：调用方（Mutex / with_sessions）已串行化。
+        let tx = self.conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO messages(id, session_id, role, content, created_at, blocks) VALUES(?,?,?,?,?,?)",
+            )?;
+            for r in rows {
+                ins.execute(rusqlite::params![
+                    r.id, session_id, r.role, r.content, now, r.blocks
+                ])?;
+            }
+        }
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            rusqlite::params![now, session_id],
+        )?;
+        if let Some(s) = summary {
+            tx.execute(
+                "UPDATE sessions SET summary = ? WHERE id = ?",
+                rusqlite::params![s, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
     }
 
     /// session_search：跨会话全文检索（FTS5），供 agent 回忆历史上下文。
@@ -1179,15 +1391,15 @@ impl SessionStore {
         Ok(rows)
     }
 
-    /// 最近会话：id / profile / 创建时间 / 消息数（倒序）。
+    /// 最近会话：id / profile / 创建时间 / 消息数 / 展示名（倒序）。
     pub fn list_sessions(
         &self,
         limit: usize,
-    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, i64, String)>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT s.id, s.profile, s.created_at, COUNT(m.id)
+            "SELECT s.id, s.profile, s.created_at, COUNT(m.id), COALESCE(s.name, '')
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
-             GROUP BY s.id ORDER BY s.created_at DESC LIMIT ?",
+             GROUP BY s.id ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT ?",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![limit as i64], |r| {
@@ -1195,9 +1407,10 @@ impl SessionStore {
                 let profile: String = r.get(1)?;
                 let created: String = r.get(2)?;
                 let count: i64 = r.get(3)?;
-                Ok((id, profile, created, count))
+                let name: String = r.get(4)?;
+                Ok((id, profile, created, count, name))
             })?
-            .collect::<Result<Vec<(String, String, String, i64)>, _>>()?;
+            .collect::<Result<Vec<(String, String, String, i64, String)>, _>>()?;
         Ok(rows)
     }
 
@@ -1760,8 +1973,8 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        // v2 = trigram 分词；v3 = messages.blocks 列（结构化落盘），open 一次迁到最新
-        assert_eq!(v, 3);
+        // v2 = trigram；v3 = messages.blocks；v4 = name/cwd/updated_at/parent_session
+        assert_eq!(v, 4);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1896,6 +2109,12 @@ mod tests {
         let list = store.list_sessions(10).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].3, 2);
+        store.set_name(&sid, "tea chat").unwrap();
+        assert_eq!(store.get_name(&sid).unwrap().as_deref(), Some("tea chat"));
+        assert_eq!(
+            store.latest_session(None).unwrap().as_deref(),
+            Some(sid.as_str())
+        );
         let msgs = store.session_messages(&sid, 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].1, "user");
@@ -1941,6 +2160,78 @@ mod tests {
         // 同路径删库再建：空库 user_version=0，必须重跑 DDL
         let db3 = SessionStore::open(&home).unwrap();
         assert!(db3.create_session("q").is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_turn_batches_messages_in_one_call() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = SessionStore::open(&home).unwrap();
+        let sid = store.create_session("default").unwrap();
+        let n = store
+            .persist_turn(
+                &sid,
+                &[
+                    SessionMessageRow {
+                        id: "u1".into(),
+                        role: "user".into(),
+                        content: "one".into(),
+                        blocks: None,
+                    },
+                    SessionMessageRow {
+                        id: "a1".into(),
+                        role: "assistant".into(),
+                        content: "two".into(),
+                        blocks: None,
+                    },
+                ],
+                Some("sum"),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(store.session_messages(&sid, 10).unwrap().len(), 2);
+        assert_eq!(store.get_summary(&sid).unwrap(), "sum");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn memory_search_reuses_store_connection() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = MemoryStore::new(home.clone());
+        store.apply_write("add", "cached oolong fact").unwrap();
+        assert!(
+            store.sessions.lock().unwrap().is_some(),
+            "mirror should cache sessions.db"
+        );
+        let mgr = MemoryManager::new(store.clone());
+        let hit = mgr
+            .handle_tool_call("memory_search", serde_json::json!({"query": "oolong"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hit.contains("oolong"), "{hit}");
+        {
+            let g = store.sessions.lock().unwrap();
+            let db = g.as_ref().expect("cached sessions.db");
+            let sid = db.create_session("default").unwrap();
+            db.add_message(&sid, "user", "session recall of oolong")
+                .unwrap();
+        }
+        let sess = mgr
+            .handle_tool_call("session_search", serde_json::json!({"query": "oolong"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sess.contains("recall") || sess.contains("oolong") || sess.contains("oolo"),
+            "{sess}"
+        );
+        assert!(
+            store.sessions.lock().unwrap().is_some(),
+            "session_search should reuse the cached sessions.db"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }
@@ -2088,7 +2379,7 @@ mod merge_tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

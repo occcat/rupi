@@ -60,6 +60,10 @@ pub struct TuiContext<'a> {
     pub sess_db: Option<Arc<Mutex<SessionStore>>>,
     /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
     pub on_turn: Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
+    /// Token / 成本状态栏。
+    pub meter: Option<Arc<Mutex<rupi_agent::TokenMeter>>>,
+    /// `--no-session` 时 /fork /clone /name 不落盘。
+    pub persist: bool,
 }
 
 /// 一轮问答记录（传给 `on_turn`）。
@@ -73,7 +77,7 @@ pub struct TurnRecord {
     pub user_node: Option<String>,
     pub assistant_node: Option<String>,
     /// 本轮新增的全部节点（id + 完整消息）：user、含工具调用的 assistant、工具结果、
-    /// 最终答复。调用方逐条落盘（blocks JSON），`/resume` 才能结构化回填工具上下文。
+    /// 最终答复。调用方应一次 `persist_turn`（blocks JSON），`/resume` 才能结构化回填工具上下文。
     pub messages: Vec<(String, Message)>,
 }
 
@@ -174,6 +178,11 @@ enum Builtin {
     Done(String),
     Compact(Option<String>),
     Resume(String),
+    Adopt {
+        id: String,
+        tree: SessionTree,
+        note: String,
+    },
     Pass,
 }
 
@@ -189,10 +198,15 @@ pub(crate) fn sessions_block(
         return Ok("no sessions yet — chat or run to create one".into());
     }
     let mut out = String::from("recent sessions (`/resume <id|短前缀>` 切换):");
-    for (id, profile, created, count) in rows {
+    for (id, profile, created, count, name) in rows {
         let mark = if id == current { "*" } else { " " };
+        let label = if name.is_empty() {
+            String::new()
+        } else {
+            format!(" {name}")
+        };
         out.push_str(&format!(
-            "\n{mark}[{profile}] {} {created} ({count} msgs)",
+            "\n{mark}[{profile}] {} {created} ({count} msgs){label}",
             &id[..8.min(id.len())]
         ));
     }
@@ -214,7 +228,7 @@ pub(crate) fn resolve_session_arg(
         .map_err(|e| format!("[resume] list failed: {e:#}"))?;
     let hits: Vec<&String> = rows
         .iter()
-        .map(|(id, _, _, _)| id)
+        .map(|(id, _, _, _, _)| id)
         .filter(|id| *id == arg || id.starts_with(arg))
         .collect();
     match hits.as_slice() {
@@ -263,6 +277,7 @@ fn dispatch_builtin(
     tools: &mut ToolRegistry,
     ext_set: Option<&mut rupi_ext::ExtensionSet>,
     sess_db: Option<&SessionStore>,
+    persist: bool,
 ) -> Builtin {
     let t = text.trim();
     if t == "/quit" {
@@ -344,9 +359,7 @@ fn dispatch_builtin(
                 Builtin::Done(format!("[rewound {}]", &id[..8.min(id.len())]))
             }
             Some(_) => Builtin::Done("[rewind] node not on current path, use /goto".into()),
-            None => Builtin::Done(format!(
-                "[rewind] unknown or ambiguous node prefix: {arg}"
-            )),
+            None => Builtin::Done(format!("[rewind] unknown or ambiguous node prefix: {arg}")),
         };
     }
     if t == "/plan" {
@@ -416,6 +429,113 @@ fn dispatch_builtin(
             .map(str::to_string);
         return Builtin::Compact(prompt);
     }
+    if t == "/export" || t.starts_with("/export ") {
+        let arg = t.strip_prefix("/export").unwrap_or("").trim();
+        let html = arg.ends_with(".html") || arg == "html";
+        let sid = session_id;
+        let path = if arg.is_empty() || arg == "html" || arg == "jsonl" {
+            let ext = if html { "html" } else { "jsonl" };
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(format!("rupi-session-{}.{ext}", &sid[..8.min(sid.len())]))
+        } else {
+            std::path::PathBuf::from(arg)
+        };
+        let name = sess_db.and_then(|db| db.get_name(sid).ok().flatten());
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        let body = if html {
+            rupi_memory::export_tree_html(session, name.as_deref().unwrap_or(sid))
+        } else {
+            rupi_memory::export_tree_jsonl(session, &cwd, name.as_deref(), None)
+        };
+        return match std::fs::write(&path, body) {
+            Ok(()) => Builtin::Done(format!("[export] {}", path.display())),
+            Err(e) => Builtin::Done(format!("[export] failed: {e:#}")),
+        };
+    }
+    if t == "/import" {
+        return Builtin::Done("[import] usage: /import <file.jsonl>".into());
+    }
+    if let Some(path) = t.strip_prefix("/import ") {
+        let path = path.trim();
+        let Some(db) = sess_db else {
+            return Builtin::Done("[import] no session store attached".into());
+        };
+        return match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".into());
+                rupi_memory::import_into_store(db, &raw, &cwd).map_err(|e| e.to_string())
+            }) {
+            Ok((id, tree)) => Builtin::Adopt {
+                note: format!(
+                    "[imported {} ({} msgs)]",
+                    &id[..8.min(id.len())],
+                    tree.history().len()
+                ),
+                id,
+                tree,
+            },
+            Err(e) => Builtin::Done(format!("[import] {e}")),
+        };
+    }
+    if t == "/fork" || t == "/clone" {
+        let path_only = t == "/fork";
+        let label = if path_only { "fork" } else { "clone" };
+        if !persist {
+            return Builtin::Done(format!("[{label}] --no-session: staying ephemeral"));
+        }
+        let Some(db) = sess_db else {
+            return Builtin::Done(format!("[{label}] no session store attached"));
+        };
+        let new_tree = rupi_memory::remap_tree(session, path_only);
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        return match db.create_session_ex(label, None, Some(&cwd), Some(session_id)) {
+            Ok(id) => match rupi_memory::persist_tree(db, &id, &new_tree) {
+                Ok(_) => {
+                    let mut tree = new_tree;
+                    tree.id = id.clone();
+                    Builtin::Adopt {
+                        note: format!(
+                            "[{label}ed {} ({} nodes)]",
+                            &id[..8.min(id.len())],
+                            tree.nodes.len()
+                        ),
+                        id,
+                        tree,
+                    }
+                }
+                Err(e) => Builtin::Done(format!("[{label}] persist failed: {e:#}")),
+            },
+            Err(e) => Builtin::Done(format!("[{label}] failed: {e:#}")),
+        };
+    }
+    if t == "/name" || t.starts_with("/name ") {
+        let arg = t.strip_prefix("/name").unwrap_or("").trim();
+        let Some(db) = sess_db else {
+            return Builtin::Done("[name] no session store attached".into());
+        };
+        if arg.is_empty() {
+            return match db.get_name(session_id) {
+                Ok(Some(n)) => Builtin::Done(format!("[name] {n}")),
+                Ok(None) => Builtin::Done("[name] (unset)".into()),
+                Err(e) => Builtin::Done(format!("[name] {e:#}")),
+            };
+        }
+        if !persist {
+            return Builtin::Done(format!("[name] --no-session: not persisted ({arg})"));
+        }
+        return match db.set_name(session_id, arg) {
+            Ok(()) => Builtin::Done(format!("[name] {arg}")),
+            Err(e) => Builtin::Done(format!("[name] {e:#}")),
+        };
+    }
     Builtin::Pass
 }
 
@@ -429,7 +549,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/sessions 看会话，/resume <短id> 切换会话，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/sessions 看会话，/resume <短id> 切换会话，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/export /import /fork /clone /name，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -463,6 +583,12 @@ async fn run_loop(
             0,
             &completion,
             completion_prefix,
+            &status_footer(
+                false,
+                0,
+                ctx.meter.as_ref().map(|a| a.as_ref()),
+                ctx.session.history_tokens(),
+            ),
         )?;
         let Some(Ok(Event::Key(key))) = reader.next().await else {
             continue;
@@ -528,11 +654,19 @@ async fn run_loop(
                             &mut *ctx.tools,
                             ctx.ext_set.as_deref_mut(),
                             sess_guard.as_deref(),
+                            ctx.persist,
                         )
                     };
                     match builtin {
                         Builtin::Quit => return Ok(()),
                         Builtin::Done(msg) => {
+                            if msg.contains("model switched") {
+                                if let (Some(cell), Some(id)) =
+                                    (ctx.meter.as_ref(), ctx.provider.model_id())
+                                {
+                                    cell.lock().unwrap().set_model(id);
+                                }
+                            }
                             view.push_system(msg);
                             continue;
                         }
@@ -576,6 +710,20 @@ async fn run_loop(
                             }
                             continue;
                         }
+                        Builtin::Adopt { id, tree, note } => {
+                            *ctx.session = tree;
+                            *ctx.session_id.lock().unwrap() = id.clone();
+                            export_session_id(&id);
+                            let model = ctx.provider.model_id().unwrap_or_default().to_string();
+                            if !model.is_empty() {
+                                if let Ok(mut p) = rupi_llm::provider_for_model(&model) {
+                                    rupi_llm::apply_session_settings(&mut *p, Some(&id));
+                                    *ctx.provider = p.into();
+                                }
+                            }
+                            view.push_system(note);
+                            continue;
+                        }
                         Builtin::Compact(prompt) => {
                             let before = ctx.session.summary.clone();
                             let buffered =
@@ -596,6 +744,29 @@ async fn run_loop(
                             }
                             if ctx.session.summary != before && ctx.session.summary.is_some() {
                                 view.push_system("[compacted]".into());
+                                if ctx.persist {
+                                    if let Some(db) = ctx.sess_db.clone() {
+                                        let sid = ctx.session_id.lock().unwrap().clone();
+                                        let sum = ctx.session.summary.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            db.lock().unwrap().persist_turn(
+                                                &sid,
+                                                &[],
+                                                sum.as_deref(),
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(e)) => {
+                                                tracing::warn!("persist compact failed: {e:#}")
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("persist compact join failed: {e}")
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 view.push_system("[compact] nothing to compress".into());
                             }
@@ -654,6 +825,7 @@ async fn run_loop(
                         &mut view,
                         user,
                         &ext_arcs,
+                        ctx.meter.as_ref().map(|a| a.as_ref()),
                     )
                     .await?;
                     if let Some(set) = ctx.ext_set.as_ref() {
@@ -706,6 +878,7 @@ async fn drive_turn<B, S>(
     view: &mut ChatView,
     user: Message,
     extensions: &[Arc<dyn Extension>],
+    meter: Option<&Mutex<rupi_agent::TokenMeter>>,
 ) -> anyhow::Result<(Control, String)>
 where
     B: Backend,
@@ -715,22 +888,15 @@ where
     let on_event = move |e: AgentEvent| {
         let _ = tx.send(e);
     };
+    // fut 持有 `&mut session`：忙时状态栏用快照，避免与 future 重复借用。
+    let ctx_tokens = session.history_tokens();
     // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
     let before = session.current_path.len();
     let user_text = user.full_text();
     // 协作取消：内循环 Esc 置位，主循环在检查点优雅中止（TurnEnd/RunEnd{Aborted} 照常走事件通道）。
     let cancel = rupi_core::CancelFlag::new();
     let fut = agent.run_with_user(
-        provider,
-        session,
-        user,
-        tools,
-        mem,
-        frozen,
-        skills,
-        extensions,
-        &on_event,
-        &cancel,
+        provider, session, user, tools, mem, frozen, skills, extensions, &on_event, &cancel,
     );
     let mut scroll: u16 = 0;
     // 运行中输入的排队缓冲：输入框实时回显（qb 镜像），结束自动跟进
@@ -745,13 +911,13 @@ where
         tokio::pin!(fut);
         loop {
             flush_turn_view(&mut rx, review_lines, view);
-            paint_busy(terminal, view, &qb, scroll, &followup)?;
+            paint_busy(terminal, view, &qb, scroll, &followup, meter, ctx_tokens)?;
             tokio::select! {
                 biased;
                 res = &mut fut => {
                     flush_turn_view(&mut rx, review_lines, view);
                     // 收尾再画一帧：与 fut 竞速的最后几个 delta 也落到 TestBackend / 屏幕上。
-                    paint_busy(terminal, view, &qb, scroll, &followup)?;
+                    paint_busy(terminal, view, &qb, scroll, &followup, meter, ctx_tokens)?;
                     break End::Finished(res);
                 }
                 maybe_key = reader.next() => {
@@ -781,6 +947,20 @@ where
                 // delta / 工具事件到达即醒：下一圈 flush + draw，不必等按键或整轮结束。
                 // `Some(e) =` 在发送端随 future 关闭后禁用此臂，避免 recv() 空转。
                 Some(e) = rx.recv() => {
+                    if let AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } = &e
+                    {
+                        if let Some(m) = meter {
+                            // fut 仍借着 session，不能在此读树；用本轮 input 自校准（ratio≈1）。
+                            m.lock().unwrap().note_usage(
+                                *input_tokens,
+                                *output_tokens,
+                                *input_tokens,
+                            );
+                        }
+                    }
                     view.push_event(&e);
                     flush_turn_view(&mut rx, review_lines, view);
                 }
@@ -813,14 +993,19 @@ where
                         .map(|n| (n.id.clone(), n.message.clone()))
                         .collect();
                     if let Some(cb) = on_turn {
-                        cb(TurnRecord {
+                        let rec = TurnRecord {
                             user: user_text.clone(),
                             assistant,
                             summary: session.summary.clone(),
                             user_node,
                             assistant_node,
                             messages,
-                        });
+                        };
+                        let cb = cb.clone();
+                        // 落盘（SQLite）离开渲染任务：`persist_turn` 在 blocking 池跑，不冻 TUI。
+                        if let Err(e) = tokio::task::spawn_blocking(move || cb(rec)).await {
+                            tracing::warn!("persist turn join failed: {e}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -857,6 +1042,8 @@ fn paint_busy<B: Backend>(
     input: &InputBuffer,
     scroll: u16,
     followup: &str,
+    meter: Option<&Mutex<rupi_agent::TokenMeter>>,
+    ctx_tokens: u64,
 ) -> anyhow::Result<()> {
     draw(
         terminal,
@@ -867,7 +1054,31 @@ fn paint_busy<B: Backend>(
         followup.chars().count(),
         &[],
         '/',
+        &status_footer(true, followup.chars().count(), meter, ctx_tokens),
     )
+}
+
+fn status_footer(
+    busy: bool,
+    queued: usize,
+    meter: Option<&Mutex<rupi_agent::TokenMeter>>,
+    ctx_tokens: u64,
+) -> String {
+    let base = if busy {
+        if queued > 0 {
+            format!("… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出)")
+        } else {
+            "… thinking (Esc 中断本轮 · Ctrl-C 退出)".to_string()
+        }
+    } else {
+        "ready".to_string()
+    };
+    let Some(meter) = meter else {
+        return base;
+    };
+    let g = meter.lock().unwrap();
+    let ctx = g.calibrate(ctx_tokens);
+    format!("{base}  {}", g.footer(ctx))
 }
 
 /// 全屏绘制（Backend 泛型：生产走 Crossterm，单测走 TestBackend 真画一遍断言像素行）。
@@ -881,6 +1092,7 @@ fn draw<B: Backend>(
     queued: usize,
     completion: &[String],
     completion_prefix: char,
+    status: &str,
 ) -> anyhow::Result<()> {
     terminal
         .draw(|f| {
@@ -941,14 +1153,20 @@ fn draw<B: Backend>(
                 );
             }
             f.render_widget(
-                Paragraph::new(if busy {
-                    if queued > 0 {
-                        format!("… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出)")
+                Paragraph::new(if status.is_empty() {
+                    if busy {
+                        if queued > 0 {
+                            format!(
+                                "… thinking ({queued} queued · Esc 中断并转向排队 · Ctrl-C 退出)"
+                            )
+                        } else {
+                            "… thinking (Esc 中断本轮 · Ctrl-C 退出)".to_string()
+                        }
                     } else {
-                        "… thinking (Esc 中断本轮 · Ctrl-C 退出)".to_string()
+                        "ready".to_string()
                     }
                 } else {
-                    "ready".to_string()
+                    status.to_string()
                 }),
                 chunks[2],
             );
@@ -1005,6 +1223,18 @@ mod tests {
     }
 
     #[test]
+    fn status_footer_shows_token_cost_line() {
+        let mut m = rupi_agent::TokenMeter::new("gpt-4o-mini");
+        m.note_usage(1000, 200, 1000);
+        let line = status_footer(false, 0, Some(&Mutex::new(m)), 12_800);
+        assert!(line.contains('↑'), "{line}");
+        assert!(line.contains('↓'), "{line}");
+        assert!(line.contains('%'), "{line}");
+        assert!(line.contains('$'), "{line}");
+        assert!(line.contains("ready"), "{line}");
+    }
+
+    #[test]
     fn followup_collects_text_enter_backspace() {
         // 运行中打字排队：字符追加、Enter 换行、Backspace 删除
         let mut buf = String::new();
@@ -1048,7 +1278,18 @@ mod tests {
         }
         let completion = vec!["help".to_string(), "history".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, false, 0, &completion, '/').unwrap();
+        draw(
+            &mut terminal,
+            &view,
+            &input,
+            0,
+            false,
+            0,
+            &completion,
+            '/',
+            "",
+        )
+        .unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1081,7 +1322,18 @@ mod tests {
         let input = InputBuffer::default();
         let completion = vec!["src/main.rs".to_string()];
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, false, 0, &completion, '@').unwrap();
+        draw(
+            &mut terminal,
+            &view,
+            &input,
+            0,
+            false,
+            0,
+            &completion,
+            '@',
+            "",
+        )
+        .unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1099,7 +1351,7 @@ mod tests {
         let view = ChatView::default();
         let input = InputBuffer::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 2, &[], '/').unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 2, &[], '/', "").unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1110,7 +1362,7 @@ mod tests {
         assert!(screen.contains("2 queued"), "缺排队数:\n{screen}");
         assert!(screen.contains("Esc"), "缺转向提示:\n{screen}");
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        draw(&mut terminal, &view, &input, 0, true, 0, &[], '/').unwrap();
+        draw(&mut terminal, &view, &input, 0, true, 0, &[], '/', "").unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -1264,6 +1516,7 @@ mod tests {
             &mut view,
             Message::text(Role::User, "ping"),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -1309,6 +1562,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             ),
             Builtin::Quit
         ));
@@ -1324,6 +1578,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             ),
             Builtin::Pass
         ));
@@ -1339,8 +1594,51 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("usage:"), "{msg}");
+        assert!(done_text(dispatch_builtin(
+            "/import",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ))
+        .contains("usage:"));
+        assert!(done_text(dispatch_builtin(
+            "/name",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ))
+        .contains("no session store"));
+        assert!(done_text(dispatch_builtin(
+            "/fork",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ))
+        .contains("no-session"));
     }
 
     #[test]
@@ -1358,6 +1656,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[plan mode on]"
         );
@@ -1374,6 +1673,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[plan mode off]"
         );
@@ -1395,6 +1695,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[thinking default (provider default)]"
         );
@@ -1410,6 +1711,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[thinking switched to High]"
         );
@@ -1426,6 +1728,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[thinking High]"
         );
@@ -1440,6 +1743,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("staying on current"), "{msg}");
         assert_eq!(agent.thinking, Some(rupi_llm::ThinkingLevel::High));
@@ -1460,6 +1764,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[model mock]"
         );
@@ -1482,6 +1787,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         for (k, v) in saved {
             if let Some(val) = v {
@@ -1507,6 +1813,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[rewind] nothing to undo"
         );
@@ -1524,6 +1831,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             "[rewound]"
         );
@@ -1543,6 +1851,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             )),
             format!("[rewound {short}]")
         );
@@ -1558,6 +1867,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
@@ -1579,6 +1889,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             ),
             Builtin::Compact(None)
         ));
@@ -1594,6 +1905,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 None,
+                false,
             ),
             Builtin::Compact(Some(_))
         ));
@@ -1620,6 +1932,7 @@ mod tests {
             &mut tools,
             Some(&mut set),
             None,
+            false,
         ));
         assert!(msg.contains("no changes"), "{msg}");
         // 新增 manifest：重载注册为工具
@@ -1639,6 +1952,7 @@ mod tests {
             &mut tools,
             Some(&mut set),
             None,
+            false,
         ));
         assert!(msg.contains("tui-echo"), "{msg}");
         assert!(tools.definitions().iter().any(|d| d.name == "tui-echo"));
@@ -1655,6 +1969,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("no extension dir"), "{msg}");
         let msg = done_text(dispatch_builtin(
@@ -1668,6 +1983,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
     }
@@ -1688,6 +2004,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("no skills found"), "{msg}");
         // 空命令目录给指引
@@ -1702,6 +2019,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
         // 空树也有视图（不空返回、不漏进模型）
@@ -1716,6 +2034,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(!msg.is_empty(), "空树视图不应为空");
         session.push(Message::text(rupi_core::Role::User, "hi"));
@@ -1730,6 +2049,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert_ne!(msg, msg2, "有节点后视图应变化");
     }
@@ -1820,6 +2140,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("no session store"), "{msg}");
         let msg = done_text(dispatch_builtin(
@@ -1833,6 +2154,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             None,
+            false,
         ));
         assert!(msg.contains("no session store"), "{msg}");
     }
@@ -1856,6 +2178,7 @@ mod tests {
                 &mut ToolRegistry::default(),
                 None,
                 Some(&store),
+                true,
             ),
             Builtin::Resume(got) if got == id
         ));
@@ -1871,6 +2194,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             Some(&store),
+            true,
         ));
         assert!(msg.contains("usage"), "{msg}");
         let msg = done_text(dispatch_builtin(
@@ -1884,6 +2208,7 @@ mod tests {
             &mut ToolRegistry::default(),
             None,
             Some(&store),
+            true,
         ));
         assert!(msg.contains("unknown session"), "{msg}");
         let _ = std::fs::remove_dir_all(&home);

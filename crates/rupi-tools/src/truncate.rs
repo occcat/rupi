@@ -59,7 +59,11 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         }
         out.push_str(line);
     }
-    let output_lines = if out.is_empty() { 0 } else { out.lines().count() };
+    let output_lines = if out.is_empty() {
+        0
+    } else {
+        out.lines().count()
+    };
     TruncationResult {
         output_bytes: out.len(),
         content: out,
@@ -82,7 +86,11 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         if kept.len() >= max_lines {
             break;
         }
-        let add = if kept.is_empty() { line.len() } else { line.len() + 1 };
+        let add = if kept.is_empty() {
+            line.len()
+        } else {
+            line.len() + 1
+        };
         if bytes + add > max_bytes {
             break;
         }
@@ -98,7 +106,11 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         content,
         truncated,
         truncated_by: if truncated {
-            Some(if kept.len() >= max_lines { "lines" } else { "bytes" })
+            Some(if kept.len() >= max_lines {
+                "lines"
+            } else {
+                "bytes"
+            })
         } else {
             None
         },
@@ -113,7 +125,10 @@ mod tests {
 
     #[test]
     fn head_truncates_by_lines() {
-        let text = (0..10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_head(&text, 3, 10_000);
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some("lines"));
@@ -131,7 +146,10 @@ mod tests {
 
     #[test]
     fn tail_keeps_last_lines() {
-        let text = (0..10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_tail(&text, 2, 10_000);
         assert_eq!(r.content, "l8\nl9");
         assert_eq!(r.truncated_by, Some("lines"));

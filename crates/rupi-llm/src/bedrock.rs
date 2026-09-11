@@ -56,10 +56,7 @@ impl BedrockProvider {
     fn body(&self, req: &super::ChatRequest) -> serde_json::Value {
         // 复用 Anthropic 消息映射，但 Bedrock 要顶层 anthropic_version，system 用字符串更稳。
         let mut inner = serde_json::Map::new();
-        inner.insert(
-            "anthropic_version".into(),
-            ANTHROPIC_BEDROCK_VERSION.into(),
-        );
+        inner.insert("anthropic_version".into(), ANTHROPIC_BEDROCK_VERSION.into());
         let requested = req.max_tokens.unwrap_or(4096);
         let max_tokens = req
             .thinking

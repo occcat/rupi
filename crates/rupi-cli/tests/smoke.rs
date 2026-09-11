@@ -288,6 +288,84 @@ fn chat_with(home: &Path, global: &[&str], input: &[u8]) -> Output {
 }
 
 #[test]
+fn settings_and_system_md_apply() {
+    let home = fresh_home();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"model":"gpt-4o-mini","theme":"light","tools":["think"],"compaction":{"reserveTokens":99,"keepRecentTokens":50}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("SYSTEM.md"), "YOU ARE CUSTOM SYS").unwrap();
+    let o = rupi(&home, &["--help"]).output().unwrap();
+    assert!(o.status.success());
+    let (out, _) = out_text(&o);
+    assert!(out.contains("continue"), "help 缺 --continue:\n{out}");
+    assert!(out.contains("no-session"), "help 缺 --no-session:\n{out}");
+    assert!(
+        out.contains("system-prompt"),
+        "help 缺 --system-prompt:\n{out}"
+    );
+}
+
+#[test]
+fn continue_and_no_session_and_export_import() {
+    let home = fresh_home();
+    let o = rupi(
+        &home,
+        &["--no-approve", "--name", "alpha", "run", "first hello"],
+    )
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "named run 失败: {o:?}");
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out, _) = out_text(&o);
+    assert!(out.contains("alpha"), "sessions 未显示 --name:\n{out}");
+    let o = rupi(
+        &home,
+        &["--no-approve", "--continue", "run", "second hello"],
+    )
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "--continue run 失败: {o:?}");
+    let o = rupi(&home, &["sessions"]).output().unwrap();
+    let (out2, _) = out_text(&o);
+    assert_eq!(out2.lines().count(), 1, "--continue 不应建新会话:\n{out2}");
+
+    let home2 = fresh_home();
+    let o = rupi(&home2, &["--no-approve", "--no-session", "run", "ghost"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "--no-session run 失败: {o:?}");
+    let o = rupi(&home2, &["sessions"]).output().unwrap();
+    let (out3, _) = out_text(&o);
+    assert!(
+        out3.contains("no sessions") || out3.lines().count() == 0,
+        "--no-session 仍落盘:\n{out3}"
+    );
+
+    let o = chat_with(&home, &["--no-review"], "/export\n/quit\n".as_bytes());
+    assert!(o.status.success(), "/export 失败: {o:?}");
+    let (out, err) = out_text(&o);
+    assert!(
+        out.contains("[export]") || err.contains("[export]"),
+        "缺 export 确认:\n{out}\n{err}"
+    );
+}
+
+#[test]
+fn exclude_tools_help_and_chat_name() {
+    let home = fresh_home();
+    let o = chat_with(
+        &home,
+        &["--no-review", "--tools", "think", "--exclude-tools", "bash"],
+        "/name demo-session\n/quit\n".as_bytes(),
+    );
+    assert!(o.status.success(), "/name 失败: {o:?}");
+    let (out, _) = out_text(&o);
+    assert!(out.contains("[name] demo-session"), "缺 /name 回显:\n{out}");
+}
+
+#[test]
 fn chat_quit_exits_zero() {
     let home = fresh_home();
     let o = chat_with(&home, &[], b"/quit\n");

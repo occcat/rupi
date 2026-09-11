@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 uuid = { workspace = true }
 rupi-core = { path = "../rupi-core" }
+rupi-config = { path = "../rupi-config" }
 rupi-llm = { path = "../rupi-llm" }
 rupi-tools = { path = "../rupi-tools" }
 rupi-agent = { path = "../rupi-agent" }

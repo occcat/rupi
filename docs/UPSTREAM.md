@@ -22,7 +22,7 @@
 
 ## Compaction（`packages/agent/src/harness/compaction` → `AgentLoop::compress_inner`）
 
-- 上游按 token（`reserveTokens=16384`、`keepRecentTokens=20000`）；rupi 按**字符阈值**（默认 60k）+ **保留条数**（默认 20），`RUPI_COMPRESSION_OVERRIDES` 按 `provider/model` 覆盖，对标 `compaction.modelOverrides`。
+- 按 token（`reserveTokens=16384`、`keepRecentTokens=20000`）：`used > context_window - reserve` 触发，切点从尾部累加 `keepRecentTokens`。估算：ASCII ≈ 4 字/token，CJK ≈ 1 字/token，provider `usage` 校准比例。`settings.json` `compaction` 与 `--compress-threshold/--compress-keep`（别名 `--reserve-tokens/--keep-recent-tokens`）可覆盖；`RUPI_COMPRESSION_OVERRIDES` 按 `provider/model` 覆盖，对标 `compaction.modelOverrides`（旧字段 `threshold_chars`/`keep_last` 仍作别名）。
 - 摘要由模型生成，失败退回首行拼接；`<read-files>/<modified-files>` 文件足迹跨轮合并（对标上游 file-ops 追踪）。
 - `/compact [指令]` 手动压实，对标 `compaction.customInstructions`。
 - 有意偏离：摘要不写回会话树节点，只存 `sessions.summary` 一列，resume 时预热窗口。
@@ -31,8 +31,9 @@
 
 - 树：`branch_from` / `rewind_to` / `goto_node` / `tree_view`，节点 id 即库行 id，`/goto 短id` 跨进程稳定。
 - 持久化：SQLite（WAL）而非上游 JSONL。**本次合并后每个节点完整落盘**：`content` 列存纯文本（FTS/展示），
-  `blocks` 列存整条 `Message` JSON（工具调用、工具结果、思考块），`--resume` / TUI `/resume` 按结构回填，模型续聊时看到完整工具上下文。老库自动补列（`user_version=3`）。
-- 不移植：上游 JSONL v3 文件格式、`--session <path>`。
+  `blocks` 列存整条 `Message` JSON（工具调用、工具结果、思考块），`--resume` / TUI `/resume` 按结构回填，模型续聊时看到完整工具上下文。老库自动补列（`user_version=4`：`name`/`cwd`/`updated_at`/`parent_session`）。每轮 3–4 条 INSERT 走 `persist_turn` 一个事务；CLI/TUI 落盘与记忆文件写进 `spawn_blocking`/`tokio::fs`。`memory_search`/`session_search`/`mirror_memory` 复用 `MemoryStore` 里的 `sessions.db` 连接。
+- 互操作：`--continue`/`-c` 最近会话（优先同 cwd）、`--no-session`、`--name`/`/name`、`/export`（Pi JSONL v3 + 简易 HTML）、`/import`、`/fork`（当前路径新 id）、`/clone`（全树 remap）。存储仍是 SQLite；JSONL 是进出口，不是主存。
+- 不移植：`--session <path>` 直接打开上游文件当主存、`/share`。
 
 ## 工具（`packages/coding-agent/src/core/tools` → `crates/rupi-tools`）
 
@@ -56,7 +57,8 @@
 - 路由：`provider/model[:thinking]`（`--provider` / `--api-key` 可覆盖）；显式 `openai` / `anthropic` / `gemini` / `openrouter` / `azure` / `bedrock` / `vertex`。Bedrock 走 Anthropic Messages + `anthropic_version`（Bearer，`AWS_BEARER_TOKEN_BEDROCK`）；Vertex 走 Gemini `generateContent`（Bearer，`VERTEX_TOKEN`）；Azure 走 deployment URL + `api-key`；OpenRouter 加 Referer/Title 与默认亲和。
 - 模型目录：内置 `crates/rupi-llm/models.json`，可被 `RUPI_MODELS` 或 `~/.rupi/models.json` 覆盖合并；`--list-models` / `rupi models`。
 - 图片：`ContentBlock::Image` 映射三家（OpenAI `image_url` data URL / Anthropic `image` source / Gemini `inline_data`）；`read` 先 `metadata` 再分页；`@file` 图片先判大小再整读（上限 5MB）。
-- OAuth：`rupi login [provider]` **仅 stub**（打印 API key 用法，无浏览器/设备码）。未落地：Claude Pro/Max、ChatGPT Codex、GitHub Copilot 订阅登录；Bedrock SigV4；定价表/footer 成本。
+- 成本：内建粗粒度价目（`TokenMeter` footer `↑↓ tokens / context% / $`）。
+- OAuth：`rupi login [provider]` **仅 stub**（打印 API key 用法，无浏览器/设备码）。未落地：Claude Pro/Max、ChatGPT Codex、GitHub Copilot 订阅登录；Bedrock SigV4。
 
 ## MCP（Pi 生态 `pi-mcp-adapter` / 官方规范 2024-11-05 + Streamable HTTP）
 
@@ -91,10 +93,12 @@
 | `pi` 交互 | `rupi chat`（REPL）与 `rupi tui`（ratatui：Tab 补全、`@path`、`/sessions` `/resume`、运行中排队） |
 | `pi -p` | `rupi run "..."` |
 | `pi --mode json` | `rupi run --json "..."`（本次合并）：stdout 每行一个 `AgentEvent`（`{"type":"text_delta",...}`），末行 `run_result`，出错 `error` 行 + 非零退出 |
-| `pi --continue/--resume` | `--resume <id>`，`rupi sessions` / `session-show` |
+| `pi --continue/--resume` | `--continue`/`-c` 最近会话、`--resume <id>`，`rupi sessions` / `session-show` |
+| `/export` `/import` `/fork` `/clone` `/name` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页） |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
+| `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；`--tools/--exclude-tools/--no-tools`、`--system-prompt/--append-system-prompt` |
 | 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`，`$ARGUMENTS`；JSON-RPC 扩展命令走 `commands/execute` |
-| 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题/差分渲染器 |
+| 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题热重载/差分渲染器 |
 
 ## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复
 
@@ -105,4 +109,4 @@
 5. 搬运：`truncate.rs`（bash 尾截 2000 行/50KB）、`sse.rs`（多行 data、跨 chunk UTF-8）、`run --json`、usage 统计。
 6. 借鉴：`[core]` 记忆分层、本文档。
 
-已知未做：`spawn_blocking` 包裹 `std::fs`/rusqlite 阻塞调用；完整 OAuth 设备码流；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。
+已知未做：完整 OAuth 设备码流；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。
