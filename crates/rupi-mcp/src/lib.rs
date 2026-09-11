@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
+
+pub mod jsonrpc;
+pub use jsonrpc::{Incoming, StdioRpc};
 
 /// MCP server 配置：stdio 是一条命令 + 参数 + 可选环境变量；
 /// StreamableHTTP 是 `url`（`command` 可空，`spawn_all` 按有无 url 分流）。
@@ -126,8 +127,6 @@ pub fn sanitize_params(
     serde_json::Value::Object(out)
 }
 
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>;
-
 /// SSE `data:` 事件分类（纯函数，可单测）：本轮响应 / server→client 请求 / 可忽略。
 /// 反向请求由调用方当场 POST 应答（POST 回包流内与独立 GET 流皆然），否则 server 侧超时。
 #[derive(Debug, PartialEq)]
@@ -197,11 +196,7 @@ impl SseFramer {
 /// 另有独立 GET 常驻流收 server 纯推送，桥 drop 时 abort）。
 enum Transport {
     Stdio {
-        pending: PendingMap,
-        stdin: Arc<Mutex<ChildStdin>>,
-        _child: Child,
-        _reader_task: tokio::task::JoinHandle<()>,
-        _stderr_task: tokio::task::JoinHandle<()>,
+        rpc: Arc<StdioRpc>,
     },
     Http {
         client: reqwest::Client,
@@ -272,94 +267,46 @@ impl McpBridge {
     async fn spawn_inner(
         config: McpServerConfig,
         tool_watch: Option<mpsc::UnboundedSender<String>>,
-    ) -> anyhow::Result<Self> {        let mut cmd = Command::new(&config.command);
-        cmd.args(&config.args)
-            .envs(&config.env)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .context(format!("spawn MCP server {}", config.command))?;
-        let stdin: ChildStdin = child.stdin.take().context("no stdin")?;
-        let stdout: ChildStdout = child.stdout.take().context("no stdout")?;
-        let stderr = child.stderr.take();
-
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (tx_lines, mut rx_lines) = mpsc::unbounded_channel::<String>();
-
-        // stdout 读取任务：逐行解析，server→client 只可能是 Response 或 Notification。
-        let pending_clone = pending.clone();
-        let reader_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let _ = tx_lines.send(line);
-            }
-        });
-        let pending_route = pending.clone();
-        let stdin_route = Arc::new(Mutex::new(stdin));
+    ) -> anyhow::Result<Self> {
+        let rpc = Arc::new(
+            StdioRpc::spawn(&config.command, &config.args, &config.env)
+                .await
+                .with_context(|| format!("spawn MCP server {}", config.command))?,
+        );
         let roots_route = vec![McpRoot::cwd()];
-        let stdin_write = stdin_route.clone();
+        let mut incoming = rpc
+            .take_incoming()
+            .await
+            .expect("fresh StdioRpc always has incoming");
+        let rpc_write = rpc.clone();
         let roots_in_task = roots_route.clone();
         let push_route = PushTarget {
             watch: tool_watch.clone(),
             server: config.name.clone(),
         };
         tokio::spawn(async move {
-            while let Some(line) = rx_lines.recv().await {
-                let v: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let id = v.get("id").and_then(|i| i.as_i64());
-                // server→client 请求（含 roots/list、ping）：必须应答，否则 server 侧超时；
-                // 无 id 的工具变更通知推进观察队列，由宿主逐轮差量刷新（无订阅即忽略）
-                if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-                    if id.is_none() {
-                        note_tools_changed(&push_route, method, id);
+            while let Some(msg) = incoming.recv().await {
+                match msg {
+                    Incoming::Notification { method, .. } => {
+                        note_tools_changed(&push_route, &method, None);
                     }
-                    if let Some(resp) = server_request_response(method, id, &roots_in_task) {
-                        let mut stdin = stdin_write.lock().await;
-                        let _ = stdin.write_all(format!("{resp}\n").as_bytes()).await;
-                        let _ = stdin.flush().await;
+                    Incoming::Request { id, method, .. } => {
+                        if let Some(resp) =
+                            server_request_response(&method, Some(id), &roots_in_task)
+                        {
+                            let _ = rpc_write.write_line(&resp).await;
+                        }
                     }
-                    continue;
-                }
-                // 无 method 即 Response：按 id 路由给挂起的 call
-                if let Some(id) = id {
-                    if let Some(tx) = pending_route.lock().await.remove(&id) {
-                        let _ = tx.send(v);
-                    }
-                }
-                // notifications 直接丢弃（可在此转 event）
-            }
-            drop(pending_clone);
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            if let Some(stderr) = stderr {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    tracing::debug!(target: "rupi-mcp", "mcp stderr: {line}");
                 }
             }
         });
 
         let bridge = Self {
             config,
-            roots: roots_route.clone(),
+            roots: roots_route,
             next_id: AtomicI64::new(1),
             tool_watch,
-            transport: Transport::Stdio {
-                pending,
-                stdin: stdin_route,
-                _child: child,
-                _reader_task: reader_task,
-                _stderr_task: stderr_task,
-            },
+            transport: Transport::Stdio { rpc },
         };
         bridge.handshake().await?;
         Ok(bridge)
@@ -427,57 +374,23 @@ impl McpBridge {
         method: &str,
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let push = PushTarget {
             watch: self.tool_watch.clone(),
             server: self.config.name.clone(),
         };
         match &self.transport {
-            Transport::Stdio { pending, stdin, .. } => {
-                Self::call_stdio(pending, stdin, id, method, params).await
-            }
+            Transport::Stdio { rpc } => rpc.call(method, params).await,
             Transport::Http {
                 client,
                 url,
                 session_id,
                 ..
             } => {
+                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
                 Self::call_http(client, url, session_id, &self.roots, &push, id, method, params)
                     .await
             }
         }
-    }
-
-    async fn call_stdio(
-        pending: &PendingMap,
-        stdin: &Arc<Mutex<ChildStdin>>,
-        id: i64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
-        let req = serde_json::json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
-        let (tx, rx) = oneshot::channel();
-        pending.lock().await.insert(id, tx);
-        {
-            let mut guard = stdin.lock().await;
-            guard.write_all(format!("{}\n", req).as_bytes()).await?;
-            guard.flush().await?;
-        }
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(r) => r?,
-            Err(_) => {
-                // 超时即摘掉挂起项：迟到响应无人认领，不留泄漏
-                pending.lock().await.remove(&id);
-                anyhow::bail!("MCP {method} timed out after 30s");
-            }
-        };
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("MCP error for {method}: {err}");
-        }
-        Ok(resp
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
     }
 
     /// StreamableHTTP POST：单 JSON 回包或 SSE 流二选一；`mcp-session-id` 捕获后回传保持。
@@ -770,13 +683,7 @@ impl McpBridge {
 
     pub async fn notify(&self, method: &str, params: serde_json::Value) -> anyhow::Result<()> {
         match &self.transport {
-            Transport::Stdio { stdin, .. } => {
-                let req = serde_json::json!({"jsonrpc":"2.0","method": method, "params": params});
-                let mut guard = stdin.lock().await;
-                guard.write_all(format!("{}\n", req).as_bytes()).await?;
-                guard.flush().await?;
-                Ok(())
-            }
+            Transport::Stdio { rpc } => rpc.notify(method, params).await,
             // notification 只有 202/空体：call_http 本就按 Null 成功处理，id 仅占位
             Transport::Http {
                 client,

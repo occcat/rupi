@@ -399,7 +399,38 @@ impl AgentLoop {
         on_event: &(dyn Fn(AgentEvent) + Sync),
         cancel: &CancelFlag,
     ) -> anyhow::Result<StopReason> {
-        session.push(Message::text(Role::User, user_input));
+        self.run_with_user(
+            provider,
+            session,
+            Message::text(Role::User, user_input),
+            tools,
+            mem,
+            frozen,
+            skills,
+            extensions,
+            on_event,
+            cancel,
+        )
+        .await
+    }
+
+    /// 与 [`Self::run`] 相同，但用户回合可以是图文混排（`@file` 图片）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_user(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        user: Message,
+        tools: &ToolRegistry,
+        mem: &MemoryManager,
+        frozen: &FrozenMemory,
+        skills: &SkillRegistry,
+        extensions: &[Arc<dyn Extension>],
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<StopReason> {
+        let user_input = user.full_text();
+        session.push(user);
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
         self.maybe_compress_with_event(provider, session, mem, on_event)
             .await;
@@ -409,7 +440,7 @@ impl AgentLoop {
         all_tools.extend(mem.all_tool_definitions());
         all_tools.extend(skills.tool_definitions());
         // 记忆 prefetch：注入到本轮（不污染冻结快照）；寒暄门在 manager 内
-        let recalled = mem.prefetch_all(user_input).await;
+        let recalled = mem.prefetch_all(&user_input).await;
         // 回想指示紧跟 prefetch（Hermes describe_recall 同约）：有注入才发射，
         // 模型沉默用户也看得到记忆被用了；寒暄短路/无货时 describe 回空，不扰屏。
         let recall_line = mem.describe_recall();
@@ -558,8 +589,8 @@ impl AgentLoop {
 
             if !has_calls {
                 // 后台记忆 sync（fire-and-forget 语义：失败只 warning）
-                mem.sync_all(user_input, &resp.message.full_text()).await;
-                self.run_review(user_input, &resp.message.full_text(), &tool_names)
+                mem.sync_all(&user_input, &resp.message.full_text()).await;
+                self.run_review(&user_input, &resp.message.full_text(), &tool_names)
                     .await;
                 on_event(AgentEvent::TurnEnd {
                     turn,
@@ -620,11 +651,15 @@ impl AgentLoop {
                         }
                     }
                 }
-                on_event(AgentEvent::ToolStart {
+                let start = AgentEvent::ToolStart {
                     tool_call_id: id.clone(),
                     name: name.clone(),
                     arguments: args.clone(),
-                });
+                };
+                on_event(start.clone());
+                for e in extensions {
+                    e.on_event(&start).await?;
+                }
                 // 权限门：拒绝 / 无审批的 Ask 一律转 tool error 回模型，主循环不中断
                 let denied: Option<rupi_tools::ToolOutput> =
                     hook_denied.or(match self.policy.decide(&name, &args) {
@@ -751,17 +786,38 @@ impl AgentLoop {
                 for h in &self.hooks {
                     out = h.after(&p.name, &p.args, out).await;
                 }
-                on_event(AgentEvent::ToolEnd {
+                let end = AgentEvent::ToolEnd {
                     tool_call_id: p.id.clone(),
                     name: p.name.clone(),
                     content: out.content.clone(),
                     is_error: out.is_error,
-                });
+                };
+                on_event(end.clone());
+                for e in extensions {
+                    e.on_event(&end).await?;
+                }
+                if let Some(hint) = out.ui_hint.clone() {
+                    let ev = AgentEvent::UiHint {
+                        source: p.name.clone(),
+                        kind: hint.kind,
+                        message: hint.message,
+                    };
+                    on_event(ev.clone());
+                    for e in extensions {
+                        e.on_event(&ev).await?;
+                    }
+                }
                 results.push(ContentBlock::ToolResult {
                     tool_call_id: p.id,
                     content: out.content,
                     is_error: out.is_error,
                 });
+                for img in out.images {
+                    results.push(ContentBlock::Image {
+                        media_type: img.media_type,
+                        data: img.data,
+                    });
+                }
             }
             session.push(Message {
                 id: uuid::Uuid::new_v4().to_string(),

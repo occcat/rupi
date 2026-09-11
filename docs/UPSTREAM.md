@@ -12,7 +12,7 @@
 
 | 上游 | rupi | 说明 |
 |---|---|---|
-| `runLoop`：流式助手消息 → 工具 → 循环直到无工具调用 | `AgentLoop::run` | 事件：`TurnStart/TextDelta/ToolStart/ToolEnd/TurnEnd/RunEnd/Usage/CompactionStart/End/UiPromptStart/End` |
+| `runLoop`：流式助手消息 → 工具 → 循环直到无工具调用 | `AgentLoop::run` / `run_with_user` | 事件：`TurnStart/TextDelta/ToolStart/ToolEnd/TurnEnd/RunEnd/Usage/CompactionStart/End/UiPromptStart/End/UiHint` |
 | `beforeToolCall` / `afterToolCall` | `ToolHook::before/after`（`hooks.rs`） | before 可改写参数或拒绝；after 包住一切结果（含拒绝路径） |
 | `toolExecution: parallel \| sequential` | `--parallel-tools`，默认串行 | 并行 `join_all`，事件与结果保原序；审批问询永远串行发生在执行前 |
 | 取消（effect gate） | `CancelFlag`（Atomic + Notify） | turn 边界、流中、串行工具间隙三处检查点；bash 进程组 SIGKILL |
@@ -38,7 +38,7 @@
 
 | 上游 | rupi |
 |---|---|
-| `read`（`offset/limit`，头截 2000 行/50KB） | `read` 分页 offset/limit；单行超长中部折叠 |
+| `read`（`offset/limit`，头截 2000 行/50KB，含图片） | 先 `metadata` 再分页；图片整读（上限 10MB）挂 `ToolImage`；`@file` 图片上限 5MB |
 | `edit`（`edits[]` 按原文匹配、必须唯一、不得重叠、返回 diff） | **同语义**：`old_string/new_string`（+`replace_all`）或 `edits[]`（兼容 `oldText/newText`），唯一性校验、重叠拒绝、统一 diff 回包。此前是 `replacen(...,1)` 静默改首个匹配 |
 | `bash`（尾截 2000 行/50KB、超时、进程组 kill） | 同默认（`truncate.rs` 自 2c40 分支搬运），默认 30s 超时可调，`execute_with_cancel` 进程组 SIGKILL、取消返回部分输出 |
 | `grep` / `find` / `ls` | `grep` / `glob`；`ls` 用 bash |
@@ -52,8 +52,11 @@
 - 真 SSE 流式。**本次合并后三家共用 `sse.rs`**（自 2c40 搬运并加强）：跨 chunk UTF-8 增量解码、多行 `data:`、`event:`、CRLF；流中 `error` 事件/对象转错误而非静默空回。
 - `usage`：OpenAI `stream_options.include_usage`、Anthropic `message_start/message_delta.usage`、Gemini `usageMetadata` → `StreamEvent::Usage` → `AgentEvent::Usage`（REPL/TUI/`run` 显示，`--json` 输出为事件）。
 - 重试：429/5xx + `Retry-After`，指数退避 500ms·2ⁿ 上限 8s，3 次。
-- thinking 四档映射 `reasoning_effort` / `thinkingLevel` / `thinking.budget_tokens`；Anthropic 签名回放、prompt caching 断点。已知限制：Anthropic `medium/high` 需要 `max_tokens > budget`，默认 4096 下只有 `low` 生效。
-- 不移植：OAuth provider、pi-ai 的模型目录/定价表、图片输入。
+- thinking 六档 `off|low|medium|high|xhigh|max` 映射 `reasoning_effort` / `thinkingLevel` / `thinking.budget_tokens`；开启 Anthropic 思考时 `max_tokens = max(请求, budget+4096)`，medium/high 不再因默认 4096 静默失效。
+- 路由：`provider/model[:thinking]`（`--provider` / `--api-key` 可覆盖）；显式 `openai` / `anthropic` / `gemini` / `openrouter` / `azure` / `bedrock` / `vertex`。Bedrock 走 Anthropic Messages + `anthropic_version`（Bearer，`AWS_BEARER_TOKEN_BEDROCK`）；Vertex 走 Gemini `generateContent`（Bearer，`VERTEX_TOKEN`）；Azure 走 deployment URL + `api-key`；OpenRouter 加 Referer/Title 与默认亲和。
+- 模型目录：内置 `crates/rupi-llm/models.json`，可被 `RUPI_MODELS` 或 `~/.rupi/models.json` 覆盖合并；`--list-models` / `rupi models`。
+- 图片：`ContentBlock::Image` 映射三家（OpenAI `image_url` data URL / Anthropic `image` source / Gemini `inline_data`）；`read` 先 `metadata` 再分页；`@file` 图片先判大小再整读（上限 5MB）。
+- OAuth：`rupi login [provider]` **仅 stub**（打印 API key 用法，无浏览器/设备码）。未落地：Claude Pro/Max、ChatGPT Codex、GitHub Copilot 订阅登录；Bedrock SigV4；定价表/footer 成本。
 
 ## MCP（Pi 生态 `pi-mcp-adapter` / 官方规范 2024-11-05 + Streamable HTTP）
 
@@ -74,6 +77,12 @@
 - 递归发现（honor `.gitignore/.ignore`），`SKILL.md` frontmatter 校验，三阶段渐进披露，`/skillname args` 即斜杠命令，每轮热刷新。
 - 自积累：默认启发式复盘只建议不落盘，`--review-apply` 落盘，`--review-llm` 用模型复盘；`skill-distill` 手工蒸馏。
 
+## 扩展（Pi 进程内 TS → `crates/rupi-ext`）
+
+- oneshot：manifest + 子进程 stdin JSON → stdout（原行为）。
+- **jsonrpc**：长连接双向 JSON-RPC（复用 `rupi_mcp::StdioRpc` 帧）。扩展可 `initialize` 注册斜杠命令、订阅 `tool_call` / `turn_end` / `session_*`，`tools/call` 可回 `ui` hint；运行中 `registerCommand` / `subscribe` / `ui/hint`。
+- 不移植：WASM、注册 provider、自定义编辑器/渲染器、快捷键/flag。
+
 ## CLI / TUI（`packages/coding-agent` CLI）
 
 | 上游 | rupi |
@@ -83,7 +92,7 @@
 | `pi --mode json` | `rupi run --json "..."`（本次合并）：stdout 每行一个 `AgentEvent`（`{"type":"text_delta",...}`），末行 `run_result`，出错 `error` 行 + 非零退出 |
 | `pi --continue/--resume` | `--resume <id>`，`rupi sessions` / `session-show` |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
-| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`，`$ARGUMENTS` |
+| 自定义命令 | `~/.rupi/commands/*.md` 与 `.rupi/commands/*.md`，`$ARGUMENTS`；JSON-RPC 扩展命令走 `commands/execute` |
 | 不移植 | `--mode rpc`、会话文件选择器 UI、Pi 的主题/差分渲染器 |
 
 ## 本次合并（2026-09-11，main ← `rupi-pi-agent-port-23a6`）新增/修复
@@ -95,4 +104,4 @@
 5. 搬运：`truncate.rs`（bash 尾截 2000 行/50KB）、`sse.rs`（多行 data、跨 chunk UTF-8）、`run --json`、usage 统计。
 6. 借鉴：`[core]` 记忆分层、本文档。
 
-已知未做：`spawn_blocking` 包裹 `std::fs`/rusqlite 阻塞调用；Anthropic thinking 预算与 `max_tokens` 联动；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱。
+已知未做：`spawn_blocking` 包裹 `std::fs`/rusqlite 阻塞调用；完整 OAuth 设备码流；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。

@@ -146,6 +146,14 @@ impl ChatView {
             AgentEvent::Error { message } => {
                 self.lines.push(Line::System(format!("error: {message}")));
             }
+            AgentEvent::UiHint {
+                source,
+                kind,
+                message,
+            } => {
+                self.lines
+                    .push(Line::System(format!("[ui {source}/{kind}] {message}")));
+            }
         }
     }
 

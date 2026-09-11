@@ -110,4 +110,31 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
 - 内建命令（`/quit`、`/tree`、`/goto` 等）优先；未知 `/foo` 先查自定义命令，
   命中则展开后发送（REPL 打印 `[command /foo]`，TUI 插一行同名系统提示），查不到才当普通消息。
 - 发现：`rupi commands` 子命令与 REPL/TUI 内 `/commands` 列出全部自定义命令
- （description 取自 frontmatter，无则取正文首行）。
+ （description 取自 frontmatter，无则取正文首行）。JSON-RPC 扩展注册的斜杠命令
+  同表列出，未命中 `.md` / skill 时再走 `commands/execute`。
+
+## Provider 广度与图片
+
+```bash
+# provider/model[:thinking]；--api-key 覆盖当前家的密钥
+./target/debug/rupi --model anthropic/claude-sonnet-4-5:high --api-key "$KEY" chat
+./target/debug/rupi --model openrouter/openai/gpt-4o-mini --provider openrouter chat
+./target/debug/rupi --list-models   # 或 `rupi models`
+./target/debug/rupi login anthropic # OAuth 占位：只打印 API key 用法，无浏览器流
+```
+
+显式路由：`openai` / `anthropic` / `gemini` / `openrouter` / `azure` / `bedrock` / `vertex`。
+思考档 `off|low|medium|high|xhigh|max`（也可写在模型后缀）。Anthropic 开启思考时会抬高
+`max_tokens`，避免 medium/high 因默认 4096 静默失效。
+
+`read` 与 `@file` 支持 png/jpg/gif/webp/bmp/svg：先 `metadata` 判大小再读；文本按行分页，
+大文件不再整文件 `read_to_string`。图片进 `ContentBlock::Image`，三家 provider 各自映射。
+
+## JSON-RPC 扩展（长连接）
+
+默认仍是 oneshot（stdin JSON → stdout）。`protocol: jsonrpc` 拉起双向 JSON-RPC 子进程
+（复用 `rupi-mcp` 换行帧）：`initialize` 可注册斜杠命令、预订阅 `tool_call` / `turn_end` /
+`session_*`；`tools/call` 结果可带 `ui` hint；运行中可 `registerCommand` / `subscribe` /
+`ui/hint`。WASM 不在范围。示例：`examples/extensions/echo-rpc.json`。
+
+OAuth 未落地（Claude Pro/Max、Codex、Copilot）；用环境变量或 `--api-key`。

@@ -1,0 +1,16 @@
+{
+  "name": "echo-rpc",
+  "description": "JSON-RPC demo: register /shout, echo tools/call, emit UI hints",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "description": "text to echo" }
+    }
+  },
+  "prompt_snippet": "echo-rpc(text): long-lived JSON-RPC extension demo",
+  "command": "python3",
+  "args": ["-u", "examples/extensions/echo_rpc.py"],
+  "protocol": "jsonrpc",
+  "subscribe": ["tool_call", "turn_end", "session_start"],
+  "timeout_secs": 30
+}

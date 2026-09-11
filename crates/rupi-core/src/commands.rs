@@ -100,13 +100,31 @@ pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
 /// `,.;:)]}!?`；只收 root 内的普通文件（canonical 校验，与 read 沙箱同口径），
 /// 目录/越界/不存在/读失败一律保留原文（静默，用户可改走 read 工具）。
 /// 超 `AT_MAX_BYTES`（64K）截断并标注；展开为围栏块，模型可定位来源。
+/// 图片（png/jpg/gif/webp/bmp/svg）：先 `metadata` 判大小，再整文件读成
+/// [`crate::ContentBlock::Image`]（上限 [`AT_MAX_IMAGE_BYTES`]），不走文本围栏。
 pub const AT_MAX_BYTES: u64 = 64 * 1024;
+/// @ 附件图片上限：先 metadata 再读，超限保留原文（改走 read 工具）。
+pub const AT_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// 纯文本展开（测试与不关心图片块的调用方）。图片写成 `[image mime]` 占位。
 pub fn expand_at_mentions(text: &str, root: &Path) -> String {
+    crate::Message::from_blocks(crate::Role::User, expand_at_mentions_blocks(text, root)).full_text()
+}
+
+/// 图文混排展开：文本围栏 + 图片块按原文顺序交错。
+pub fn expand_at_mentions_blocks(text: &str, root: &Path) -> Vec<crate::ContentBlock> {
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut blocks = Vec::new();
+    let mut text_buf = String::with_capacity(text.len());
     let mut i = 0;
+    let flush_text = |buf: &mut String, blocks: &mut Vec<crate::ContentBlock>| {
+        if !buf.is_empty() {
+            blocks.push(crate::ContentBlock::Text {
+                text: std::mem::take(buf),
+            });
+        }
+    };
     while i < bytes.len() {
         if bytes[i] == b'@'
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
@@ -120,21 +138,50 @@ pub fn expand_at_mentions(text: &str, root: &Path) -> String {
             let mut raw = &text[i + 1..j];
             raw = raw.trim_end_matches([',', '.', ';', ':', ')', ']', '}', '!', '?']);
             let tail = &text[i + 1 + raw.len()..j];
-            if let Some(block) = read_at_file(raw, &root_canon) {
-                out.push_str(&block);
-                out.push_str(tail);
+            if let Some(part) = read_at_file(raw, &root_canon) {
+                match part {
+                    AtPart::Text(s) => {
+                        text_buf.push_str(&s);
+                        text_buf.push_str(tail);
+                    }
+                    AtPart::Image {
+                        caption,
+                        media_type,
+                        data,
+                    } => {
+                        text_buf.push_str(&caption);
+                        text_buf.push_str(tail);
+                        flush_text(&mut text_buf, &mut blocks);
+                        blocks.push(crate::ContentBlock::Image { media_type, data });
+                    }
+                }
                 i = j;
                 continue;
             }
         }
         let ch = text[i..].chars().next().expect("非空剩余必有字符");
-        out.push(ch);
+        text_buf.push(ch);
         i += ch.len_utf8();
     }
-    out
+    flush_text(&mut text_buf, &mut blocks);
+    if blocks.is_empty() {
+        blocks.push(crate::ContentBlock::Text {
+            text: String::new(),
+        });
+    }
+    blocks
 }
 
-fn read_at_file(rel: &str, root_canon: &Path) -> Option<String> {
+enum AtPart {
+    Text(String),
+    Image {
+        caption: String,
+        media_type: String,
+        data: String,
+    },
+}
+
+fn read_at_file(rel: &str, root_canon: &Path) -> Option<AtPart> {
     if rel.is_empty() || rel.contains('\0') {
         return None;
     }
@@ -151,14 +198,33 @@ fn read_at_file(rel: &str, root_canon: &Path) -> Option<String> {
     if !canon.starts_with(root_canon) {
         return None;
     }
-    let content = std::fs::read_to_string(&canon).ok()?;
+    if let Some(media) = crate::image_media_type(&canon) {
+        if meta.len() > AT_MAX_IMAGE_BYTES {
+            return Some(AtPart::Text(format!(
+                "`@{rel}` 是图片（{media}，{} bytes，超过 @ 附件上限 {}）——请用 read 工具",
+                meta.len(),
+                AT_MAX_IMAGE_BYTES
+            )));
+        }
+        let bytes = std::fs::read(&canon).ok()?;
+        return Some(AtPart::Image {
+            caption: format!("`@{rel}` 的图片（{media}，{} bytes）：\n", bytes.len()),
+            media_type: media.to_string(),
+            data: crate::encode_base64(&bytes),
+        });
+    }
     let truncated = meta.len() > AT_MAX_BYTES;
-    let body: String = content.chars().take(AT_MAX_BYTES as usize).collect();
-    Some(if truncated {
+    let file = std::fs::File::open(&canon).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = vec![0u8; AT_MAX_BYTES as usize];
+    let n = std::io::Read::read(&mut reader, &mut buf).ok()?;
+    buf.truncate(n);
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    Some(AtPart::Text(if truncated {
         format!("`@{rel}` 的内容（已截断前 64K）：\n```\n{body}\n```")
     } else {
         format!("`@{rel}` 的内容：\n```\n{body}\n```")
-    })
+    }))
 }
 
 /// 列出命令：按名称排序的 (name, description)。
@@ -368,6 +434,28 @@ mod tests {
         write(&base, "big.txt", &big);
         let out = expand_at_mentions("@big.txt", &base);
         assert!(out.contains("已截断前 64K"), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn at_mention_image_becomes_image_block() {
+        let base = at_root("img");
+        // 最小 PNG 头 + 一点载荷，足够走图片分支（不校验解码）
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+        std::fs::write(base.join("pic.png"), png).unwrap();
+        let blocks = expand_at_mentions_blocks("看 @pic.png", &base);
+        assert!(
+            blocks.iter().any(|b| matches!(
+                b,
+                crate::ContentBlock::Image {
+                    media_type,
+                    data
+                } if media_type == "image/png" && !data.is_empty()
+            )),
+            "{blocks:?}"
+        );
+        let text = expand_at_mentions("看 @pic.png", &base);
+        assert!(text.contains("[image image/png]"), "{text}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

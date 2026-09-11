@@ -20,7 +20,7 @@ use ratatui::{
     Terminal,
 };
 use rupi_agent::AgentLoop;
-use rupi_core::{commands, AgentEvent, Message, SessionTree};
+use rupi_core::{commands, AgentEvent, Extension, Message, Role, SessionTree};
 use rupi_llm::LlmProvider;
 use rupi_mcp::McpManager;
 use rupi_memory::{FrozenMemory, MemoryManager, SessionStore};
@@ -278,7 +278,15 @@ fn dispatch_builtin(
         });
     }
     if t == "/commands" {
-        return Builtin::Done(commands::index_block(command_dirs));
+        let mut block = commands::index_block(command_dirs);
+        if let Some(set) = ext_set.as_ref() {
+            let extra = set.command_index();
+            if !extra.is_empty() {
+                block.push('\n');
+                block.push_str(&extra);
+            }
+        }
+        return Builtin::Done(block);
     }
     if t == "/tree" {
         return Builtin::Done(session.tree_view());
@@ -374,6 +382,9 @@ fn dispatch_builtin(
                 // 切换后回填亲和头：同会话 id 即同一下游（与 REPL /model 同语义）
                 rupi_llm::apply_session_settings(&mut *p, Some(session_id));
                 *provider = p.into();
+                if let Some(t) = rupi_llm::parse_model_spec(arg).thinking {
+                    agent.thinking = Some(t);
+                }
                 Builtin::Done(format!("[model switched to {arg}]"))
             }
             Err(e) => Builtin::Done(format!("[model] switch failed ({e:#})")),
@@ -426,10 +437,13 @@ async fn run_loop(
     loop {
         // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
         // 无斜杠候选时回退 @路径补全（root 取 current_dir，失败即无弹窗）。
-        let custom_names: Vec<String> = commands::list(&ctx.command_dirs)
+        let mut custom_names: Vec<String> = commands::list(&ctx.command_dirs)
             .into_iter()
             .map(|(n, _)| n)
             .collect();
+        if let Some(set) = ctx.ext_set.as_ref() {
+            custom_names.extend(set.list_commands().into_iter().map(|c| c.name));
+        }
         let slash_completion = complete::candidates(&input.text(), &custom_names);
         let (completion, completion_prefix) = if slash_completion.is_empty() {
             let at = match std::env::current_dir() {
@@ -601,17 +615,32 @@ async fn run_loop(
                         } else if let Some(expanded) = ctx.skills.expand_as_command(name, args) {
                             view.push_system(format!("[skill /{name}]"));
                             send_text = expanded;
+                        } else if let Some(set) = ctx.ext_set.as_ref() {
+                            if let Some(expanded) = set.expand_command(name, args) {
+                                view.push_system(format!("[ext /{name}]"));
+                                send_text = expanded;
+                            }
                         }
                     }
-                    // @path 引用展开：斜杠展开之后、发送之前内联文件内容（root 取 current_dir）。
-                    if let Ok(cwd) = std::env::current_dir() {
-                        send_text = commands::expand_at_mentions(&send_text, &cwd);
-                    }
-                    view.push_user(send_text.clone());
+                    // @path 引用展开：斜杠展开之后、发送之前内联文件（图片走 Image 块）。
+                    let user = if let Ok(cwd) = std::env::current_dir() {
+                        Message::from_blocks(
+                            Role::User,
+                            commands::expand_at_mentions_blocks(&send_text, &cwd),
+                        )
+                    } else {
+                        Message::text(Role::User, send_text.clone())
+                    };
+                    view.push_user(user.full_text());
                     scroll = 0;
                     // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
                     ctx.skills.refresh(&ctx.skill_dirs);
-                    match drive_turn(
+                    let ext_arcs: Vec<Arc<dyn Extension>> = ctx
+                        .ext_set
+                        .as_ref()
+                        .map(|s| s.extension_arcs())
+                        .unwrap_or_default();
+                    let turn = drive_turn(
                         terminal,
                         ctx.agent,
                         &**ctx.provider,
@@ -624,10 +653,19 @@ async fn run_loop(
                         &ctx.on_turn,
                         &mut reader,
                         &mut view,
-                        send_text,
+                        user,
+                        &ext_arcs,
                     )
-                    .await?
-                    {
+                    .await?;
+                    if let Some(set) = ctx.ext_set.as_ref() {
+                        for (source, hint) in set.drain_ui_hints() {
+                            view.push_system(format!(
+                                "[ui {source}/{}] {}",
+                                hint.kind, hint.message
+                            ));
+                        }
+                    }
+                    match turn {
                         (Control::Continue, followup) => {
                             let q = followup.trim().to_string();
                             if q.is_empty() {
@@ -667,7 +705,8 @@ async fn drive_turn<B, S>(
     on_turn: &Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
     reader: &mut S,
     view: &mut ChatView,
-    text: String,
+    user: Message,
+    extensions: &[Arc<dyn Extension>],
 ) -> anyhow::Result<(Control, String)>
 where
     B: Backend,
@@ -679,17 +718,18 @@ where
     };
     // 本轮前路径长度：用户节点即 current_path[before]，落盘沿用其 id（resume 短 id 稳定）
     let before = session.current_path.len();
+    let user_text = user.full_text();
     // 协作取消：内循环 Esc 置位，主循环在检查点优雅中止（TurnEnd/RunEnd{Aborted} 照常走事件通道）。
     let cancel = rupi_core::CancelFlag::new();
-    let fut = agent.run(
+    let fut = agent.run_with_user(
         provider,
         session,
-        &text,
+        user,
         tools,
         mem,
         frozen,
         skills,
-        &[],
+        extensions,
         &on_event,
         &cancel,
     );
@@ -775,7 +815,7 @@ where
                         .collect();
                     if let Some(cb) = on_turn {
                         cb(TurnRecord {
-                            user: text.clone(),
+                            user: user_text.clone(),
                             assistant,
                             summary: session.summary.clone(),
                             user_node,
@@ -1223,7 +1263,8 @@ mod tests {
             &None,
             &mut reader,
             &mut view,
-            "ping".into(),
+            Message::text(Role::User, "ping"),
+            &[],
         )
         .await
         .unwrap();

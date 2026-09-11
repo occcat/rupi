@@ -19,10 +19,11 @@ pub enum Role {
     Tool,
 }
 
-/// 内容块：文本 / 工具调用 / 工具结果 / 思考块，与 OpenAI/Anthropic 两种风格兼容。
+/// 内容块：文本 / 工具调用 / 工具结果 / 思考块 / 图片，与 OpenAI/Anthropic/Gemini 兼容。
 /// Thinking 系 Anthropic extended-thinking 专有：`signature` 是回放凭证，
 /// 多轮工具流必须原样带回，否则 API 400；`RedactedThinking` 是服务端加密块，
 /// 无明文、必须按 `data` 原样回放。OpenAI/Gemini 请求映射跳过它们（服务端各自管理推理态）。
+/// Image：`media_type` 为 MIME（如 `image/png`），`data` 为标准 Base64（无 data: 前缀）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -47,6 +48,10 @@ pub enum ContentBlock {
     RedactedThinking {
         data: String,
     },
+    Image {
+        media_type: String,
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +74,23 @@ impl Message {
         }
     }
 
+    /// 由内容块组装消息（`@file` 图文混排、工具结果附图片）。
+    pub fn from_blocks(role: Role, blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role,
+            blocks,
+            provider: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
+    }
+
     pub fn full_text(&self) -> String {
         self.blocks
             .iter()
@@ -83,6 +105,7 @@ impl Message {
                     Some(format!("[thinking] {text}"))
                 }
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+                ContentBlock::Image { media_type, .. } => Some(format!("[image {media_type}]")),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -369,6 +392,13 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// 扩展返回的 UI 提示（对标 Pi extension UI hints）：宿主可画 toast/状态行。
+    /// `kind` 为扩展自报（`note`/`status`/`toast`），未知值当普通系统行。
+    UiHint {
+        source: String,
+        kind: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +476,13 @@ impl ToolDefinition {
     }
 }
 
+/// 扩展注册的斜杠命令（JSON-RPC 扩展 `registerCommand` / initialize.capabilities）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionCommand {
+    pub name: String,
+    pub description: String,
+}
+
 /// 扩展点：工具 / 命令 / 事件钩子。Pi 哲学：core 极小，一切能力走扩展组合。
 #[async_trait::async_trait]
 pub trait Extension: Send + Sync {
@@ -457,9 +494,66 @@ pub trait Extension: Send + Sync {
     fn system_prompt_snippet(&self) -> Option<String> {
         None
     }
+    /// 扩展注册的斜杠命令（默认无）。
+    fn commands(&self) -> Vec<ExtensionCommand> {
+        vec![]
+    }
     async fn on_event(&self, _event: &AgentEvent) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// 按扩展名猜图片 MIME。未知扩展返回 None（不当图片读）。
+pub fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("svg") => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// 标准 Base64（无换行）。图片块与 data URL 共用，避免再引 crate。
+pub fn encode_base64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = data.get(i + 1).copied();
+        let b2 = data.get(i + 2).copied();
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        match (b1, b2) {
+            (Some(b1), Some(b2)) => {
+                out.push(T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+                out.push(T[(b2 & 0x3f) as usize] as char);
+            }
+            (Some(b1), None) => {
+                out.push(T[((b1 & 0x0f) << 2) as usize] as char);
+                out.push('=');
+            }
+            (None, _) => {
+                out.push('=');
+                out.push('=');
+            }
+        }
+        i += 3;
+    }
+    out
+}
+
+/// `data:{media_type};base64,{data}`（OpenAI `image_url`）。
+pub fn image_data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
 }
 
 #[cfg(test)]
@@ -560,5 +654,35 @@ mod tests {
         };
         // 无 snippet 时回退到 description，保证可见性（Rust 复刻里强制要求调用方提供 snippet）
         assert!(t.prompt_line().contains("read file"));
+    }
+
+    #[test]
+    fn image_block_full_text_and_base64() {
+        let m = Message::from_blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text {
+                    text: "see".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: encode_base64(&[0, 1, 2]),
+                },
+            ],
+        );
+        assert!(m.has_images());
+        assert!(m.full_text().contains("see"));
+        assert!(m.full_text().contains("[image image/png]"));
+        assert_eq!(image_media_type(std::path::Path::new("a.PNG")), Some("image/png"));
+        assert_eq!(image_media_type(std::path::Path::new("x.txt")), None);
+        // RFC 4648：`Man` → `TWFu`；空输入空串
+        assert_eq!(encode_base64(b"Man"), "TWFu");
+        assert_eq!(encode_base64(b"Ma"), "TWE=");
+        assert_eq!(encode_base64(b"M"), "TQ==");
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(
+            image_data_url("image/png", "abc"),
+            "data:image/png;base64,abc"
+        );
     }
 }

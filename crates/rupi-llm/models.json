@@ -1,0 +1,88 @@
+{
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "provider": "openai",
+      "name": "GPT-4o mini",
+      "context": 128000
+    },
+    {
+      "id": "gpt-4o",
+      "provider": "openai",
+      "name": "GPT-4o",
+      "context": 128000
+    },
+    {
+      "id": "o3",
+      "provider": "openai",
+      "name": "o3",
+      "context": 200000
+    },
+    {
+      "id": "o4-mini",
+      "provider": "openai",
+      "name": "o4-mini",
+      "context": 200000
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "name": "Claude Sonnet 4.5",
+      "context": 200000
+    },
+    {
+      "id": "claude-opus-4",
+      "provider": "anthropic",
+      "name": "Claude Opus 4",
+      "context": 200000
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "name": "Claude Haiku 4.5",
+      "context": 200000
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "provider": "gemini",
+      "name": "Gemini 2.5 Flash",
+      "context": 1048576
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "provider": "gemini",
+      "name": "Gemini 2.5 Pro",
+      "context": 1048576
+    },
+    {
+      "id": "openai/gpt-4o-mini",
+      "provider": "openrouter",
+      "name": "OpenRouter · GPT-4o mini",
+      "context": 128000
+    },
+    {
+      "id": "anthropic/claude-sonnet-4.5",
+      "provider": "openrouter",
+      "name": "OpenRouter · Claude Sonnet 4.5",
+      "context": 200000
+    },
+    {
+      "id": "gpt-4o",
+      "provider": "azure",
+      "name": "Azure OpenAI · GPT-4o (deployment name)",
+      "context": 128000
+    },
+    {
+      "id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+      "provider": "bedrock",
+      "name": "Bedrock · Claude 3.5 Sonnet v2",
+      "context": 200000
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "provider": "vertex",
+      "name": "Vertex AI · Gemini 2.5 Pro",
+      "context": 1048576
+    }
+  ]
+}
