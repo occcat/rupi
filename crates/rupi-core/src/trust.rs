@@ -1,6 +1,7 @@
 //! 项目信任：对标上游 Pi `project_trust`（0.79）。
 //!
-//! 加载项目本地资源（项目 `MEMORY.md`、`.rupi/skills`、`.rupi/commands`）前先确认：
+//! 加载项目本地资源（项目 `MEMORY.md`、`.rupi/skills`、`.rupi/commands`、
+//! 以及上溯到的 `.pi/skills` / `.agents/skills`）前先确认：
 //! 已记住 → 静默加载；否则问一次（总是信任并记住 / 仅本次 / 跳过）。
 //! 拒绝后本轮只用全局资源；密钥是“是否加载”，不管“能否执行”——执行仍走策略门。
 

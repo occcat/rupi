@@ -14,7 +14,7 @@
 | 默认七工具 Read/Write/Edit/Bash/Glob/Grep/Think | `rupi-tools`（`ToolRegistry::with_builtins`；`read` 分页 offset/limit + 大文件截断标注，`bash` 支持 `timeout_secs` + 输出保尾 2000 行 / 50KB（对标 Pi 默认，`truncate.rs`）；`edit` 唯一匹配校验（多处命中报错而非静默改首个）+ `replace_all` + `edits[]` 多处编辑（兼容 Pi `oldText/newText`）+ 统一 diff 回包；REPL/TUI 用 `with_sandboxed_builtins` 把 read/write/edit 约束在启动 cwd 内——`..`/绝对路径/符号链接逃逸拒绝并改写为绝对路径执行，subagent 克隆继承） |
 | sessions are trees（branch/rewind/summary） | `SessionTree::branch_from` / `rewind_to` / `prompt_history` 压缩窗口 + `AgentLoop::maybe_compress`（`--compress-threshold/--compress-keep` 全局，`RUPI_COMPRESSION_OVERRIDES` 按 `provider/model` 覆盖，对标上游 `compaction.modelOverrides`；溢出报错强制压实 + 同 turn 重发（`MAX_OVERFLOW_RECOVERIES=2` 封顶），对标上游 overflow recovery） |
 | 无内置 MCP（立场非缺失），MCP-Direct 扩展：spawn → initialize → tools/list → registerTool，`sanitizeParams`，30s 超时，`promptSnippet` 必填 | `rupi-mcp`（`McpBridge` stdio JSON-RPC + StreamableHTTP（`url` 配置，POST 单 JSON/SSE 回包，`mcp-session-id` 保持）+ `sanitize_params` + `mcp_tool_to_definition` + server→client 请求应答 roots/ping（stdio 与 HTTP 同语义：POST 回包流增量消费 + 独立 GET 常驻流，反向请求当场 POST 应答，桥 drop 即停流）+ `resources/list→read`（每 server `{server}_read_resource`）+ `prompts/list→get`（每 server `{server}_get_prompt`）+ `McpManager` 配对注册与失败隔离；`mcp-list` 三区段探活，`--url` 直探 HTTP） |
-| Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill`/`read_resource` 工具 + 每轮 `refresh` 热加载（蒸馏即对模型可见，REPL/TUI 同闭环）+ `SkillAccumulator::propose` 落盘校验（名/描述/steps，非 ascii 回合 hash 兜底命名）；内建 `skills/builtin` 走 exe 锚定发现，cwd 无关） |
+| Skills（Agent Skills 开放标准，渐进披露） | `rupi-skills`（`SkillRegistry` 三阶段 + `load_skill`/`read_resource` 工具 + 每轮 `refresh` 热加载（蒸馏即对模型可见，REPL/TUI 同闭环）+ `SkillAccumulator::propose` 落盘校验（名/描述/steps，非 ascii 回合 hash 兜底命名）；发现目录：exe 锚定 `skills/builtin`、`~/.rupi/skills`、项目 `.rupi/skills`，以及 Pi / Agent Skills 约定的 `~/.pi/agent/skills`、`~/.agents/skills`、从 cwd 上溯的 `.pi/skills` / `.agents/skills`（有 `.git` 停在仓库根）） |
 | Hermes 记忆：MEMORY.md/USER.md 冻结快照 + `MemoryProvider` 七方法 + `MemoryManager`（单外部）+ SQLite FTS5 session_search + background_review | `rupi-memory`（冻结快照 + `<MemoryGuidance>` 指导块 + `--no-memory` 总开关 + provider/manager + `SessionStore` 触发器同步 FTS（trigram 中英文子串召回 + bm25 排名，老库自动迁移）+ 全局/项目 two-tier + 密钥拒写 + failures.md + `JsonlProvider` 示例，`--memory-provider jsonl` 即接即用） |
 | Skill 自积累（后台 review 沉淀） | 启发式复盘默认开（`--no-review` 关，`--review-llm` 切模型版）：记忆/纠正失败/多工具草稿建议只打印，`--review-apply` 才落盘（MEMORY.md/failures.md/skills/）+ `rupi skill-distill` 手工蒸馏 |
 | 会话持久化 | 每轮落盘 `sessions.db`（每个节点：`content` 纯文本供检索 + `blocks` 完整消息 JSON，工具调用/结果一并保存），`sessions` / `session-show` / `session-search`，`--resume <id>` 断点续聊并**结构化回填工具上下文**（REPL + TUI 通用，老库自动迁移）；`/tree` 全分支视图 + `/goto <短id>` 跨分支时间旅行（节点 id 即库行 id，跨进程稳定） |
@@ -95,6 +95,11 @@ echo "/quit" | ./target/debug/rupi --mcp-config /tmp/mcp.json chat
   （name 小写-数字-连字符 ≤64，description ≤1024，body 建议 <5000 tokens / <500 行）。
 - 渐进披露：`skills-list`（metadata 索引）→ `skill-load`（全文）→ `read_resource` 按需读
   `references/`/`assets/`；agent 内以 `load_skill` / `read_resource` 工具激活（schema 随工具表发给模型，空注册表时不挂载）。
+- 发现目录（先发现者胜）：`skills/builtin`（exe 锚定）→ `~/.rupi/skills` → 项目
+  `.rupi/skills` → `~/.pi/agent/skills` → `~/.agents/skills` → 从 cwd 上溯的
+  `.pi/skills` / `.agents/skills`（有 `.git` 停在仓库根，否则到文件系统根；与全局
+  `~/.agents/skills` 重合的路径不重复算项目层）。项目级目录与记忆同走信任门。
+- 斜杠直调保持 `/skillname args`；兼容 Pi 的 `/skill:name`（剥掉 `skill:` 前缀）。
 - 自积累：`skill-distill <name> <description> [steps...]` 生成新 `SKILL.md` 草稿到
   `~/.rupi/skills/<name>/`，落盘前校验（name 规范 + description 压单行 1..=1024 + steps 非空 + 重名拒绝）。
   REPL/TUI 每轮发送前热刷新注册表，会话内新蒸馏 skill 下一轮即对模型可见，无需重启。

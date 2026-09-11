@@ -74,7 +74,8 @@
 
 ## Skills（Agent Skills 开放标准 + Hermes 自积累）
 
-- 递归发现（honor `.gitignore/.ignore`），`SKILL.md` frontmatter 校验，三阶段渐进披露，`/skillname args` 即斜杠命令，每轮热刷新。
+- 递归发现（honor `.gitignore/.ignore`），`SKILL.md` frontmatter 校验，三阶段渐进披露，`/skillname args` 即斜杠命令（兼容 `/skill:name`），每轮热刷新。
+- 发现目录对齐 Pi / Agent Skills：全局 `~/.pi/agent/skills` 与 `~/.agents/skills`；项目 `.pi/skills` 与 `.agents/skills` 从 cwd 上溯（有 `.git` 停在仓库根，否则到文件系统根）。另保留 `skills/builtin`、`~/.rupi/skills`、`.rupi/skills`。
 - 自积累：默认启发式复盘只建议不落盘，`--review-apply` 落盘，`--review-llm` 用模型复盘；`skill-distill` 手工蒸馏。
 
 ## 扩展（Pi 进程内 TS → `crates/rupi-ext`）

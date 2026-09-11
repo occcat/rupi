@@ -604,9 +604,8 @@ async fn run_loop(
                         Builtin::Pass => {}
                     }
                     // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词；
-                    // 未命中再回退 skill 名（`/skillname args` 即调 skill）。
-                    let slash =
-                        commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
+                    // 未命中再回退 skill 名（`/skillname args` 即调 skill；`/skill:name` 同义）。
+                    let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
                     let mut send_text = text.clone();
                     if let Some((name, args)) = slash.as_ref() {
                         if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args) {

@@ -236,17 +236,19 @@ fn memory_store(home: &PathBuf, load_project: bool) -> MemoryStore {
 }
 
 /// 项目资源探测（只读）：有项目根且现存本地资源时返回 (root, 清单），否则 None。
-/// 发现语义与加载侧一致：cwd 相对路径。
+/// `.rupi/*` 仍按 cwd 相对路径；`.pi/skills` / `.agents/skills` 与发现侧同款上溯。
 fn project_resources() -> Option<(PathBuf, Vec<String>)> {
     let cwd = std::env::current_dir().ok()?;
+    let shared = rupi_skills::existing_project_skill_dirs(&cwd, &dirs_home());
     let root = match MemoryStore::discover_project(&cwd) {
         Some(r) => r,
-        // 回退：无 .git 的普通目录自带 .rupi 资源也视为项目（否则永不设门）
+        // 回退：无 .git 的普通目录自带 .rupi 或 Pi/Agent Skills 资源也视为项目
         None if PathBuf::from(".rupi/skills").exists()
             || PathBuf::from(".rupi/commands").exists()
             || PathBuf::from(".rupi")
                 .join(rupi_memory::MEMORY_FILE)
-                .exists() =>
+                .exists()
+            || !shared.is_empty() =>
         {
             cwd.clone()
         }
@@ -261,6 +263,9 @@ fn project_resources() -> Option<(PathBuf, Vec<String>)> {
         if PathBuf::from(rel).exists() {
             resources.push(rel.to_owned());
         }
+    }
+    for p in shared {
+        resources.push(p.display().to_string());
     }
     if resources.is_empty() {
         return None;
@@ -303,12 +308,10 @@ fn load_project_resources(home: &PathBuf, cli: &Cli) -> bool {
 }
 
 fn skill_dirs(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
-    let mut dirs = vec![builtin_skills_dir(), home.join("skills")];
-    // 项目 skills 与项目记忆同门：信任被拒则不发现、不加载
-    if load_project {
-        dirs.push(PathBuf::from(".rupi/skills"));
-    }
-    dirs
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // 项目 skills（含 `.pi/skills` / `.agents/skills` 上溯）与项目记忆同门：
+    // 信任被拒则不发现、不加载；全局 `~/.pi` / `~/.agents` 仍可见。
+    rupi_skills::skill_search_dirs(builtin_skills_dir(), home, &dirs_home(), &cwd, load_project)
 }
 
 /// 内建 skills 目录：从 exe 所在位置向上找 `skills/builtin`
@@ -1313,13 +1316,19 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 .filter(|p| !p.is_empty());
             let before = session.summary.clone();
             agent
-                .force_compress_with_prompt(&*provider, &mut session, &mem, &|e| match e {
-                    rupi_core::AgentEvent::CompactionStart => eprintln!("[compacting]…"),
-                    rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
-                        eprintln!("[compacted: summarized {summarized}, kept {kept}]")
-                    }
-                    _ => {}
-                }, prompt)
+                .force_compress_with_prompt(
+                    &*provider,
+                    &mut session,
+                    &mem,
+                    &|e| match e {
+                        rupi_core::AgentEvent::CompactionStart => eprintln!("[compacting]…"),
+                        rupi_core::AgentEvent::CompactionEnd { summarized, kept } => {
+                            eprintln!("[compacted: summarized {summarized}, kept {kept}]")
+                        }
+                        _ => {}
+                    },
+                    prompt,
+                )
                 .await;
             if session.summary != before && session.summary.is_some() {
                 println!("[compacted]");
@@ -1363,7 +1372,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         }
         skills.refresh(&skill_dirs(home, load_project));
         // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词；
-        // 未命中再回退 skill 名（`/skillname args` 即调 skill）。
+        // 未命中再回退 skill 名（`/skillname args` 即调 skill；`/skill:name` 同义）。
         let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
         if let Some((name, args)) = slash.as_ref() {
             if let Some(expanded) =
@@ -1449,8 +1458,8 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
         };
         drop(fut); // future（含 &mut session 借用）在此释放，后续落盘再借
-        // provider/网络错误不再终结 REPL（此前 `res?` 直接退出进程）：回滚本轮已入树的
-        // 节点（user 及可能的半轮工具态），打印原因，回到提示符让用户重试或 /model 切换。
+                   // provider/网络错误不再终结 REPL（此前 `res?` 直接退出进程）：回滚本轮已入树的
+                   // 节点（user 及可能的半轮工具态），打印原因，回到提示符让用户重试或 /model 切换。
         if let Err(e) = res {
             for id in session.current_path.split_off(before_len) {
                 session.nodes.remove(&id);
@@ -1602,10 +1611,11 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                             tracing::debug!("[review] skill {} already exists, skip", d.name);
                         } else {
                             match acc.propose(&d.name, &d.description, &d.steps) {
-                                Ok(dir) => {
-                                    lines.push(format!("[review] skill drafted at {}", dir.display()))
+                                Ok(dir) => lines
+                                    .push(format!("[review] skill drafted at {}", dir.display())),
+                                Err(e) => {
+                                    lines.push(format!("[review] skill draft skipped: {e:#}"))
                                 }
-                                Err(e) => lines.push(format!("[review] skill draft skipped: {e:#}")),
                             }
                         }
                     }
