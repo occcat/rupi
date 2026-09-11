@@ -1,9 +1,12 @@
 //! rupi-tools: Tool trait + Pi 默认七件套 Read / Write / Edit / Bash / Glob / Grep / Think + 注册表。
 
 use async_trait::async_trait;
+use ignore::{WalkBuilder, WalkState};
 use rupi_core::{CancelFlag, ToolDefinition};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod truncate;
 pub use truncate::{
@@ -377,10 +380,7 @@ impl Tool for WriteTool {
                     }
                 }
                 Ok(match tokio::fs::write(path, content).await {
-                    Ok(()) => ToolOutput::ok(format!(
-                        "wrote {path} ({} bytes)",
-                        content.len()
-                    )),
+                    Ok(()) => ToolOutput::ok(format!("wrote {path} ({} bytes)", content.len())),
                     Err(e) => ToolOutput::err(format!("write failed: {e}")),
                 })
             })
@@ -453,7 +453,11 @@ pub fn parse_edit_args(arguments: &serde_json::Value) -> Result<(Vec<EditSpec>, 
 /// 对原文一次性应用全部替换（对标 Pi edit：每条 old 都按**原文**匹配而非逐条累积；
 /// 必须命中且唯一，区间不得重叠）。`replace_all=true` 时单条替换全部命中。
 /// 此前实现是 `replacen(old, new, 1)`：多处命中静默改第一处、空 old 把新文本插到文件头。
-pub fn apply_edits(original: &str, edits: &[EditSpec], replace_all: bool) -> Result<String, String> {
+pub fn apply_edits(
+    original: &str,
+    edits: &[EditSpec],
+    replace_all: bool,
+) -> Result<String, String> {
     if replace_all {
         let e = &edits[0];
         if e.old.is_empty() {
@@ -462,8 +466,7 @@ pub fn apply_edits(original: &str, edits: &[EditSpec], replace_all: bool) -> Res
         let n = original.matches(e.old.as_str()).count();
         if n == 0 {
             return Err(
-                "old_string not found in file. It must match exactly, including whitespace."
-                    .into(),
+                "old_string not found in file. It must match exactly, including whitespace.".into(),
             );
         }
         return Ok(original.replace(e.old.as_str(), &e.new));
@@ -478,7 +481,10 @@ pub fn apply_edits(original: &str, edits: &[EditSpec], replace_all: bool) -> Res
         if e.old.is_empty() {
             return Err(format!("edit[{i}]: old_string must not be empty"));
         }
-        let hits: Vec<usize> = original.match_indices(e.old.as_str()).map(|(p, _)| p).collect();
+        let hits: Vec<usize> = original
+            .match_indices(e.old.as_str())
+            .map(|(p, _)| p)
+            .collect();
         match hits.len() {
             0 => {
                 return Err(format!(
@@ -738,7 +744,8 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    fn parse_args(arguments: &serde_json::Value) -> (&str, u64) {        let command = arguments
+    fn parse_args(arguments: &serde_json::Value) -> (&str, u64) {
+        let command = arguments
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -846,13 +853,16 @@ impl PipeTail {
 
 /// 按 glob 列文件（`**/*.rs`）。`path` 为基准目录（沙箱改写到 root 内），
 /// `pattern` 禁 `..` 与绝对路径：两者配合结果恒在基准目录下。
+/// 遍历走 `ignore::WalkBuilder`（并行、遵守 .gitignore），阻塞 I/O 在 `spawn_blocking`。
 pub struct GlobTool;
 #[async_trait]
 impl Tool for GlobTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "glob".into(),
-            description: "List files matching a glob pattern under path (capped at 200)".into(),
+            description:
+                "List files matching a glob pattern under path (respects .gitignore; capped at 200 results)"
+                    .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -872,40 +882,34 @@ impl Tool for GlobTool {
         if pattern.contains("..") {
             return Ok(ToolOutput::err("glob pattern must not contain '..'"));
         }
-        if std::path::Path::new(pattern).is_absolute() {
+        if Path::new(pattern).is_absolute() {
             return Ok(ToolOutput::err("glob pattern must be relative"));
+        }
+        if let Err(e) = glob::Pattern::new(pattern) {
+            return Ok(ToolOutput::err(format!("bad glob pattern: {e}")));
         }
         let base = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .unwrap_or(".");
-        let full = std::path::Path::new(base).join(pattern);
-        let mut hits: Vec<String> = vec![];
-        match glob::glob(&full.to_string_lossy()) {
-            Ok(paths) => {
-                for p in paths.flatten() {
-                    hits.push(p.to_string_lossy().into_owned());
-                    if hits.len() >= 200 {
-                        break;
-                    }
-                }
-            }
-            Err(e) => return Ok(ToolOutput::err(format!("bad glob pattern: {e}"))),
-        }
-        hits.sort();
-        Ok(ToolOutput::ok(hits.join("\n")))
+            .unwrap_or(".")
+            .to_owned();
+        let pattern = pattern.to_owned();
+        Ok(spawn_blocking_tool(move || glob_blocking(base, pattern)).await)
     }
 }
 
-/// 正则搜文件内容（`path` 文件或目录，目录递归；跳隐藏文件与二进制/超大文件，结果按行 capped）。
+/// 正则搜文件内容（`path` 文件或目录，目录递归；跳隐藏/二进制/超大文件，结果按行 capped）。
+/// 目录遍历走 `ignore::WalkBuilder`（并行、遵守 .gitignore），不再用 2000 文件硬上限；
+/// 读盘与 walk 全部在 `spawn_blocking`，避免卡住 tokio 运行时。
 pub struct GrepTool;
 #[async_trait]
 impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".into(),
-            description: "Search file contents by regex (path file or dir; capped at 50 hits)"
-                .into(),
+            description:
+                "Search file contents by regex (path file or dir; respects .gitignore; capped at 50 hits)"
+                    .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -931,88 +935,226 @@ impl Tool for GrepTool {
         let base = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .unwrap_or(".");
-        let include = arguments.get("include").and_then(|v| v.as_str());
+            .unwrap_or(".")
+            .to_owned();
+        let include = arguments
+            .get("include")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if let Some(g) = &include {
+            if let Err(e) = glob::Pattern::new(g) {
+                return Ok(ToolOutput::err(format!("bad include glob: {e}")));
+            }
+        }
         let max_results = arguments
             .get("max_results")
             .and_then(|v| v.as_u64())
             .unwrap_or(50)
             .clamp(1, 200) as usize;
-        let include_re = match include {
-            Some(g) => match glob::Pattern::new(g) {
-                Ok(p) => Some(p),
-                Err(e) => return Ok(ToolOutput::err(format!("bad include glob: {e}"))),
-            },
-            None => None,
-        };
-        let base_path = std::path::Path::new(base);
-        // 单文件直接读；目录 walk（跳隐藏、跳 >2MB、最多看 2000 文件防爆）
-        let mut files: Vec<std::path::PathBuf> = vec![];
-        if base_path.is_file() {
-            files.push(base_path.to_path_buf());
-        } else if base_path.is_dir() {
-            for e in walkdir::WalkDir::new(base_path)
-                .follow_links(false)
-                .into_iter()
-                .flatten()
-            {
-                let p = e.path();
-                if !p.is_file() {
-                    continue;
-                }
-                if p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with('.'))
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                if p.metadata().map(|m| m.len() > 2 << 20).unwrap_or(true) {
-                    continue;
-                }
-                files.push(p.to_path_buf());
-                if files.len() >= 2000 {
-                    break;
-                }
-            }
-        } else {
-            return Ok(ToolOutput::err(format!("grep path not found: {base}")));
-        }
-        let mut hits: Vec<String> = vec![];
-        let mut truncated = 0usize;
-        'files: for f in &files {
-            if let Some(inc) = &include_re {
-                if !inc.matches_path(f) {
-                    continue;
-                }
-            }
-            // 非 UTF-8（二进制）直接跳过
-            let body = match std::fs::read_to_string(f) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            for (i, line) in body.lines().enumerate() {
-                if re.is_match(line) {
-                    if hits.len() >= max_results {
-                        truncated += 1;
-                        continue;
-                    }
-                    let mut l: String = line.chars().take(500).collect();
-                    if line.chars().count() > 500 {
-                        l.push('…');
-                    }
-                    hits.push(format!("{}:{}:{l}", f.to_string_lossy(), i + 1));
-                }
-            }
-            if truncated > 0 && hits.len() >= max_results {
-                break 'files;
-            }
-        }
-        let mut out = hits.join("\n");
-        if truncated > 0 {
-            out.push_str(&format!("\n...[truncated {truncated} more matches]"));
-        }
-        Ok(ToolOutput::ok(out))
+        Ok(spawn_blocking_tool(move || grep_blocking(re, base, include, max_results)).await)
     }
+}
+
+const GLOB_MAX_HITS: usize = 200;
+const GREP_MAX_FILE_BYTES: u64 = 2 << 20;
+
+async fn spawn_blocking_tool(f: impl FnOnce() -> ToolOutput + Send + 'static) -> ToolOutput {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| ToolOutput::err(format!("search interrupted: {e}")))
+}
+
+/// 标准过滤器：隐藏文件、`.gitignore` / `.ignore`、全局 exclude。`require_git` 保持默认
+/// true，只在 git 仓库内应用 gitignore（测试夹具建空 `.git` 即可隔离父目录规则）。
+fn ignore_walker(root: impl AsRef<Path>) -> WalkBuilder {
+    let mut b = WalkBuilder::new(root);
+    b.standard_filters(true).follow_links(false);
+    b
+}
+
+/// 相对路径匹配：`require_literal_separator` 让 `*` 不跨目录（`*.rs` ≠ `sub/c.rs`），
+/// 同时 `**/*.rs` 仍命中根下 `a.rs`（与 `glob::glob("base/**/*.rs")` 一致）。
+fn glob_rel_matches(pattern: &str, rel: &Path) -> bool {
+    let Ok(p) = glob::Pattern::new(pattern) else {
+        return false;
+    };
+    p.matches_path_with(
+        rel,
+        glob::MatchOptions {
+            require_literal_separator: true,
+            ..glob::MatchOptions::new()
+        },
+    )
+}
+
+/// `include: *.rs` 按文件名命中任意深度（对标 ripgrep `--glob`）；带目录的 pattern 走相对路径。
+fn include_matches(pattern: &str, path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    if glob_rel_matches(pattern, rel) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| glob::Pattern::new(pattern).is_ok_and(|p| p.matches(n)))
+}
+
+fn glob_blocking(base: String, pattern: String) -> ToolOutput {
+    let root = PathBuf::from(base);
+    let hits = Mutex::new(Vec::new());
+    ignore_walker(&root).build_parallel().run(|| {
+        let hits = &hits;
+        let pattern = &pattern;
+        let root = &root;
+        Box::new(move |res| {
+            let Ok(ent) = res else {
+                return WalkState::Continue;
+            };
+            let path = ent.path();
+            if !path.is_file() {
+                return WalkState::Continue;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            if !glob_rel_matches(pattern, rel) {
+                return WalkState::Continue;
+            }
+            let mut g = hits.lock().unwrap();
+            if g.len() >= GLOB_MAX_HITS {
+                return WalkState::Quit;
+            }
+            g.push(path.to_string_lossy().into_owned());
+            WalkState::Continue
+        })
+    });
+    let mut hits = hits.into_inner().unwrap();
+    hits.sort();
+    hits.truncate(GLOB_MAX_HITS);
+    ToolOutput::ok(hits.join("\n"))
+}
+
+fn format_grep_hit(path: &Path, line_idx: usize, line: &str) -> String {
+    let mut l: String = line.chars().take(500).collect();
+    if line.chars().count() > 500 {
+        l.push('…');
+    }
+    format!("{}:{}:{l}", path.to_string_lossy(), line_idx + 1)
+}
+
+fn push_line_hits(
+    re: &regex::Regex,
+    path: &Path,
+    body: &str,
+    hits: &Mutex<Vec<String>>,
+    extra: &AtomicUsize,
+    max_results: usize,
+) {
+    let mut local = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        if re.is_match(line) {
+            local.push(format_grep_hit(path, i, line));
+        }
+    }
+    if local.is_empty() {
+        return;
+    }
+    let mut g = hits.lock().unwrap();
+    for h in local {
+        if g.len() >= max_results {
+            extra.fetch_add(1, Ordering::Relaxed);
+        } else {
+            g.push(h);
+        }
+    }
+}
+
+fn finish_grep_hits(mut hits: Vec<String>, truncated: usize) -> ToolOutput {
+    hits.sort();
+    let mut out = hits.join("\n");
+    if truncated > 0 {
+        out.push_str(&format!("\n...[truncated {truncated} more matches]"));
+    }
+    ToolOutput::ok(out)
+}
+
+fn grep_file(
+    re: &regex::Regex,
+    path: &Path,
+    include: Option<&str>,
+    max_results: usize,
+) -> ToolOutput {
+    if let Some(inc) = include {
+        let root = path.parent().unwrap_or(path);
+        if !include_matches(inc, path, root) {
+            return ToolOutput::ok("");
+        }
+    }
+    // 显式点名的单文件：不套 2MB / gitignore / 隐藏规则，读失败（二进制）当空。
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(_) => return ToolOutput::ok(""),
+    };
+    let hits = Mutex::new(Vec::new());
+    let extra = AtomicUsize::new(0);
+    push_line_hits(re, path, &body, &hits, &extra, max_results);
+    finish_grep_hits(hits.into_inner().unwrap(), extra.load(Ordering::Relaxed))
+}
+
+fn grep_blocking(
+    re: regex::Regex,
+    base: String,
+    include: Option<String>,
+    max_results: usize,
+) -> ToolOutput {
+    let root = PathBuf::from(&base);
+    if root.is_file() {
+        return grep_file(&re, &root, include.as_deref(), max_results);
+    }
+    if !root.is_dir() {
+        return ToolOutput::err(format!("grep path not found: {base}"));
+    }
+    let hits = Mutex::new(Vec::new());
+    let extra = AtomicUsize::new(0);
+    ignore_walker(&root).build_parallel().run(|| {
+        let hits = &hits;
+        let extra = &extra;
+        let re = &re;
+        let include = &include;
+        let root = &root;
+        Box::new(move |res| {
+            let Ok(ent) = res else {
+                return WalkState::Continue;
+            };
+            let path = ent.path();
+            if !path.is_file() {
+                return WalkState::Continue;
+            }
+            if let Some(inc) = include.as_deref() {
+                if !include_matches(inc, path, root) {
+                    return WalkState::Continue;
+                }
+            }
+            if path
+                .metadata()
+                .map(|m| m.len() > GREP_MAX_FILE_BYTES)
+                .unwrap_or(true)
+            {
+                return WalkState::Continue;
+            }
+            if hits.lock().unwrap().len() >= max_results {
+                return WalkState::Quit;
+            }
+            let body = match std::fs::read_to_string(path) {
+                Ok(b) => b,
+                Err(_) => return WalkState::Continue,
+            };
+            push_line_hits(re, path, &body, hits, extra, max_results);
+            if hits.lock().unwrap().len() >= max_results {
+                WalkState::Quit
+            } else {
+                WalkState::Continue
+            }
+        })
+    });
+    finish_grep_hits(hits.into_inner().unwrap(), extra.load(Ordering::Relaxed))
 }
 
 /// 思考通道：模型写下扩展推理，无执行副作用，回固定确认（正文已在 ToolCall 历史里）。
@@ -1447,6 +1589,16 @@ mod tests {
         assert!(out.content.contains("a.rs"));
         assert!(out.content.contains("c.rs"));
         assert!(!out.content.contains("b.txt"));
+        let one_level = r
+            .execute("glob", serde_json::json!({"pattern": "*.rs", "path": base}))
+            .await
+            .unwrap();
+        assert!(one_level.content.contains("a.rs"), "{}", one_level.content);
+        assert!(
+            !one_level.content.contains("c.rs"),
+            "*.rs must not match nested files: {}",
+            one_level.content
+        );
         // `..` 与绝对 pattern 拒绝
         let esc = r
             .execute("glob", serde_json::json!({"pattern": "../x", "path": base}))
@@ -1493,6 +1645,167 @@ mod tests {
             .unwrap();
         assert!(bad.is_error);
         assert!(bad.content.contains("bad regex"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn init_git_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    #[test]
+    fn glob_rel_matches_double_star_and_one_level() {
+        assert!(glob_rel_matches("**/*.rs", Path::new("a.rs")));
+        assert!(glob_rel_matches("**/*.rs", Path::new("sub/c.rs")));
+        assert!(!glob_rel_matches("**/*.rs", Path::new("b.txt")));
+        assert!(glob_rel_matches("*.rs", Path::new("in.rs")));
+        assert!(!glob_rel_matches("*.rs", Path::new("sub/c.rs")));
+        assert!(glob_rel_matches("src/*.rs", Path::new("src/main.rs")));
+        assert!(!glob_rel_matches("src/*.rs", Path::new("src/a/b.rs")));
+        assert!(include_matches(
+            "*.rs",
+            Path::new("/tmp/x/src/a.rs"),
+            Path::new("/tmp/x")
+        ));
+    }
+
+    #[tokio::test]
+    async fn grep_and_glob_honor_gitignore_and_skip_target() {
+        let dir = unique_tmp("rupi-gg-ig");
+        init_git_fixture(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
+        std::fs::write(dir.join("src/hit.rs"), "fn unique_source_marker() {}\n").unwrap();
+        std::fs::write(
+            dir.join("target/debug/hit.rs"),
+            "fn unique_source_marker() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("noise.log"), "unique_source_marker\n").unwrap();
+
+        let r = ToolRegistry::with_builtins();
+        let base = dir.to_string_lossy().to_string();
+        let g = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "unique_source_marker", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!g.is_error, "{}", g.content);
+        assert!(
+            g.content.contains("src/hit.rs") || g.content.contains("hit.rs"),
+            "{}",
+            g.content
+        );
+        assert!(
+            !g.content.contains("target"),
+            "gitignored target/ must not crowd grep: {}",
+            g.content
+        );
+        assert!(!g.content.contains("noise.log"), "{}", g.content);
+
+        let listing = r
+            .execute(
+                "glob",
+                serde_json::json!({"pattern": "**/*.rs", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!listing.is_error, "{}", listing.content);
+        assert!(listing.content.contains("hit.rs"), "{}", listing.content);
+        assert!(
+            !listing.content.contains("target"),
+            "gitignored target/ must not crowd glob: {}",
+            listing.content
+        );
+
+        // 显式点名被 ignore 的文件仍可读（不走目录 walker）
+        let explicit = r
+            .execute(
+                "grep",
+                serde_json::json!({
+                    "pattern": "unique_source_marker",
+                    "path": dir.join("target/debug/hit.rs").to_string_lossy()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            explicit.content.contains("unique_source_marker"),
+            "{}",
+            explicit.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_finds_source_past_old_2000_file_cap() {
+        // 旧实现先收 2000 个文件再搜：lex 靠前的目录能把源码挤掉。
+        let dir = unique_tmp("rupi-grep-cap");
+        std::fs::create_dir_all(dir.join("aaa")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for i in 0..2100 {
+            std::fs::write(
+                dir.join("aaa").join(format!("f{i:04}.txt")),
+                format!("pad-{i}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("src/late.txt"), "needle-beyond-cap\n").unwrap();
+        let r = ToolRegistry::with_builtins();
+        let base = dir.to_string_lossy().to_string();
+        let late = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "needle-beyond-cap", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!late.is_error, "{}", late.content);
+        assert!(late.content.contains("late.txt"), "{}", late.content);
+        let pad = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "pad-2099", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(pad.content.contains("f2099.txt"), "{}", pad.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_include_glob_filters_by_filename() {
+        let dir = unique_tmp("rupi-grep-inc");
+        std::fs::write(dir.join("a.rs"), "needle in rust\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "needle in text\n").unwrap();
+        let r = ToolRegistry::with_builtins();
+        let base = dir.to_string_lossy().to_string();
+        let out = r
+            .execute(
+                "grep",
+                serde_json::json!({"pattern": "needle", "path": base, "include": "*.rs"}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.rs"), "{}", out.content);
+        assert!(!out.content.contains("a.txt"), "{}", out.content);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1593,9 +1906,10 @@ mod tests {
         for i in 0..8 {
             let qq = q.clone();
             handles.push(tokio::spawn(async move {
-                qq.with_queued(std::path::PathBuf::from(format!("key-{i}")), || async move {
-                    i * 10
-                })
+                qq.with_queued(
+                    std::path::PathBuf::from(format!("key-{i}")),
+                    || async move { i * 10 },
+                )
                 .await
             }));
         }
@@ -1616,7 +1930,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("slots.txt");
-        let body: String = (0..20).map(|i| format!("slot-{i}:0")).collect::<Vec<_>>().join("\n");
+        let body: String = (0..20)
+            .map(|i| format!("slot-{i}:0"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&path, &body).unwrap();
         let path_s = path.to_string_lossy().to_string();
         let r = std::sync::Arc::new(ToolRegistry::with_builtins());
@@ -1642,7 +1959,10 @@ mod tests {
         }
         let final_body = std::fs::read_to_string(&path).unwrap();
         for i in 0..20 {
-            assert!(final_body.contains(&format!("slot-{i}:1")), "slot-{i} 更新丢失");
+            assert!(
+                final_body.contains(&format!("slot-{i}:1")),
+                "slot-{i} 更新丢失"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1708,7 +2028,8 @@ mod edit_tests {
 
     #[tokio::test]
     async fn edit_tool_end_to_end_reports_diff_and_refuses_ambiguity() {
-        let dir = std::env::temp_dir().join(format!("rupi-edit-{}-{}", std::process::id(), line!()));
+        let dir =
+            std::env::temp_dir().join(format!("rupi-edit-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.txt");
@@ -1724,7 +2045,10 @@ mod edit_tests {
             .unwrap();
         assert!(amb.is_error, "{}", amb.content);
         assert!(amb.content.contains("matched 2 times"));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world\nhello again\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "hello world\nhello again\n"
+        );
         let ok = r
             .execute(
                 "edit",
@@ -1734,7 +2058,10 @@ mod edit_tests {
             .unwrap();
         assert!(!ok.is_error, "{}", ok.content);
         assert!(ok.content.contains("-hello world") && ok.content.contains("+bye world"));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "bye world\nhello again\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "bye world\nhello again\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

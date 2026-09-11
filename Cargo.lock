@@ -1564,6 +1564,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "glob",
+ "ignore",
  "libc",
  "regex",
  "rupi-core",
@@ -1572,7 +1573,6 @@ dependencies = [
  "similar",
  "tokio",
  "tracing",
- "walkdir",
 ]
 
 [[package]]
