@@ -20,14 +20,14 @@ use ratatui::{
     Terminal,
 };
 use rupi_agent::AgentLoop;
-use rupi_core::{commands, AgentEvent, SessionTree};
+use rupi_core::{commands, AgentEvent, Message, Role, SessionTree};
 use rupi_llm::LlmProvider;
 use rupi_mcp::McpManager;
-use rupi_memory::{FrozenMemory, MemoryManager};
+use rupi_memory::{FrozenMemory, MemoryManager, SessionStore};
 use rupi_skills::SkillRegistry;
-use rupi_tools::ToolRegistry;
+use rupi_tools::{export_session_id, ToolRegistry};
 use std::io::Stdout;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// TUI 运行上下文：与 REPL 版 `run_chat` 同构的装配。
@@ -53,8 +53,11 @@ pub struct TuiContext<'a> {
     pub command_dirs: Vec<std::path::PathBuf>,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
-    /// sessions.db 会话 id：`/model` 切换后重建 provider 时回填亲和头（与 REPL 同语义）。
-    pub session_id: String,
+    /// sessions.db 会话 id（共享 cell：`/resume` 切换后落盘回调与亲和头同读此值，
+    /// 与 REPL `--resume` 同语义，调用方装配）。
+    pub session_id: Arc<Mutex<String>>,
+    /// 会话库（`/sessions` 列表与 `/resume` 重建用）；`None`（单测/内嵌）则提示不可用。
+    pub sess_db: Option<Arc<Mutex<SessionStore>>>,
     /// 回合落盘回调（调用方做会话持久化）。`--review` 无关，默认装配。
     pub on_turn: Option<Arc<dyn Fn(TurnRecord) + Send + Sync>>,
 }
@@ -160,13 +163,93 @@ fn collect_followup(buf: &mut String, key: &KeyEvent) -> bool {
 }
 
 /// 内建斜杠派发结果：Quit 退出主循环；Done 顯示一行系统消息并等下一输入；
-/// Compact 手动压实（async，调用方执行后推行反馈）；Pass 非内建，调用方走自定义展开/发送。
+/// Compact 手动压实（async，调用方执行后推行反馈）；Resume 切会话（调用方重建树，
+/// 回填亲和头后推行反馈）；Pass 非内建，调用方走自定义展开/发送。
 /// 纯逻辑（无终端依赖），可单测。
 enum Builtin {
     Quit,
     Done(String),
     Compact(Option<String>),
+    Resume(String),
     Pass,
+}
+
+/// 最近会话列表块：与 CLI `sessions` 同列（profile/id/时间/消息数），当前会话标 `*`。
+/// 纯函数（可单测）；库不可用由调用方拦截，这里只管渲染。
+pub(crate) fn sessions_block(
+    store: &SessionStore,
+    current: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let rows = store.list_sessions(limit)?;
+    if rows.is_empty() {
+        return Ok("no sessions yet — chat or run to create one".into());
+    }
+    let mut out = String::from("recent sessions (`/resume <id|短前缀>` 切换):");
+    for (id, profile, created, count) in rows {
+        let mark = if id == current { "*" } else { " " };
+        out.push_str(&format!(
+            "\n{mark}[{profile}] {} {created} ({count} msgs)",
+            &id[..8.min(id.len())]
+        ));
+    }
+    Ok(out)
+}
+
+/// `/resume` 参数解析：完整 id 或唯一短前缀（与 `/goto` 短 id 同心智）。
+/// 返回完整 id；未知/歧义/指回当前会话一律返回展示文案（调用方 Done）。
+pub(crate) fn resolve_session_arg(
+    store: &SessionStore,
+    arg: &str,
+    current: &str,
+) -> Result<String, String> {
+    if arg.is_empty() {
+        return Err("[resume] usage: /resume <id|短前缀>（/sessions 查看）".into());
+    }
+    let rows = store
+        .list_sessions(100)
+        .map_err(|e| format!("[resume] list failed: {e:#}"))?;
+    let hits: Vec<&String> = rows
+        .iter()
+        .map(|(id, _, _, _)| id)
+        .filter(|id| *id == arg || id.starts_with(arg))
+        .collect();
+    match hits.as_slice() {
+        [] => Err(format!("[resume] unknown session: {arg} (see `/sessions`)")),
+        [one] if one.as_str() == current => Err("[resume] already on this session".into()),
+        [one] => Ok((*one).clone()),
+        _ => Err(format!(
+            "[resume] ambiguous prefix `{arg}` ({} hits, see `/sessions`)",
+            hits.len()
+        )),
+    }
+}
+
+/// 会话重建：按序回填 user/assistant 文本 + 压缩摘要预热（与 CLI `restore_or_new`
+/// 同语义：工具中间态不落盘，恢复的是 transcript；行 id 沿用库行 id，短 id 稳定）。
+/// 返回 (树, 消息数)；空会话（存在但零消息）返回空树，调用方提示后可直接续聊。
+pub(crate) fn replay_session(
+    store: &SessionStore,
+    id: &str,
+) -> anyhow::Result<(SessionTree, usize)> {
+    let msgs = store.session_messages(id, 500)?;
+    let mut s = SessionTree::new();
+    for (mid, role, content, _) in msgs {
+        let msg = match role.as_str() {
+            "assistant" => Message::text(Role::Assistant, content),
+            _ => Message::text(Role::User, content),
+        };
+        s.push_with_id(mid, msg);
+    }
+    let n = s.history().len();
+    let stored = store.get_summary(id).unwrap_or_default();
+    if !stored.is_empty() {
+        if let Some(first) = s.current_path.first().cloned() {
+            s.summary = Some(stored);
+            s.summary_through = Some(first);
+        }
+    }
+    Ok((s, n))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -180,6 +263,7 @@ fn dispatch_builtin(
     session_id: &str,
     tools: &mut ToolRegistry,
     ext_set: Option<&mut rupi_ext::ExtensionSet>,
+    sess_db: Option<&SessionStore>,
 ) -> Builtin {
     let t = text.trim();
     if t == "/quit" {
@@ -199,6 +283,29 @@ fn dispatch_builtin(
     }
     if t == "/tree" {
         return Builtin::Done(session.tree_view());
+    }
+    if t == "/sessions" {
+        // 最近会话列表（与 CLI `sessions` 同列）；库不可用（单测/内嵌）给提示。
+        return match sess_db {
+            Some(db) => match sessions_block(db, session_id, 20) {
+                Ok(block) => Builtin::Done(block),
+                Err(e) => Builtin::Done(format!("[sessions] list failed: {e:#}")),
+            },
+            None => Builtin::Done("[sessions] no session store attached".into()),
+        };
+    }
+    if t == "/resume" || t.starts_with("/resume ") {
+        // 会话切换只做解析（返回完整 id），重建树/亲和头由调用方执行（与 /compact 同分工）。
+        return match sess_db {
+            None => Builtin::Done("[resume] no session store attached".into()),
+            Some(db) => {
+                let arg = t.strip_prefix("/resume").unwrap().trim();
+                match resolve_session_arg(db, arg, session_id) {
+                    Ok(id) => Builtin::Resume(id),
+                    Err(msg) => Builtin::Done(msg),
+                }
+            }
+        };
     }
     if t == "/goto" {
         // 裸 `/goto` 拦截给用法（与 REPL 同语义）；此前 Pass 会漏进模型白烧一轮。
@@ -312,7 +419,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
+    view.push_system("rupi TUI — Enter 发送，Esc 中止本轮，运行中输入自动排队跟进，/quit 退出，/sessions 看会话，/resume <短id> 切换会话，/tree 看树，/goto <短id> 跳转，/rewind 回退，/compact 手动压实，/plan 计划模式，/thinking 思考强度，/model 切换模型，/skills 看技能，/commands 看自定义命令，PgUp/PgDn 滚动".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -392,20 +499,68 @@ async fn run_loop(
                             }
                         }
                     }
-                    match dispatch_builtin(
-                        &text,
-                        ctx.agent,
-                        ctx.session,
-                        ctx.provider,
-                        ctx.skills,
-                        &ctx.command_dirs,
-                        &ctx.session_id,
-                        &mut *ctx.tools,
-                        ctx.ext_set.as_deref_mut(),
-                    ) {
+                    // 锁守卫只活在派发语句内：守卫跨 await 会触发 await_holding_lock，
+                    // 故先求值出 owned 的 Builtin 再 match（后续臂有 await）。
+                    let builtin = {
+                        let sess_guard = ctx.sess_db.as_ref().map(|db| db.lock().unwrap());
+                        let sid = ctx.session_id.lock().unwrap().clone();
+                        dispatch_builtin(
+                            &text,
+                            ctx.agent,
+                            ctx.session,
+                            ctx.provider,
+                            ctx.skills,
+                            &ctx.command_dirs,
+                            &sid,
+                            &mut *ctx.tools,
+                            ctx.ext_set.as_deref_mut(),
+                            sess_guard.as_deref(),
+                        )
+                    };
+                    match builtin {
                         Builtin::Quit => return Ok(()),
                         Builtin::Done(msg) => {
                             view.push_system(msg);
+                            continue;
+                        }
+                        Builtin::Resume(id) => {
+                            // 会话切换：库重建树 → 换 id（落盘 cell 同写）→ 亲和头回填新 id。
+                            let db = match ctx.sess_db.as_ref() {
+                                Some(db) => db.clone(),
+                                None => {
+                                    view.push_system("[resume] no session store attached".into());
+                                    continue;
+                                }
+                            };
+                            let db = db.lock().unwrap();
+                            match replay_session(&db, &id) {
+                                Ok((tree, n)) => {
+                                    *ctx.session = tree;
+                                    *ctx.session_id.lock().unwrap() = id.clone();
+                                    export_session_id(&id);
+                                    // 亲和头回填新 id（/model 同语义：重建替换；
+                                    // mock 等不可重建只降级提示，切换本身照常生效）。
+                                    let model =
+                                        ctx.provider.model_id().unwrap_or_default().to_string();
+                                    match rupi_llm::provider_for_model(&model) {
+                                        Ok(mut p) => {
+                                            rupi_llm::apply_session_settings(&mut *p, Some(&id));
+                                            *ctx.provider = p.into();
+                                        }
+                                        Err(e) => view.push_system(format!(
+                                            "[resume] provider rebuild skipped ({e:#})"
+                                        )),
+                                    }
+                                    view.push_system(format!(
+                                        "[resumed {} ({} msgs)]",
+                                        &id[..8.min(id.len())],
+                                        n
+                                    ));
+                                }
+                                Err(e) => {
+                                    view.push_system(format!("[resume] switch failed: {e:#}"))
+                                }
+                            }
                             continue;
                         }
                         Builtin::Compact(prompt) => {
@@ -906,6 +1061,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             ),
             Builtin::Quit
         ));
@@ -920,6 +1076,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             ),
             Builtin::Pass
         ));
@@ -933,6 +1090,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         assert!(msg.contains("usage:"), "{msg}");
@@ -952,6 +1110,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             )),
             "[plan mode on]"
         );
@@ -966,6 +1125,7 @@ mod tests {
                 &[],
                 "t-sess",
                 &mut ToolRegistry::default(),
+                None,
                 None,
             )),
             "[plan mode off]"
@@ -987,6 +1147,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             )),
             "[thinking default (provider default)]"
         );
@@ -1000,6 +1161,7 @@ mod tests {
                 &[],
                 "t-sess",
                 &mut ToolRegistry::default(),
+                None,
                 None,
             )),
             "[thinking switched to High]"
@@ -1016,6 +1178,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             )),
             "[thinking High]"
         );
@@ -1028,6 +1191,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         assert!(msg.contains("staying on current"), "{msg}");
@@ -1047,6 +1211,7 @@ mod tests {
                 &[],
                 "t-sess",
                 &mut ToolRegistry::default(),
+                None,
                 None,
             )),
             "[model mock]"
@@ -1068,6 +1233,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         for (k, v) in saved {
@@ -1093,6 +1259,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             )),
             "[rewind] nothing to undo"
         );
@@ -1108,6 +1275,7 @@ mod tests {
                 &[],
                 "t-sess",
                 &mut ToolRegistry::default(),
+                None,
                 None,
             )),
             "[rewound]"
@@ -1127,6 +1295,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             )),
             format!("[rewound {short}]")
         );
@@ -1140,6 +1309,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
@@ -1161,6 +1331,7 @@ mod tests {
                 "t-sess",
                 &mut ToolRegistry::default(),
                 None,
+                None,
             ),
             Builtin::Compact(None)
         ));
@@ -1174,6 +1345,7 @@ mod tests {
                 &[],
                 "t-sess",
                 &mut ToolRegistry::default(),
+                None,
                 None,
             ),
             Builtin::Compact(Some(_))
@@ -1200,6 +1372,7 @@ mod tests {
             "t-sess",
             &mut tools,
             Some(&mut set),
+            None,
         ));
         assert!(msg.contains("no changes"), "{msg}");
         // 新增 manifest：重载注册为工具
@@ -1218,6 +1391,7 @@ mod tests {
             "t-sess",
             &mut tools,
             Some(&mut set),
+            None,
         ));
         assert!(msg.contains("tui-echo"), "{msg}");
         assert!(tools.definitions().iter().any(|d| d.name == "tui-echo"));
@@ -1233,6 +1407,7 @@ mod tests {
             "t-sess",
             &mut ToolRegistry::default(),
             None,
+            None,
         ));
         assert!(msg.contains("no extension dir"), "{msg}");
         let msg = done_text(dispatch_builtin(
@@ -1244,6 +1419,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         assert!(msg.contains("unknown or ambiguous"), "{msg}");
@@ -1264,6 +1440,7 @@ mod tests {
             "t-sess",
             &mut ToolRegistry::default(),
             None,
+            None,
         ));
         assert!(msg.contains("no skills found"), "{msg}");
         // 空命令目录给指引
@@ -1276,6 +1453,7 @@ mod tests {
             &[],
             "t-sess",
             &mut ToolRegistry::default(),
+            None,
             None,
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
@@ -1290,6 +1468,7 @@ mod tests {
             "t-sess",
             &mut ToolRegistry::default(),
             None,
+            None,
         ));
         assert!(!msg.is_empty(), "空树视图不应为空");
         session.push(Message::text(rupi_core::Role::User, "hi"));
@@ -1303,7 +1482,163 @@ mod tests {
             "t-sess",
             &mut ToolRegistry::default(),
             None,
+            None,
         ));
         assert_ne!(msg, msg2, "有节点后视图应变化");
+    }
+
+    fn sess_home(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("rupi-tui-sess-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    fn seed_session(store: &SessionStore, profile: &str) -> String {
+        let id = store.create_session(profile).unwrap();
+        store.add_message(&id, "user", "hello").unwrap();
+        store
+            .add_message_with_id("node-assistant-1", &id, "assistant", "hi there")
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn sessions_block_lists_and_marks_current() {
+        let home = sess_home("list");
+        let store = SessionStore::open(&home).unwrap();
+        assert!(sessions_block(&store, "none", 20)
+            .unwrap()
+            .contains("no sessions yet"));
+        let id = seed_session(&store, "work");
+        let block = sessions_block(&store, &id, 20).unwrap();
+        assert!(block.contains(&id[..8]), "{block}");
+        assert!(block.contains("*[work]"), "{block}");
+        assert!(block.contains("/resume"), "{block}");
+        // 非当前会话无星标
+        let other = sessions_block(&store, "other", 20).unwrap();
+        assert!(!other.contains('*'), "{other}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_session_arg_accepts_full_and_prefix() {
+        let home = sess_home("resolve");
+        let store = SessionStore::open(&home).unwrap();
+        let id = seed_session(&store, "work");
+        assert_eq!(resolve_session_arg(&store, &id, "other").unwrap(), id);
+        assert_eq!(resolve_session_arg(&store, &id[..12], "other").unwrap(), id);
+        // 裸命令给用法，未知 id 指引 /sessions，指回当前拒绝
+        assert!(resolve_session_arg(&store, "", "other")
+            .unwrap_err()
+            .contains("usage"));
+        assert!(resolve_session_arg(&store, "no-such", "other")
+            .unwrap_err()
+            .contains("unknown session"));
+        assert!(resolve_session_arg(&store, &id, &id)
+            .unwrap_err()
+            .contains("already"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn replay_session_restores_transcript_and_summary() {
+        let home = sess_home("replay");
+        let store = SessionStore::open(&home).unwrap();
+        let id = seed_session(&store, "work");
+        store.set_summary(&id, "talked about tea").unwrap();
+        let (tree, n) = replay_session(&store, &id).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(tree.history().len(), 2);
+        assert_eq!(tree.summary.as_deref(), Some("talked about tea"));
+        assert!(tree.summary_through.is_some());
+        // 空会话返回空树（存在但零消息可直接续聊）
+        let empty = store.create_session("empty").unwrap();
+        let (tree, n) = replay_session(&store, &empty).unwrap();
+        assert_eq!(n, 0);
+        assert!(tree.history().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sessions_and_resume_dispatch_without_store_hint() {
+        let (mut agent, mut session, mut provider, skills) = harness();
+        let msg = done_text(dispatch_builtin(
+            "/sessions",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+        ));
+        assert!(msg.contains("no session store"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/resume abc",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+        ));
+        assert!(msg.contains("no session store"), "{msg}");
+    }
+
+    #[test]
+    fn resume_dispatch_resolves_to_resume_variant() {
+        let home = sess_home("dispatch");
+        let store = SessionStore::open(&home).unwrap();
+        let id = seed_session(&store, "work");
+        let (mut agent, mut session, mut provider, skills) = harness();
+        // 完整 id → Resume 变体（调用方重建，不经模型）
+        assert!(matches!(
+            dispatch_builtin(
+                &format!("/resume {id}"),
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "other",
+                &mut ToolRegistry::default(),
+                None,
+                Some(&store),
+            ),
+            Builtin::Resume(got) if got == id
+        ));
+        // 裸 /resume 给用法，未知 id 指引 /sessions
+        let msg = done_text(dispatch_builtin(
+            "/resume",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "other",
+            &mut ToolRegistry::default(),
+            None,
+            Some(&store),
+        ));
+        assert!(msg.contains("usage"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/resume no-such",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "other",
+            &mut ToolRegistry::default(),
+            None,
+            Some(&store),
+        ));
+        assert!(msg.contains("unknown session"), "{msg}");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

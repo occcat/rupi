@@ -1403,6 +1403,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let saved = Arc::new(std::sync::Mutex::new(
         session.summary.clone().unwrap_or_default(),
     ));
+    // 当前会话 id 共享 cell：`/resume` 切换后落盘与后续亲和头同读此值，不再钉死启动 id。
+    let sid_cell = Arc::new(std::sync::Mutex::new(sid.clone()));
+    let sid_for_turn = sid_cell.clone();
+    let sess_db_ctx = sess_db.clone();
     let ctx = rupi_tui::TuiContext {
         provider: &mut provider,
         agent: &mut agent,
@@ -1417,9 +1421,11 @@ async fn run_tui(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         ext_set: Some(&mut ext_set),
         command_dirs: command_dirs_filtered(home, load_project),
         review_lines,
-        session_id: sid.clone(),
+        session_id: sid_cell,
+        sess_db: Some(sess_db_ctx),
         on_turn: Some(Arc::new(move |t: rupi_tui::TurnRecord| {
             let db = sess_db.lock().unwrap();
+            let sid = sid_for_turn.lock().unwrap().clone();
             let persist = |node: &Option<String>, role: &str, content: &str| {
                 let res = match node {
                     Some(id) => db.add_message_with_id(id, &sid, role, content),
