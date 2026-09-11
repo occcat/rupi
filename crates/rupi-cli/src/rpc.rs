@@ -3,7 +3,7 @@
 //! 记录分隔符只认 LF；输入行尾 `\r` 会剥掉。事件沿用 `AgentEvent` 的 serde 形状
 //!（`type` 字段）；命令回包为 `{type:"response", command, success, id?}`。
 
-use rupi_agent::{AgentSession, MessageInbox, QueueMode};
+use rupi_agent::{AgentSession, MessageInbox, QueueMode, QueuedImage, QueuedMessage};
 use rupi_core::{AgentEvent, CancelFlag};
 use rupi_llm::ThinkingLevel;
 use serde::Deserialize;
@@ -19,6 +19,8 @@ pub struct RpcCommand {
     pub typ: String,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub images: Vec<RpcImage>,
     #[serde(default, rename = "streamingBehavior")]
     pub streaming_behavior: Option<String>,
     #[serde(default)]
@@ -29,6 +31,30 @@ pub struct RpcCommand {
     pub custom_instructions: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default, rename = "modelId")]
+    pub model_id: Option<String>,
+    #[serde(default, rename = "sessionPath")]
+    pub session_path: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, rename = "entryId")]
+    pub entry_id: Option<String>,
+}
+
+/// Pi RPC `images[]`：`{type, data, mimeType}`。
+#[derive(Debug, Deserialize)]
+pub struct RpcImage {
+    #[serde(default, rename = "type")]
+    #[allow(dead_code)]
+    pub typ: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default, rename = "mimeType", alias = "mediaType")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug)]
@@ -109,18 +135,12 @@ pub async fn serve(mut session: AgentSession) -> anyhow::Result<AgentSession> {
                 continue;
             }
         };
-        if matches!(cmd.typ.as_str(), "prompt" | "steer" | "follow_up")
-            && !session.is_streaming()
-            && cmd
-                .message
-                .as_deref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        {
-            let message = cmd.message.clone().unwrap_or_default();
-            emit(&response_ok(cmd.id.as_deref(), &cmd.typ, None));
-            run_prompt(&mut session, &message, &mut lines).await?;
-            continue;
+        if matches!(cmd.typ.as_str(), "prompt" | "steer" | "follow_up") && !session.is_streaming() {
+            if let Some(message) = queued_from_cmd(&cmd) {
+                emit(&response_ok(cmd.id.as_deref(), &cmd.typ, None));
+                run_prompt(&mut session, message, &mut lines).await?;
+                continue;
+            }
         }
         dispatch(&mut session, &cmd).await?;
     }
@@ -241,6 +261,69 @@ async fn dispatch(session: &mut AgentSession, cmd: &RpcCommand) -> anyhow::Resul
             session.agent.compaction_enabled = cmd.enabled.unwrap_or(true);
             emit(&response_ok(id, "set_auto_compaction", None));
         }
+        "set_model" => match model_spec(cmd) {
+            Some(spec) => {
+                let data = apply_set_model(session, &spec).await;
+                emit(&response_ok(id, "set_model", Some(data)));
+            }
+            None => emit(&response_err(id, "set_model", "missing provider/modelId")),
+        },
+        "get_available_models" => {
+            emit(&response_ok(
+                id,
+                "get_available_models",
+                Some(AgentSession::available_models()),
+            ));
+        }
+        "switch_session" => {
+            let dest = cmd
+                .session_path
+                .as_deref()
+                .or(cmd.session.as_deref())
+                .unwrap_or("")
+                .trim();
+            if dest.is_empty() {
+                emit(&response_err(
+                    id,
+                    "switch_session",
+                    "missing sessionPath or session",
+                ));
+            } else {
+                match session.switch_session(dest) {
+                    Ok(data) => emit(&response_ok(id, "switch_session", Some(data))),
+                    Err(e) => emit(&response_err(id, "switch_session", format!("{e:#}"))),
+                }
+            }
+        }
+        "fork" => match session.fork_session(cmd.entry_id.as_deref()) {
+            Ok(data) => emit(&response_ok(id, "fork", Some(data))),
+            Err(e) => emit(&response_err(id, "fork", format!("{e:#}"))),
+        },
+        "clone" => match session.clone_session() {
+            Ok(data) => emit(&response_ok(id, "clone", Some(data))),
+            Err(e) => emit(&response_err(id, "clone", format!("{e:#}"))),
+        },
+        "get_tree" => {
+            emit(&response_ok(id, "get_tree", Some(session.get_tree())));
+        }
+        "set_session_name" => {
+            let name = cmd.name.as_deref().unwrap_or("");
+            match session.set_session_name(name) {
+                Ok(()) => emit(&response_ok(
+                    id,
+                    "set_session_name",
+                    Some(json!({"name": session.session_name})),
+                )),
+                Err(e) => emit(&response_err(id, "set_session_name", format!("{e:#}"))),
+            }
+        }
+        "get_commands" => {
+            emit(&response_ok(
+                id,
+                "get_commands",
+                Some(session.get_commands()),
+            ));
+        }
         other => emit(&response_err(
             id,
             other,
@@ -250,9 +333,79 @@ async fn dispatch(session: &mut AgentSession, cmd: &RpcCommand) -> anyhow::Resul
     Ok(())
 }
 
+fn queued_from_cmd(cmd: &RpcCommand) -> Option<QueuedMessage> {
+    let text = cmd.message.clone().unwrap_or_default();
+    let images = parse_rpc_images(&cmd.images);
+    if text.trim().is_empty() && images.is_empty() {
+        None
+    } else {
+        Some(QueuedMessage { text, images })
+    }
+}
+
+fn parse_rpc_images(images: &[RpcImage]) -> Vec<QueuedImage> {
+    images
+        .iter()
+        .filter_map(|img| {
+            let data = img.data.as_deref()?.trim();
+            if data.is_empty() {
+                return None;
+            }
+            Some(QueuedImage {
+                media_type: img
+                    .mime_type
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "image/png".into()),
+                data: data.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn model_spec(cmd: &RpcCommand) -> Option<String> {
+    let provider = cmd
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let model = cmd
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (provider, model) {
+        (Some(p), Some(m)) => Some(format!("{p}/{m}")),
+        (None, Some(m)) => Some(m.to_string()),
+        (Some(p), None) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
+async fn apply_set_model(session: &mut AgentSession, spec: &str) -> Value {
+    let data = session.set_model(spec);
+    let ev = AgentEvent::ModelChange {
+        provider: data
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+    for ext in &session.extensions {
+        let _ = ext.on_event(&ev).await;
+    }
+    emit_event(&ev);
+    data
+}
+
 async fn run_prompt<R: tokio::io::AsyncBufRead + Unpin>(
     session: &mut AgentSession,
-    message: &str,
+    message: QueuedMessage,
     lines: &mut tokio::io::Lines<R>,
 ) -> anyhow::Result<()> {
     let inbox = session.inbox.clone();
@@ -266,7 +419,7 @@ async fn run_prompt<R: tokio::io::AsyncBufRead + Unpin>(
     let on_event = move |e: AgentEvent| {
         let _ = tx.send(e);
     };
-    let fut = session.prompt(message, &on_event);
+    let fut = session.prompt_queued(message, &on_event);
     tokio::pin!(fut);
     let mut done = false;
     while !done {
@@ -319,15 +472,15 @@ fn handle_during_prompt(
                 Some("followUp") | Some("follow_up")
             ));
     if steer {
-        if let Some(m) = &cmd.message {
-            inbox.steer(m);
+        if let Some(q) = queued_from_cmd(cmd) {
+            inbox.steer_msg(q);
         }
         emit(&response_ok(id, cmd.typ.as_str(), None));
         return;
     }
     if follow {
-        if let Some(m) = &cmd.message {
-            inbox.follow_up(m);
+        if let Some(q) = queued_from_cmd(cmd) {
+            inbox.follow_up_msg(q);
         }
         emit(&response_ok(id, cmd.typ.as_str(), None));
         return;
@@ -420,5 +573,36 @@ mod tests {
                 .unwrap();
         assert_eq!(c.streaming_behavior.as_deref(), Some("steer"));
         assert_eq!(c.message.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn prompt_images_and_set_model_fields() {
+        let c = parse_line(
+            r#"{"type":"prompt","message":"look","images":[{"type":"image","data":"AAAA","mimeType":"image/png"}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let q = queued_from_cmd(&c).unwrap();
+        assert_eq!(q.text, "look");
+        assert_eq!(q.images.len(), 1);
+        assert_eq!(q.images[0].media_type, "image/png");
+        assert_eq!(q.images[0].data, "AAAA");
+
+        let m = parse_line(r#"{"type":"set_model","provider":"openai","modelId":"gpt-4o-mini"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(model_spec(&m).as_deref(), Some("openai/gpt-4o-mini"));
+    }
+
+    #[test]
+    fn switch_session_accepts_path_or_id() {
+        let c = parse_line(r#"{"type":"switch_session","sessionPath":"/tmp/a.jsonl"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.session_path.as_deref(), Some("/tmp/a.jsonl"));
+        let c = parse_line(r#"{"type":"fork","entryId":"abc"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.entry_id.as_deref(), Some("abc"));
     }
 }

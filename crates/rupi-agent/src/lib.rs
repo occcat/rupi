@@ -31,7 +31,7 @@ pub use discovery::{default_always, DiscoveryConfig, ScoredHit};
 pub use hooks::{
     DenyToolsHook, HookDecision, RecordedCall, RecordingHook, RedirectCommandHook, ToolHook,
 };
-pub use queue::{MessageInbox, QueueMode};
+pub use queue::{MessageInbox, QueueMode, QueuedImage, QueuedMessage};
 pub use session::{create_agent_session, AgentSession, AgentSessionBuilder, AgentSessionState};
 pub use tokens::{
     context_window_for, rates_for, TokenMeter, DEFAULT_CONTEXT_WINDOW, DEFAULT_KEEP_RECENT_TOKENS,
@@ -273,16 +273,17 @@ impl AgentLoop {
         let Some(inbox) = &self.inbox else {
             return 0;
         };
-        let msgs = inbox.take_steering();
+        let msgs = inbox.take_steering_msgs();
         if msgs.is_empty() {
             return 0;
         }
+        let texts: Vec<String> = msgs.iter().map(|m| m.text.clone()).collect();
         for m in &msgs {
-            session.push(Message::text(Role::User, m));
+            session.push(m.to_user_message());
         }
         on_event(AgentEvent::SteeringInjected {
             count: msgs.len(),
-            messages: msgs.clone(),
+            messages: texts,
         });
         msgs.len()
     }

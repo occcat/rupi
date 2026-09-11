@@ -86,9 +86,27 @@ fn strip_frontmatter(raw: &str) -> &str {
     }
 }
 
-/// 命令目录：用户级 + 项目级（cwd 下 `.rupi/commands`）。
+/// 命令目录：`commands/*.md` 与 `prompts/*.md` 同展开（对标 Pi prompt templates）。
+/// 含 `~/.rupi`、`.rupi`、以及只读的 `~/.pi/agent` / `.pi`。
 pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
-    vec![home.join("commands"), PathBuf::from(".rupi/commands")]
+    command_dirs_filtered(home, true)
+}
+
+/// `load_project` 为 false 时只留全局层（信任被拒）。
+pub fn command_dirs_filtered(home: &Path, load_project: bool) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join("commands"), home.join("prompts")];
+    if let Ok(h) = std::env::var("HOME") {
+        let user = PathBuf::from(h);
+        dirs.push(user.join(".pi/agent/commands"));
+        dirs.push(user.join(".pi/agent/prompts"));
+    }
+    if load_project {
+        dirs.push(PathBuf::from(".rupi/commands"));
+        dirs.push(PathBuf::from(".rupi/prompts"));
+        dirs.push(PathBuf::from(".pi/commands"));
+        dirs.push(PathBuf::from(".pi/prompts"));
+    }
+    dirs
 }
 
 /// `@path` 引用展开：用户消息里的 `@相对路径` 内联文件内容（对标 Pi 的 @ 附件）。
@@ -376,6 +394,27 @@ mod tests {
     fn index_block_empty_dirs_hints_paths() {
         let block = index_block(&[PathBuf::from("/nonexistent-rupi-cmd")]);
         assert!(block.contains("no custom commands"));
+    }
+
+    #[test]
+    fn command_dirs_include_prompts() {
+        let home = PathBuf::from("/tmp/rupi-home-prompts");
+        let dirs = command_dirs(&home);
+        assert!(dirs.iter().any(|d| d.ends_with("prompts")));
+        let global_only = command_dirs_filtered(&home, false);
+        assert!(global_only.iter().all(|d| {
+            let s = d.to_string_lossy();
+            !s.contains(".rupi/prompts") && !s.contains(".pi/prompts")
+                || s.contains(".pi/agent/prompts")
+        }));
+        let base = std::env::temp_dir().join(format!("rupi-prompts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        write(&base, "review.md", "Review $ARGUMENTS\n");
+        assert_eq!(
+            expand(&[base.clone()], "review", "diff").as_deref(),
+            Some("Review diff")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn at_root(tag: &str) -> PathBuf {

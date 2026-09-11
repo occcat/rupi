@@ -4,10 +4,13 @@
 //! 用 [`MessageInbox`] 在工具间隙注入转向或在整轮结束后跟进。
 //! CLI `--mode rpc` 与 TUI 都走这一层，而不是再复制一套循环。
 
-use crate::{AgentLoop, MessageInbox, QueueMode};
+use crate::{AgentLoop, MessageInbox, QueueMode, QueuedMessage};
 use rupi_core::{AgentEvent, CancelFlag, Extension, Message, SessionTree, StopReason};
-use rupi_llm::{LlmProvider, ThinkingLevel};
-use rupi_memory::{FrozenMemory, MemoryManager, MemoryStore};
+use rupi_llm::{load_models, provider_or_mock, LlmProvider, ProviderOptions, ThinkingLevel};
+use rupi_memory::{
+    import_into_store, import_jsonl, persist_tree, remap_tree, resolve_session_ref, restore_tree,
+    FrozenMemory, MemoryManager, MemoryStore, SessionStore,
+};
 use rupi_skills::SkillRegistry;
 use rupi_tools::ToolRegistry;
 use serde::Serialize;
@@ -126,6 +129,10 @@ impl AgentSessionBuilder {
             session_name: self.session_name,
             streaming: Arc::new(AtomicBool::new(false)),
             last_usage: Arc::new(Mutex::new(None)),
+            sess_db: None,
+            persist: false,
+            command_dirs: Vec::new(),
+            provider_opts: ProviderOptions::default(),
         }
     }
 }
@@ -146,6 +153,10 @@ pub struct AgentSession {
     pub session_name: Option<String>,
     streaming: Arc<AtomicBool>,
     last_usage: Arc<Mutex<Option<(u64, u64)>>>,
+    pub sess_db: Option<Arc<Mutex<SessionStore>>>,
+    pub persist: bool,
+    pub command_dirs: Vec<std::path::PathBuf>,
+    pub provider_opts: ProviderOptions,
 }
 
 impl AgentSession {
@@ -185,6 +196,10 @@ impl AgentSession {
             session_name: None,
             streaming: Arc::new(AtomicBool::new(false)),
             last_usage: Arc::new(Mutex::new(None)),
+            sess_db: None,
+            persist: false,
+            command_dirs: Vec::new(),
+            provider_opts: ProviderOptions::default(),
         }
     }
 
@@ -240,6 +255,15 @@ impl AgentSession {
         message: &str,
         on_event: &(dyn Fn(AgentEvent) + Sync),
     ) -> anyhow::Result<StopReason> {
+        self.prompt_queued(QueuedMessage::from_text(message), on_event)
+            .await
+    }
+
+    pub async fn prompt_queued(
+        &mut self,
+        message: QueuedMessage,
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+    ) -> anyhow::Result<StopReason> {
         self.cancel.reset();
         self.streaming.store(true, Ordering::SeqCst);
         let usage = self.last_usage.clone();
@@ -253,15 +277,15 @@ impl AgentSession {
             }
             on_event(e);
         };
-        let mut next = Some(message.to_string());
+        let mut next = Some(message);
         let mut last = StopReason::Done;
-        while let Some(text) = next.take() {
+        while let Some(q) = next.take() {
             last = self
                 .agent
-                .run(
+                .run_with_user(
                     &*self.provider,
                     &mut self.session,
-                    &text,
+                    q.to_user_message(),
                     &self.tools,
                     &self.mem,
                     &self.frozen,
@@ -274,11 +298,11 @@ impl AgentSession {
             if matches!(last, StopReason::Aborted) {
                 break;
             }
-            let more = self.inbox.take_follow_up();
+            let more = self.inbox.take_follow_up_msgs();
             if more.is_empty() {
                 break;
             }
-            next = Some(more.join("\n\n"));
+            next = Some(merge_queued(more));
         }
         self.streaming.store(false, Ordering::SeqCst);
         Ok(last)
@@ -294,6 +318,227 @@ impl AgentSession {
         self.inbox.clear();
         self.cancel.reset();
     }
+
+    pub fn set_model(&mut self, spec: &str) -> serde_json::Value {
+        let parsed = rupi_llm::parse_model_spec(spec);
+        if let Some(t) = parsed.thinking {
+            self.agent.thinking = Some(t);
+        }
+        let mut p = provider_or_mock(spec, &self.provider_opts);
+        rupi_llm::apply_session_settings(&mut *p, Some(&self.session_id));
+        self.provider = p.into();
+        let provider = self.provider.name().to_string();
+        let model = self
+            .provider
+            .model_id()
+            .unwrap_or(&parsed.model)
+            .to_string();
+        rupi_tools::export_model(&provider, &model);
+        if let Some(t) = self.agent.thinking {
+            rupi_tools::export_reasoning_level(t.as_str());
+        }
+        serde_json::json!({
+            "provider": provider,
+            "id": model,
+            "name": spec,
+        })
+    }
+
+    pub fn available_models() -> serde_json::Value {
+        let models: Vec<serde_json::Value> = load_models()
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "provider": m.provider,
+                    "name": m.name,
+                    "contextWindow": m.context,
+                })
+            })
+            .collect();
+        serde_json::json!({ "models": models })
+    }
+
+    pub fn switch_session(&mut self, dest: &str) -> anyhow::Result<serde_json::Value> {
+        let dest = dest.trim();
+        let path = std::path::Path::new(dest);
+        if path.is_file() || dest.ends_with(".jsonl") {
+            let raw = std::fs::read_to_string(path)?;
+            if let Some(db) = &self.sess_db {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".into());
+                let (id, tree) = import_into_store(&db.lock().unwrap(), &raw, &cwd)?;
+                self.adopt_session(id, tree);
+                rupi_tools::export_session_file(dest);
+            } else {
+                let imported = import_jsonl(&raw)?;
+                let id = imported.tree.id.clone();
+                self.adopt_session(id, imported.tree);
+                rupi_tools::export_session_file(dest);
+            }
+        } else {
+            let db = self
+                .sess_db
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no session store"))?;
+            let db = db.lock().unwrap();
+            let id = resolve_session_ref(&db, dest)?;
+            let tree = restore_tree(&db, &id)?;
+            drop(db);
+            self.adopt_session(id, tree);
+        }
+        Ok(serde_json::json!({
+            "cancelled": false,
+            "sessionId": self.session_id,
+        }))
+    }
+
+    fn adopt_session(&mut self, id: String, tree: SessionTree) {
+        self.session = tree;
+        self.session.id = id.clone();
+        self.session_id = id.clone();
+        self.inbox.clear();
+        rupi_tools::export_session_id(&id);
+        let mut p = provider_or_mock(
+            self.provider.model_id().unwrap_or("gpt-4o-mini"),
+            &self.provider_opts,
+        );
+        rupi_llm::apply_session_settings(&mut *p, Some(&id));
+        self.provider = p.into();
+    }
+
+    pub fn fork_session(&mut self, entry_id: Option<&str>) -> anyhow::Result<serde_json::Value> {
+        if let Some(id) = entry_id {
+            if !self.session.rewind_to(id) && !self.session.goto_node(id) {
+                anyhow::bail!("unknown entryId: {id}");
+            }
+        }
+        let text = self
+            .session
+            .history()
+            .last()
+            .map(|m| m.full_text())
+            .unwrap_or_default();
+        self.duplicate_session(true)?;
+        Ok(serde_json::json!({
+            "cancelled": false,
+            "text": text,
+            "sessionId": self.session_id,
+        }))
+    }
+
+    pub fn clone_session(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.duplicate_session(false)?;
+        Ok(serde_json::json!({
+            "cancelled": false,
+            "sessionId": self.session_id,
+        }))
+    }
+
+    fn duplicate_session(&mut self, path_only: bool) -> anyhow::Result<()> {
+        let new_tree = remap_tree(&self.session, path_only);
+        if let (true, Some(db)) = (self.persist, &self.sess_db) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let parent = self.session_id.clone();
+            let db = db.lock().unwrap();
+            let id = db.create_session_ex(
+                if path_only { "fork" } else { "clone" },
+                None,
+                Some(&cwd),
+                Some(&parent),
+            )?;
+            persist_tree(&db, &id, &new_tree)?;
+            drop(db);
+            self.adopt_session(id, new_tree);
+        } else {
+            let id = new_tree.id.clone();
+            self.adopt_session(id, new_tree);
+        }
+        Ok(())
+    }
+
+    pub fn get_tree(&self) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = self
+            .session
+            .tree_entries()
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.id,
+                    "depth": e.depth,
+                    "onPath": e.on_path,
+                    "role": e.role,
+                    "preview": e.preview,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "sessionId": self.session_id,
+            "tree": self.session.tree_view(),
+            "entries": entries,
+        })
+    }
+
+    pub fn set_session_name(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        self.session_name = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
+        if self.persist {
+            if let Some(db) = &self.sess_db {
+                db.lock().unwrap().set_name(&self.session_id, name)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_commands(&self) -> serde_json::Value {
+        let mut commands = Vec::new();
+        for (name, desc) in rupi_core::commands::list(&self.command_dirs) {
+            commands.push(serde_json::json!({
+                "name": name,
+                "description": desc,
+                "source": "prompt",
+            }));
+        }
+        for (name, desc) in self.skills.command_entries() {
+            commands.push(serde_json::json!({
+                "name": format!("skill:{name}"),
+                "description": desc,
+                "source": "skill",
+            }));
+        }
+        for ext in &self.extensions {
+            for c in ext.commands() {
+                commands.push(serde_json::json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "source": "extension",
+                }));
+            }
+        }
+        serde_json::json!({ "commands": commands })
+    }
+}
+
+fn merge_queued(msgs: Vec<QueuedMessage>) -> QueuedMessage {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for m in msgs {
+        if !m.text.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&m.text);
+        }
+        images.extend(m.images);
+    }
+    QueuedMessage { text, images }
 }
 
 #[cfg(test)]

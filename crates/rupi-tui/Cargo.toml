@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }
+rupi-config = { path = "../rupi-config" }
 rupi-llm = { path = "../rupi-llm" }
 rupi-tools = { path = "../rupi-tools" }
 rupi-agent = { path = "../rupi-agent" }
+serde = { workspace = true }
 rupi-memory = { path = "../rupi-memory" }
 rupi-skills = { path = "../rupi-skills" }
 rupi-ext = { path = "../rupi-ext" }

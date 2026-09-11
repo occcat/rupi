@@ -78,6 +78,107 @@ fn rpc_mode_prompt_and_state() {
 }
 
 #[test]
+fn rpc_set_model_session_fork_images_and_commands() {
+    let home = fresh_home();
+    std::fs::create_dir_all(home.join("prompts")).unwrap();
+    std::fs::write(
+        home.join("prompts").join("greet.md"),
+        "---\ndescription: say hi\n---\nHello $ARGUMENTS\n",
+    )
+    .unwrap();
+    let mut child = rupi(&home, &["--mode", "rpc", "--no-approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sin = child.stdin.take().unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"m","type":"set_model","provider":"openai","modelId":"gpt-4o-mini"}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"a","type":"get_available_models"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"c","type":"get_commands"}}"#).unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"p","type":"prompt","message":"hello","images":[{{"type":"image","data":"AAAA","mimeType":"image/png"}}]}}"#
+        )
+        .unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"n","type":"set_session_name","name":"rpc-smoke"}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"t","type":"get_tree"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"f","type":"fork"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"k","type":"clone"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"s","type":"get_state"}}"#).unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "rpc 扩面非零退出:\nstdout={out}\nstderr={err}"
+    );
+    for want in [
+        r#""command":"set_model""#,
+        r#""command":"get_available_models""#,
+        r#""command":"get_commands""#,
+        r#""command":"get_tree""#,
+        r#""command":"fork""#,
+        r#""command":"clone""#,
+        "model_change",
+        "greet",
+    ] {
+        assert!(out.contains(want), "rpc 扩面缺 `{want}`:\n{out}");
+    }
+}
+
+#[test]
+fn chat_settings_slash_persists_and_trust_never_skips() {
+    let home = fresh_home();
+    let o = chat_with(
+        &home,
+        &["--no-review"],
+        "/settings\n/settings steeringMode all\n/quit\n".as_bytes(),
+    );
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "/settings 非零:\n{out}\n{err}");
+    assert!(
+        out.contains("steeringMode") && out.contains("all"),
+        "/settings 未列出或未写入:\n{out}"
+    );
+    let saved = std::fs::read_to_string(home.join("settings.json")).unwrap_or_default();
+    assert!(
+        saved.contains("steeringMode"),
+        "settings.json 未写回:\n{saved}"
+    );
+
+    let home2 = fresh_home();
+    std::fs::write(
+        home2.join("settings.json"),
+        r#"{"defaultProjectTrust":"never"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home2.join(".rupi")).unwrap();
+    std::fs::write(home2.join(".rupi").join("MEMORY.md"), "project secret").unwrap();
+    let o = rupi(&home2, &["--no-approve", "run", "say hi"])
+        .output()
+        .unwrap();
+    let (out2, err2) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "trust=never run 失败:\nstdout={out2}\nstderr={err2}"
+    );
+    assert!(
+        out2.contains("defaultProjectTrust=never") || err2.contains("defaultProjectTrust=never"),
+        "never 未跳过项目资源:\nstdout={out2}\nstderr={err2}"
+    );
+}
+
+#[test]
 fn help_lists_key_subcommands() {
     let home = fresh_home();
     let o = rupi(&home, &["--help"]).output().unwrap();

@@ -14,9 +14,14 @@ pub use bedrock::BedrockProvider;
 pub mod vertex;
 pub use vertex::VertexProvider;
 pub mod catalog;
-pub use catalog::{format_catalog, load_models, ModelEntry};
+pub use catalog::{
+    extra_providers, format_catalog, load_extra_providers, load_models, persist_extra_providers,
+    register_extra_provider, ExtraProvider, ModelEntry,
+};
 pub mod route;
-pub use route::{parse_model_spec, provider_from_spec, ModelSpec, ProviderOptions};
+pub use route::{
+    parse_model_spec, provider_from_spec, provider_or_mock, ModelSpec, ProviderOptions,
+};
 pub mod overflow;
 pub use overflow::is_overflow_error;
 pub mod sse;
@@ -65,6 +70,33 @@ impl std::str::FromStr for ThinkingLevel {
                 anyhow::bail!("invalid thinking level '{other}' (off|low|medium|high|xhigh|max)")
             }
         }
+    }
+}
+
+impl ThinkingLevel {
+    pub const ALL: [Self; 6] = [
+        ThinkingLevel::Off,
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::XHigh,
+        ThinkingLevel::Max,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        let i = Self::ALL.iter().position(|l| *l == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
     }
 }
 

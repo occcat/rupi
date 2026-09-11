@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod complete;
+pub mod keybindings;
 pub mod markdown;
 pub mod theme;
 pub mod tree_nav;

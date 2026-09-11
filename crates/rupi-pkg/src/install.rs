@@ -68,7 +68,7 @@ pub async fn install(spec: &str, opts: &InstallOpts) -> anyhow::Result<InstallRe
     if resources.is_empty() {
         if resources.skipped_ts_extensions > 0 {
             anyhow::bail!(
-                "{} has only TypeScript/JS extensions; rupi loads *.json manifests",
+                "{} has only TypeScript/JS extensions; rupi skips TS — use a JSON-RPC manifest (*.json)",
                 checkout.display()
             );
         }
@@ -392,7 +392,7 @@ pub fn format_report(r: &InstallReport) -> String {
     }
     if r.skipped_ts_extensions > 0 {
         lines.push(format!(
-            "  skipped {} TypeScript/JS extensions (rupi loads *.json manifests only)",
+            "  skipped {} TypeScript/JS extensions (use a JSON-RPC *.json manifest)",
             r.skipped_ts_extensions
         ));
     }
