@@ -430,9 +430,7 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
             Ok(b) => b,
             Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
         };
-        let caption = format!(
-            "[image {media} · {file_len} bytes · attached to this tool result]"
-        );
+        let caption = format!("[image {media} · {file_len} bytes · attached to this tool result]");
         return ToolOutput::ok(caption).with_images(vec![ToolImage {
             media_type: media.to_string(),
             data: rupi_core::encode_base64(&bytes),
@@ -1492,17 +1490,22 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.starts_with("row0\nrow1\nrow2"), "{}", out.content);
+        assert!(
+            out.content.starts_with("row0\nrow1\nrow2"),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains("truncated"), "{}", out.content);
         assert!(!out.content.contains("row79999"));
         // 图片：metadata 后整读，base64 进 images
         let png = dir.join("dot.png");
-        std::fs::write(&png, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 8, 7]).unwrap();
+        std::fs::write(
+            &png,
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 8, 7],
+        )
+        .unwrap();
         let img = r
-            .execute(
-                "read",
-                serde_json::json!({"path": png.to_string_lossy()}),
-            )
+            .execute("read", serde_json::json!({"path": png.to_string_lossy()}))
             .await
             .unwrap();
         assert!(!img.is_error, "{}", img.content);
@@ -1730,7 +1733,11 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
-        assert!(out.content.contains("timed out after 1s"), "{}", out.content);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "{}",
+            out.content
+        );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let post = tokio::process::Command::new("sh")
             .arg("-c")
@@ -1751,7 +1758,7 @@ mod tests {
         let out = r
             .execute(
                 "bash",
-                serde_json::json!({"command": "printf '\\xe4\\xbd\\xa0\\xe5\\xa5\\xbd'"}),
+                serde_json::json!({"command": "printf '%s' '你好'"}),
             )
             .await
             .unwrap();
@@ -1798,10 +1805,8 @@ mod tests {
         assert!(link.is_error);
         // 悬空符号链接：canonicalize 失败时旧逻辑会把链接名当新建文件放行，
         // write 跟随链接写到沙箱外。目标必须按链接指向判定。
-        let outside = std::env::temp_dir().join(format!(
-            "rupi-sbx-dangle-out-{}",
-            std::process::id()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("rupi-sbx-dangle-out-{}", std::process::id()));
         let _ = std::fs::remove_file(&outside);
         symlink(&outside, root.join("sub/dangle")).unwrap();
         let dangle = r

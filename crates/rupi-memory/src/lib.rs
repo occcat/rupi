@@ -6,9 +6,8 @@
 
 use async_trait::async_trait;
 use rupi_core::ToolDefinition;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
@@ -73,15 +72,41 @@ pub fn is_trivial_prompt(text: &str) -> bool {
     let lower = stripped.to_lowercase();
     let word = lower.trim_end_matches([
         ' ', '\t', '\n', '\r', '!', '?', '.', ':', ';', ',', '"', '\'', '~', '\u{2018}',
-        '\u{2019}', '\u{201c}', '\u{201d}', '\u{2014}', '\u{2013}', '\u{2026}', '(', ')', '[',
-        ']', '{', '}', '<', '>', '*', '&', '^', '%', '$', '#', '@', '+', '=', '`', '\u{a0}',
+        '\u{2019}', '\u{201c}', '\u{201d}', '\u{2014}', '\u{2013}', '\u{2026}', '(', ')', '[', ']',
+        '{', '}', '<', '>', '*', '&', '^', '%', '$', '#', '@', '+', '=', '`', '\u{a0}',
     ]);
     matches!(
         word,
-        "yes" | "no" | "ok" | "okay" | "sure" | "thanks" | "thank you" | "y" | "n"
-            | "yep" | "nope" | "yeah" | "nah" | "hi" | "hey" | "hello" | "yo" | "sup"
-            | "continue" | "go ahead" | "do it" | "proceed" | "got it" | "cool" | "nice"
-            | "great" | "done" | "next" | "lgtm" | "k"
+        "yes"
+            | "no"
+            | "ok"
+            | "okay"
+            | "sure"
+            | "thanks"
+            | "thank you"
+            | "y"
+            | "n"
+            | "yep"
+            | "nope"
+            | "yeah"
+            | "nah"
+            | "hi"
+            | "hey"
+            | "hello"
+            | "yo"
+            | "sup"
+            | "continue"
+            | "go ahead"
+            | "do it"
+            | "proceed"
+            | "got it"
+            | "cool"
+            | "nice"
+            | "great"
+            | "done"
+            | "next"
+            | "lgtm"
+            | "k"
     )
 }
 
@@ -92,7 +117,10 @@ pub fn is_trivial_prompt(text: &str) -> bool {
 pub fn core_tier(text: &str) -> (String, usize) {
     fn split_core(line: &str) -> Option<String> {
         let body = line.trim_start();
-        let body = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")).unwrap_or(body);
+        let body = body
+            .strip_prefix("- ")
+            .or_else(|| body.strip_prefix("* "))
+            .unwrap_or(body);
         let prefix = &line[..line.len() - body.len()];
         let tag = body.get(..6)?;
         if !tag.eq_ignore_ascii_case("[core]") {
@@ -272,7 +300,10 @@ impl MemoryStore {
         // 幂等：同纠正反复出现只记一条（行首 `- [日期] ` 前缀剥掉再比，日期不同也算重复）
         let want = entry.trim();
         let dup = content.lines().any(|l| {
-            let body = l.trim().strip_prefix("- [").and_then(|r| r.split_once("] "));
+            let body = l
+                .trim()
+                .strip_prefix("- [")
+                .and_then(|r| r.split_once("] "));
             match body {
                 Some((_, rest)) => rest.trim() == want,
                 None => l.trim() == want,
@@ -964,24 +995,8 @@ fn fts_phrase(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
-/// 本进程已对哪些 sessions.db 跑过 DDL/迁移（按设备号+inode，删库重建会换 inode）。
-static MIGRATED_DBS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
-
-fn migrated_dbs() -> &'static Mutex<HashSet<(u64, u64)>> {
-    MIGRATED_DBS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[cfg(unix)]
-fn db_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path).ok()?;
-    Some((m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn db_identity(_path: &Path) -> Option<(u64, u64)> {
-    None
-}
+/// 当前 schema：v2 trigram FTS，v3 messages.blocks。已到此版本则跳过 DDL/回填。
+const SCHEMA_USER_VERSION: i64 = 3;
 
 fn apply_connection_pragmas(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -1050,8 +1065,8 @@ fn migrate_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     if !has_blocks {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN blocks TEXT;")?;
     }
-    if version < 3 {
-        conn.execute_batch("PRAGMA user_version = 3;")?;
+    if version < SCHEMA_USER_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION};"))?;
     }
     Ok(())
 }
@@ -1061,27 +1076,17 @@ impl SessionStore {
         std::fs::create_dir_all(home)?;
         let db_path = home.join("sessions.db");
         let conn = rusqlite::Connection::open(&db_path)?;
-        // 每条连接都要设：WAL / 同步级别 / 忙等。DDL 按 inode 进程内只跑一次。
+        // 每条连接都要设：WAL / 同步级别 / 忙等。DDL 只在 schema 未到最新时跑
+        //（同进程反复 open 已迁库不再重放 CREATE/FTS 回填；删库重建 user_version=0 会重跑）。
         apply_connection_pragmas(&conn)?;
-        let id = db_identity(&db_path);
-        {
-            let mut done = migrated_dbs().lock().expect("migrated db set poisoned");
-            let skip = id.map(|i| done.contains(&i)).unwrap_or(false);
-            if !skip {
-                migrate_schema(&conn)?;
-                if let Some(i) = id.or_else(|| db_identity(&db_path)) {
-                    done.insert(i);
-                }
-            }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < SCHEMA_USER_VERSION {
+            migrate_schema(&conn)?;
         }
         Ok(Self { conn })
     }
 
-    fn execute_cached(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> anyhow::Result<usize> {
+    fn execute_cached(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<usize> {
         Ok(self.conn.prepare_cached(sql)?.execute(params)?)
     }
 
@@ -1293,7 +1298,9 @@ impl SessionRecord {
             }
         }
         match self.role.as_str() {
-            "assistant" => rupi_core::Message::text(rupi_core::Role::Assistant, self.content.clone()),
+            "assistant" => {
+                rupi_core::Message::text(rupi_core::Role::Assistant, self.content.clone())
+            }
             "tool" => rupi_core::Message::text(
                 rupi_core::Role::User,
                 format!("[tool result]\n{}", self.content),
@@ -1461,7 +1468,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jsonl_provider_prefetch_sync_recall() {        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
+    async fn jsonl_provider_prefetch_sync_recall() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-jsonl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let mut p = JsonlProvider::new(10);
         p.initialize(&home).await.unwrap();
@@ -1548,7 +1556,10 @@ mod tests {
         assert!(hit.contains("sess-old"), "{hit}");
         assert!(hit.contains("elephant"), "{hit}");
         let miss = mgr
-            .handle_tool_call("session_search", serde_json::json!({"query": "zzz-no-match"}))
+            .handle_tool_call(
+                "session_search",
+                serde_json::json!({"query": "zzz-no-match"}),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1634,9 +1645,10 @@ mod tests {
         let store = MemoryStore::new(home.clone());
         store.apply_write("add", "my editor is vim").unwrap();
         store.apply_write("add", "  my editor is vim  ").unwrap();
-        store.apply_write("add", "my editor is vim with plugins").unwrap();
-        let content =
-            std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
+        store
+            .apply_write("add", "my editor is vim with plugins")
+            .unwrap();
+        let content = std::fs::read_to_string(home.join("memories").join("MEMORY.md")).unwrap();
         assert_eq!(content.matches("my editor is vim").count(), 2, "{content}");
         assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
         let _ = std::fs::remove_dir_all(&home);
@@ -1648,18 +1660,22 @@ mod tests {
         let home = std::env::temp_dir().join(format!("rupi-mem-faildup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.record_failure("wrong directory; check pwd first").unwrap();
-        store.record_failure("wrong directory; check pwd first").unwrap();
+        store
+            .record_failure("wrong directory; check pwd first")
+            .unwrap();
+        store
+            .record_failure("wrong directory; check pwd first")
+            .unwrap();
         store.record_failure("forgot to run tests").unwrap();
-        let content =
-            std::fs::read_to_string(home.join("memories").join("failures.md")).unwrap();
+        let content = std::fs::read_to_string(home.join("memories").join("failures.md")).unwrap();
         assert_eq!(content.matches("wrong directory").count(), 1, "{content}");
         assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn memory_writes_mirror_into_sqlite_and_searchable() {        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
+    fn memory_writes_mirror_into_sqlite_and_searchable() {
+        let home = std::env::temp_dir().join(format!("rupi-mem-mirror-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
         store
@@ -1912,7 +1928,7 @@ mod tests {
         assert_eq!(busy, 5000);
         let sid = db.create_session("p").unwrap();
         drop(db);
-        // 同进程再开：跳过 DDL，pragma 仍要落到新连接上
+        // 同进程再开：user_version 已是最新，跳过 DDL；pragma 仍要落到新连接上
         let db2 = SessionStore::open(&home).unwrap();
         assert!(db2.has_session(&sid).unwrap());
         let sync2: i64 = db2
@@ -1922,7 +1938,7 @@ mod tests {
         assert_eq!(sync2, 1);
         drop(db2);
         let _ = std::fs::remove_dir_all(&home);
-        // 同路径删库再建：inode 变了必须重跑 DDL
+        // 同路径删库再建：空库 user_version=0，必须重跑 DDL
         let db3 = SessionStore::open(&home).unwrap();
         assert!(db3.create_session("q").is_ok());
         let _ = std::fs::remove_dir_all(&home);
@@ -1943,7 +1959,10 @@ mod merge_tests {
     #[test]
     fn core_tier_keeps_only_tagged_lines_and_counts_extended() {
         let (out, ext) = core_tier("- [core] prefers tabs\n- [CORE] repo uses cargo\n- some verbose note\n\n- another note\n");
-        assert!(out.starts_with("- prefers tabs\n- repo uses cargo\n"), "{out}");
+        assert!(
+            out.starts_with("- prefers tabs\n- repo uses cargo\n"),
+            "{out}"
+        );
         assert!(out.contains("2 extended entries not shown"), "{out}");
         assert_eq!(ext, 2);
         // 多字节字符不在字节边界上切（get(..6) 安全）
@@ -1953,15 +1972,23 @@ mod merge_tests {
 
     #[test]
     fn memory_text_applies_core_tier_and_grep_finds_extended() {
-        let home = std::env::temp_dir().join(format!("rupi-core-tier-{}-{}", std::process::id(), line!()));
+        let home =
+            std::env::temp_dir().join(format!("rupi-core-tier-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&home);
         let store = MemoryStore::new(home.clone());
-        store.apply_write("add", "[core] always run cargo test").unwrap();
-        store.apply_write("add", "the deploy script lives in ops/deploy.sh").unwrap();
+        store
+            .apply_write("add", "[core] always run cargo test")
+            .unwrap();
+        store
+            .apply_write("add", "the deploy script lives in ops/deploy.sh")
+            .unwrap();
         let text = store.memory_text();
         assert!(text.contains("always run cargo test"), "{text}");
         assert!(!text.contains("[core]"), "{text}");
-        assert!(!text.contains("ops/deploy.sh"), "extended must stay out of prompt: {text}");
+        assert!(
+            !text.contains("ops/deploy.sh"),
+            "extended must stay out of prompt: {text}"
+        );
         let hits = store.grep_memory_files("DEPLOY.sh", 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "memory");
@@ -1971,7 +1998,11 @@ mod merge_tests {
 
     #[test]
     fn session_records_roundtrip_blocks_and_legacy_rows() {
-        let home = std::env::temp_dir().join(format!("rupi-sess-blocks-{}-{}", std::process::id(), line!()));
+        let home = std::env::temp_dir().join(format!(
+            "rupi-sess-blocks-{}-{}",
+            std::process::id(),
+            line!()
+        ));
         let _ = std::fs::remove_dir_all(&home);
         let db = SessionStore::open(&home).unwrap();
         let sid = db.create_session("t").unwrap();
@@ -1992,19 +2023,38 @@ mod merge_tests {
             provider: None,
             created_at: chrono::Utc::now(),
         };
-        db.add_message_with_id("n0", &sid, "user", "legacy user row").unwrap();
-        db.add_message_full("n1", &sid, "assistant", &asst.full_text(), serde_json::to_string(&asst).ok().as_deref()).unwrap();
-        db.add_message_full("n2", &sid, "tool", &tool.full_text(), serde_json::to_string(&tool).ok().as_deref()).unwrap();
+        db.add_message_with_id("n0", &sid, "user", "legacy user row")
+            .unwrap();
+        db.add_message_full(
+            "n1",
+            &sid,
+            "assistant",
+            &asst.full_text(),
+            serde_json::to_string(&asst).ok().as_deref(),
+        )
+        .unwrap();
+        db.add_message_full(
+            "n2",
+            &sid,
+            "tool",
+            &tool.full_text(),
+            serde_json::to_string(&tool).ok().as_deref(),
+        )
+        .unwrap();
         let recs = db.session_records(&sid, 10).unwrap();
         assert_eq!(recs.len(), 3);
         assert!(recs[0].blocks.is_none());
         assert_eq!(recs[0].to_message().role, rupi_core::Role::User);
         let m1 = recs[1].to_message();
         assert_eq!(m1.role, rupi_core::Role::Assistant);
-        assert!(m1.blocks.iter().any(|b| matches!(b, rupi_core::ContentBlock::ToolCall { name, .. } if name == "read")));
+        assert!(m1.blocks.iter().any(
+            |b| matches!(b, rupi_core::ContentBlock::ToolCall { name, .. } if name == "read")
+        ));
         let m2 = recs[2].to_message();
         assert_eq!(m2.role, rupi_core::Role::Tool);
-        assert!(matches!(&m2.blocks[0], rupi_core::ContentBlock::ToolResult { content, .. } if content == "file body"));
+        assert!(
+            matches!(&m2.blocks[0], rupi_core::ContentBlock::ToolResult { content, .. } if content == "file body")
+        );
         // 老接口仍可用且 FTS 能搜到工具结果文本
         assert_eq!(db.session_messages(&sid, 10).unwrap().len(), 3);
         assert!(!db.search("file body", 5).unwrap().is_empty());
@@ -2013,7 +2063,8 @@ mod merge_tests {
 
     #[test]
     fn legacy_db_without_blocks_column_is_migrated() {
-        let home = std::env::temp_dir().join(format!("rupi-migrate3-{}-{}", std::process::id(), line!()));
+        let home =
+            std::env::temp_dir().join(format!("rupi-migrate3-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         {
@@ -2031,8 +2082,12 @@ mod merge_tests {
         let recs = db.session_records("s1", 10).unwrap();
         assert_eq!(recs.len(), 1);
         assert!(recs[0].blocks.is_none());
-        db.add_message_full("m2", "s1", "assistant", "new", Some("{}")).unwrap();
-        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        db.add_message_full("m2", "s1", "assistant", "new", Some("{}"))
+            .unwrap();
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, 3);
         let _ = std::fs::remove_dir_all(&home);
     }

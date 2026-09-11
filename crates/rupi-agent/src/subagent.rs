@@ -420,7 +420,8 @@ mod tests {
 
     /// 子任务思考强度透传：父档位进子循环请求，默认 None 不干预。
     #[tokio::test]
-    async fn thinking_level_reaches_child_loop() {        struct Capture {
+    async fn thinking_level_reaches_child_loop() {
+        struct Capture {
             seen: std::sync::Mutex<Vec<Option<rupi_llm::ThinkingLevel>>>,
         }
         #[async_trait::async_trait]
@@ -520,11 +521,13 @@ mod tests {
     }
 
     /// 委托工具自建循环必须带上父 policy/approver，否则子任务绕过权限门。
+    /// 回执只含摘要+工具名，用写文件副作用判断是否真执行。
     #[tokio::test]
     async fn subagent_inherits_parent_policy_and_approver() {
         use crate::{Approver, RulePolicy};
         use rupi_core::{ContentBlock, Message, Role};
         use rupi_llm::ChatResponse;
+        use std::path::PathBuf;
 
         struct Deny;
         impl Approver for Deny {
@@ -539,15 +542,18 @@ mod tests {
             }
         }
 
-        fn bash_call() -> ChatResponse {
+        fn write_call(path: &std::path::Path) -> ChatResponse {
             ChatResponse {
                 message: Message {
                     id: "m1".into(),
                     role: Role::Assistant,
                     blocks: vec![ContentBlock::ToolCall {
                         id: "c1".into(),
-                        name: "bash".into(),
-                        arguments: serde_json::json!({"command": "echo POLICY_LEAK"}),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": path.to_string_lossy(),
+                            "content": "leaked"
+                        }),
                     }],
                     provider: None,
                     created_at: chrono::Utc::now(),
@@ -563,71 +569,83 @@ mod tests {
                 .content
         }
 
+        fn probe(tag: &str) -> PathBuf {
+            let p = std::env::temp_dir().join(format!(
+                "rupi-sub-policy-{}-{}-{tag}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_file(&p);
+            p
+        }
+
         let (_p, t, m, f, s) = ctx();
-        let denied = run(
-            SubagentTool::new(
-                Arc::new(MockProvider::new(vec![
-                    bash_call(),
-                    MockProvider::text_response("done"),
-                ])),
-                t.clone(),
-                m.clone(),
-                f.clone(),
-                s.clone(),
-                3,
-            )
-            .with_policy(Arc::new(RulePolicy {
-                deny_tools: vec!["bash".into()],
-                ..Default::default()
-            })),
+        let deny_path = probe("deny");
+        let denied = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&deny_path),
+                MockProvider::text_response("done"),
+            ])),
+            t.clone(),
+            m.clone(),
+            f.clone(),
+            s.clone(),
+            3,
         )
+        .with_policy(Arc::new(RulePolicy {
+            deny_tools: vec!["write".into()],
+            ..Default::default()
+        })))
         .await;
-        assert!(denied.contains("denied by policy"), "{denied}");
-        assert!(!denied.contains("POLICY_LEAK"), "{denied}");
+        assert!(denied.contains("write!"), "{denied}");
+        assert!(!deny_path.exists(), "deny policy still executed write");
 
-        let asked = run(
-            SubagentTool::new(
-                Arc::new(MockProvider::new(vec![
-                    bash_call(),
-                    MockProvider::text_response("done"),
-                ])),
-                t.clone(),
-                m.clone(),
-                f.clone(),
-                s.clone(),
-                3,
-            )
-            .with_policy(Arc::new(RulePolicy {
-                ask_tools: vec!["bash".into()],
-                ..Default::default()
-            }))
-            .with_approver(Arc::new(Deny)),
+        let ask_path = probe("ask");
+        let asked = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&ask_path),
+                MockProvider::text_response("done"),
+            ])),
+            t.clone(),
+            m.clone(),
+            f.clone(),
+            s.clone(),
+            3,
         )
+        .with_policy(Arc::new(RulePolicy {
+            ask_tools: vec!["write".into()],
+            ..Default::default()
+        }))
+        .with_approver(Arc::new(Deny)))
         .await;
-        assert!(asked.contains("approval required"), "{asked}");
-        assert!(!asked.contains("POLICY_LEAK"), "{asked}");
+        assert!(asked.contains("write!"), "{asked}");
+        assert!(!ask_path.exists(), "denied approver still executed write");
 
+        let allow_path = probe("allow");
         let parent = AgentLoop::new(3)
             .with_policy(Arc::new(RulePolicy {
-                ask_tools: vec!["bash".into()],
+                ask_tools: vec!["write".into()],
                 ..Default::default()
             }))
             .with_approver(Arc::new(Allow));
-        let allowed = run(
-            SubagentTool::new(
-                Arc::new(MockProvider::new(vec![
-                    bash_call(),
-                    MockProvider::text_response("done"),
-                ])),
-                t,
-                m,
-                f,
-                s,
-                3,
-            )
-            .inherit_from(&parent),
+        let allowed = run(SubagentTool::new(
+            Arc::new(MockProvider::new(vec![
+                write_call(&allow_path),
+                MockProvider::text_response("done"),
+            ])),
+            t,
+            m,
+            f,
+            s,
+            3,
         )
+        .inherit_from(&parent))
         .await;
-        assert!(allowed.contains("POLICY_LEAK"), "{allowed}");
+        assert!(allowed.contains("write"), "{allowed}");
+        assert_eq!(std::fs::read_to_string(&allow_path).unwrap(), "leaked");
+        let _ = std::fs::remove_file(&allow_path);
     }
 }

@@ -224,10 +224,7 @@ impl ExternalTool {
 
     /// wait/timeout 收尾（纯函数，取消/非取消路径共用）。
     fn finish(
-        out: Result<
-            Result<std::process::Output, std::io::Error>,
-            tokio::time::error::Elapsed,
-        >,
+        out: Result<Result<std::process::Output, std::io::Error>, tokio::time::error::Elapsed>,
         timeout_secs: u64,
     ) -> rupi_tools::ToolOutput {
         match out {
@@ -243,16 +240,13 @@ impl ExternalTool {
                     rupi_tools::ToolOutput::ok(text)
                 } else {
                     let err = rupi_tools::decode_utf8(&out.stderr).trim().to_string();
-                    rupi_tools::ToolOutput::err(format!(
-                        "exit {}: {err}",
-                        out.status
-                    ))
+                    rupi_tools::ToolOutput::err(format!("exit {}: {err}", out.status))
                 }
             }
             Ok(Err(e)) => rupi_tools::ToolOutput::err(format!("wait failed: {e}")),
-            Err(_) => rupi_tools::ToolOutput::err(format!(
-                "extension timed out after {timeout_secs}s"
-            )),
+            Err(_) => {
+                rupi_tools::ToolOutput::err(format!("extension timed out after {timeout_secs}s"))
+            }
         }
     }
 }
