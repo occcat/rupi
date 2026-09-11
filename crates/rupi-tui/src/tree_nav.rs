@@ -81,13 +81,16 @@ mod tests {
     #[test]
     fn filter_and_select() {
         let mut s = SessionTree::new();
-        s.push(Message::text(Role::User, "alpha hello"));
-        s.push(Message::text(Role::Assistant, "beta world"));
+        // 预览用 g–z（非 hex）：过滤串不能撞上节点 UUID（0-9a-f），
+        // 也不因大小写折叠把两条预览收成同一命中。
+        s.push(Message::text(Role::User, "alpha-hello"));
+        s.push(Message::text(Role::Assistant, "unique-qzx-marker"));
         let mut nav = TreeNavigator::from_session(&s);
         assert_eq!(nav.visible().len(), 2);
         nav.filtering = true;
-        nav.type_char('b');
-        nav.type_char('e');
+        for c in "qzx".chars() {
+            nav.type_char(c);
+        }
         nav.clamp_selected();
         assert_eq!(nav.visible().len(), 1);
         assert!(nav.selected_id().is_some());
