@@ -1084,6 +1084,7 @@ async fn handle_session_slash(
     sid: &mut String,
     provider: &mut Arc<dyn LlmProvider>,
     persist: bool,
+    opts: &rupi_llm::ProviderOptions,
 ) -> anyhow::Result<bool> {
     let t = input.trim();
     if t == "/export" || t.starts_with("/export ") {
@@ -1131,8 +1132,12 @@ async fn handle_session_slash(
         *session = tree;
         *sid = new_id.clone();
         rupi_tools::export_session_id(&new_id);
-        if let Ok(p) =
-            build_provider(provider.model_id().unwrap_or("gpt-4o-mini"), Some(&new_id)).await
+        if let Ok(p) = build_provider(
+            provider.model_id().unwrap_or("gpt-4o-mini"),
+            Some(&new_id),
+            opts,
+        )
+        .await
         {
             *provider = p.into();
         }
@@ -1739,6 +1744,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             &mut sid,
             &mut provider,
             rt.persist,
+            &provider_options(cli),
         )
         .await?
         {
