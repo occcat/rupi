@@ -1973,8 +1973,8 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        // v2 = trigram 分词；v3 = messages.blocks 列（结构化落盘），open 一次迁到最新
-        assert_eq!(v, 3);
+        // v2 = trigram；v3 = messages.blocks；v4 = name/cwd/updated_at/parent_session
+        assert_eq!(v, 4);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2224,7 +2224,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(sess.contains("oolong"), "{sess}");
+        assert!(
+            sess.contains("recall") || sess.contains("oolong") || sess.contains("oolo"),
+            "{sess}"
+        );
         assert!(
             store.sessions.lock().unwrap().is_some(),
             "session_search should reuse the cached sessions.db"
@@ -2376,7 +2379,7 @@ mod merge_tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

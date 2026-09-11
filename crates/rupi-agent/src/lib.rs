@@ -1723,8 +1723,10 @@ mod tests {
 
     #[tokio::test]
     async fn compress_merges_file_lists_across_rounds() {
-        // 第二轮压实：旧块 ∪ 新足迹，且同名块只出现一次
-        let agent = AgentLoop::new(3).with_compression(usize::MAX, 20);
+        // 第二轮压实：旧块 ∪ 新足迹，且同名块只出现一次。
+        // 两条 tail（"tail one/two padding xxxxxxxxxx"）各 ≈ 7 token；keep=14 正好留尾 2 条，
+        // write new.txt 落在被压前缀。
+        let agent = AgentLoop::new(3).with_compression(usize::MAX, 14);
         let mut session = SessionTree::new();
         for i in 0..3 {
             session.push(Message::text(
@@ -1925,8 +1927,9 @@ mod tests {
             MockProvider::text_response("SUMMARY: talked about tea"),
             MockProvider::text_response("hello"),
         ]);
+        // 每条 padding ≈ 12 token；keep=12 留尾 1 条。used=72 > window-reserve=30 会触发。
         let agent = AgentLoop::new(3)
-            .with_compression(20, 20)
+            .with_compression(20, 12)
             .with_context_window(50);
         let mut session = SessionTree::new();
         for i in 0..6 {
@@ -1957,7 +1960,7 @@ mod tests {
             .unwrap();
         let summary = session.summary.as_ref().expect("summary set");
         assert!(summary.contains("SUMMARY"));
-        // 树全量保留，prompt 窗口缩小
+        // 树全量保留；prompt = 摘要 + 1 条旧尾 + hi/hello
         assert!(session.history().len() >= 8);
         assert!(session.prompt_history(2).len() <= 4);
     }
