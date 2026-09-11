@@ -155,24 +155,18 @@ mod tests {
             false,
             || TrustAnswer::Always
         ));
-        assert!(decide_load_project(
-            TrustPolicy::Never,
-            false,
-            true,
-            || TrustAnswer::Skip
-        ));
+        assert!(decide_load_project(TrustPolicy::Never, false, true, || {
+            TrustAnswer::Skip
+        }));
         assert!(decide_load_project(
             TrustPolicy::Always,
             false,
             false,
             || TrustAnswer::Skip
         ));
-        assert!(!decide_load_project(
-            TrustPolicy::Ask,
-            false,
-            false,
-            || TrustAnswer::Skip
-        ));
+        assert!(!decide_load_project(TrustPolicy::Ask, false, false, || {
+            TrustAnswer::Skip
+        }));
     }
 
     #[test]

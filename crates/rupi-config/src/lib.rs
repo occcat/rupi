@@ -199,9 +199,7 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
     } else {
         settings.enabled_models.join(", ")
     };
-    let editor = settings
-        .external_editor()
-        .unwrap_or("(VISUAL/EDITOR)");
+    let editor = settings.external_editor().unwrap_or("(VISUAL/EDITOR)");
     format!(
         "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}",
         write_path.display(),

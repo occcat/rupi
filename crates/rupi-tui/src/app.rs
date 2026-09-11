@@ -719,7 +719,12 @@ async fn run_loop(
                     .into_iter()
                     .map(|m| format!("{}/{}", m.provider, m.id))
                     .collect();
-                match cycle_and_switch_model(ctx.provider, ctx.agent, &ctx.session_id.lock().unwrap(), &list) {
+                match cycle_and_switch_model(
+                    ctx.provider,
+                    ctx.agent,
+                    &ctx.session_id.lock().unwrap(),
+                    &list,
+                ) {
                     Ok(spec) => {
                         chrome.footer.model = ctx.provider.name().to_string();
                         if let Some(set) = ctx.ext_set.as_ref() {
@@ -1625,7 +1630,10 @@ fn handle_settings_cmd(
                             inbox.set_follow_up_mode(m);
                         }
                     }
-                    Some(format!("[settings] {jk} = {value} (saved {})", path.display()))
+                    Some(format!(
+                        "[settings] {jk} = {value} (saved {})",
+                        path.display()
+                    ))
                 }
                 Err(e) => Some(format!("[settings] {e:#}")),
             }
