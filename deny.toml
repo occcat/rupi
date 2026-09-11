@@ -11,6 +11,9 @@ ignore = []
 [licenses]
 version = 2
 confidence-threshold = 0.8
+# 仓内 crate 未写 license 字段，不当成第三方未授权。
+unused-allowed-license = "allow"
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",

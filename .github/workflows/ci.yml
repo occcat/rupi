@@ -100,8 +100,10 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
 
+      # Advisories 走 cargo-audit：部分 rustsec 条目已用 CVSS 4.0，
+      # 旧 cargo-deny 解析 advisory-db 会直接失败。
       - name: cargo deny check
-        run: cargo deny check
+        run: cargo deny check licenses bans sources
 
       - name: cargo audit
         run: cargo audit

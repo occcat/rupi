@@ -3,6 +3,7 @@ name = "rupi-pkg"
 version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
+license.workspace = true
 description = "rupi install git:/npm: — skills, commands, extensions"
 
 [dependencies]
