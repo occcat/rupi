@@ -265,6 +265,14 @@ pub trait Executor: Send + Sync {
             kind: Some(self.backend_name().into()),
         })
     }
+
+    /// 逐节点容量。单节点后端默认就是 [`stats`]。
+    async fn node_stats(&self) -> Vec<ExecutorStats> {
+        match self.stats().await {
+            Ok(s) => vec![s],
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

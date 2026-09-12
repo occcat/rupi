@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rupi 管理面</title>
+  <link rel="stylesheet" href="/admin/assets/admin.css">
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <p class="eyebrow">Rupi 控制面</p>
+      <h1>管理控制台</h1>
+      <p class="lede">用 <code>RUPI_ADMIN_TOKEN</code> 或 <code>rupi_admin_*</code> Key 登录。不做社交 / 订阅 OAuth。</p>
+      <label>管理凭证
+        <input id="login-token" name="token" type="password" required placeholder="口令或 rupi_admin_…" spellcheck="false" autocomplete="off" data-1p-ignore data-lpignore="true">
+      </label>
+      <button type="submit">进入</button>
+      <p id="login-err" class="err" hidden></p>
+    </form>
+  </div>
+
+  <div id="shell" class="shell" hidden>
+    <aside class="nav">
+      <div class="brand">
+        <span class="mark">R</span>
+        <div>
+          <strong>Rupi</strong>
+          <small>运营控制台</small>
+        </div>
+      </div>
+      <nav>
+        <a href="#/" data-nav="overview">概览</a>
+        <a href="#/tenants" data-nav="tenants">租户 / Key</a>
+        <a href="#/sessions" data-nav="sessions">会话目录</a>
+        <a href="#/executors" data-nav="executors">区域 / 执行池</a>
+        <a href="#/keys" data-nav="keys">管理凭证</a>
+      </nav>
+      <div class="nav-foot">
+        <button type="button" id="logout">退出</button>
+      </div>
+    </aside>
+    <div class="main">
+      <header class="top">
+        <div>
+          <h2 id="page-title">概览</h2>
+          <p id="page-sub" class="muted">云控制面运营，不是聊天 IDE。</p>
+        </div>
+        <div id="pills" class="pills"></div>
+      </header>
+      <main id="view"></main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <header>
+        <h3 id="modal-title"></h3>
+        <button type="button" class="ghost" id="modal-close">关闭</button>
+      </header>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+  <noscript>管理面需要 JavaScript。</noscript>
+  <script src="/admin/assets/admin.js"></script>
+</body>
+</html>

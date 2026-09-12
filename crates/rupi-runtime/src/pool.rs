@@ -274,6 +274,30 @@ impl Executor for PoolScheduler {
             kind: Some("pool".into()),
         })
     }
+
+    async fn node_stats(&self) -> Vec<ExecutorStats> {
+        let mut out = Vec::new();
+        for n in &self.nodes {
+            match n.executor.stats().await {
+                Ok(mut s) => {
+                    s.node_id = n.id.clone();
+                    s.region = Some(n.region.clone());
+                    s.kind = Some(n.kind.as_str().into());
+                    out.push(s);
+                }
+                Err(_) => out.push(ExecutorStats {
+                    backend: n.id.clone(),
+                    node_id: n.id.clone(),
+                    used: 0,
+                    capacity: 0,
+                    warm: 0,
+                    region: Some(n.region.clone()),
+                    kind: Some(n.kind.as_str().into()),
+                }),
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ pub fn router(app: App) -> Router {
         .route("/v1/sessions/{id}/export", get(export_session))
         .route("/v1/sessions/{id}/import", post(import_session))
         .route("/v1/agent", post(agent_run))
+        .merge(crate::admin::router())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(app)
 }
@@ -50,9 +51,9 @@ async fn ready(State(app): State<App>) -> Json<Value> {
     }))
 }
 
-struct CancelOnDrop<S> {
-    inner: S,
-    cancel: CancelFlag,
+pub(crate) struct CancelOnDrop<S> {
+    pub(crate) inner: S,
+    pub(crate) cancel: CancelFlag,
 }
 
 impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
@@ -282,13 +283,7 @@ async fn get_session(
     )))
 }
 
-async fn delete_session(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<StatusCode, Response> {
-    let t = tenant_of(&app, &headers).await?;
-    let row = session_guard(&app, &t, &id).await?;
+pub(crate) async fn teardown_session(app: &App, row: &db::SessionRow) {
     if let (Some(b), Some(h)) = (row.runtime_backend.clone(), row.runtime_handle.clone()) {
         let _ = app
             .executor
@@ -303,8 +298,18 @@ async fn delete_session(
     if let Some(key) = row.snapshot_key.as_deref() {
         let _ = app.object_store.delete(key).await;
     }
-    let _ = db::delete_session(&app.pool, &t.id, &id).await;
-    app.cache.invalidate_session(&t.id, &id).await;
+    let _ = db::delete_session(&app.pool, &row.tenant_id, &row.id).await;
+    app.cache.invalidate_session(&row.tenant_id, &row.id).await;
+}
+
+async fn delete_session(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Response> {
+    let t = tenant_of(&app, &headers).await?;
+    let row = session_guard(&app, &t, &id).await?;
+    teardown_session(&app, &row).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -546,7 +551,7 @@ async fn alloc_workspace(
     }
 }
 
-fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {
+pub(crate) fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {
     let status = if row.workspace_state.as_deref() == Some("snapshotted") {
         "snapshotted"
     } else if row.runtime_handle.is_some() {

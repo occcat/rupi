@@ -159,6 +159,18 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
              CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (content_tsv);",
         )
         .await;
+    let _ = c
+        .batch_execute(
+            "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+             CREATE TABLE IF NOT EXISTS admin_keys (
+               id TEXT PRIMARY KEY,
+               key_hash TEXT NOT NULL UNIQUE,
+               key_prefix TEXT NOT NULL,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               revoked_at TIMESTAMPTZ
+             );",
+        )
+        .await;
     Ok(())
 }
 
@@ -243,7 +255,7 @@ pub async fn load_tenant(pool: &PgPool, id: &str) -> anyhow::Result<Option<Tenan
             &[&id],
         )
         .await?;
-    Ok(row.map(map_tenant))
+    Ok(row.as_ref().map(map_tenant))
 }
 
 pub async fn tenant_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Option<Tenant>> {
@@ -254,14 +266,14 @@ pub async fn tenant_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Opt
                     COALESCE(t.max_runs_per_day, 10000), COALESCE(t.max_tokens_per_day, 100000000),
                     t.default_region, COALESCE(t.max_qps, 8)
              FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
-             WHERE k.key_hash = $1",
+             WHERE k.key_hash = $1 AND k.revoked_at IS NULL",
             &[&hash],
         )
         .await?;
-    Ok(row.map(map_tenant))
+    Ok(row.as_ref().map(map_tenant))
 }
 
-fn map_tenant(r: tokio_postgres::Row) -> Tenant {
+fn map_tenant(r: &tokio_postgres::Row) -> Tenant {
     Tenant {
         id: r.get(0),
         name: r.get(1),
@@ -1165,8 +1177,460 @@ pub async fn today_quota(pool: &PgPool, tenant_id: &str) -> anyhow::Result<(i64,
 pub async fn reset_all(pool: &PgPool) -> anyhow::Result<()> {
     let c = pool.get().await?;
     c.batch_execute(
-        "TRUNCATE interrupts, memories, messages, sessions, api_keys, quota_ledger, workspace_snapshots, tenants CASCADE",
+        "TRUNCATE interrupts, memories, messages, sessions, api_keys, admin_keys, quota_ledger, workspace_snapshots, tenants CASCADE",
     )
     .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantListItem {
+    pub tenant: Tenant,
+    pub created_at: DateTime<Utc>,
+    pub session_count: i64,
+    pub key_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiKeyRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub key_prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminKeyRow {
+    pub id: String,
+    pub key_prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OverviewCounts {
+    pub tenants: i64,
+    pub sessions: i64,
+    pub running: i64,
+    pub snapshotted: i64,
+    pub allocated: i64,
+    pub keys_active: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandleGroup {
+    pub backend: String,
+    pub region: String,
+    pub kind: String,
+    pub allocated: i64,
+    pub hot: i64,
+    pub snapshotted: i64,
+}
+
+fn map_api_key(r: &tokio_postgres::Row) -> ApiKeyRow {
+    ApiKeyRow {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        key_prefix: r.get(2),
+        created_at: r.get(3),
+        revoked_at: r.get(4),
+    }
+}
+
+fn map_admin_key(r: &tokio_postgres::Row) -> AdminKeyRow {
+    AdminKeyRow {
+        id: r.get(0),
+        key_prefix: r.get(1),
+        created_at: r.get(2),
+        revoked_at: r.get(3),
+    }
+}
+
+pub async fn count_tenants(pool: &PgPool, query: &str) -> anyhow::Result<i64> {
+    let c = pool.get().await?;
+    let like = format!("%{query}%");
+    let n: i64 = c
+        .query_one(
+            "SELECT count(*) FROM tenants
+             WHERE $1 = '' OR name ILIKE $2 OR id ILIKE $2",
+            &[&query, &like],
+        )
+        .await?
+        .get(0);
+    Ok(n)
+}
+
+pub async fn list_tenants(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<TenantListItem>> {
+    let c = pool.get().await?;
+    let like = format!("%{query}%");
+    let rows = c
+        .query(
+            "SELECT t.id, t.name, t.settings, t.default_model, t.max_concurrent_runs, t.max_handles,
+                    COALESCE(t.max_runs_per_day, 10000), COALESCE(t.max_tokens_per_day, 100000000),
+                    t.default_region, COALESCE(t.max_qps, 8), t.created_at,
+                    (SELECT count(*) FROM sessions s WHERE s.tenant_id = t.id),
+                    (SELECT count(*) FROM api_keys k WHERE k.tenant_id = t.id AND k.revoked_at IS NULL)
+             FROM tenants t
+             WHERE $1 = '' OR t.name ILIKE $2 OR t.id ILIKE $2
+             ORDER BY t.created_at DESC
+             LIMIT $3 OFFSET $4",
+            &[&query, &like, &limit, &offset],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| TenantListItem {
+            tenant: map_tenant(r),
+            created_at: r.get(10),
+            session_count: r.get(11),
+            key_count: r.get(12),
+        })
+        .collect())
+}
+
+pub async fn patch_tenant_meta(
+    pool: &PgPool,
+    tenant_id: &str,
+    name: Option<&str>,
+    default_model: Option<&str>,
+    default_region: Option<&str>,
+) -> anyhow::Result<u64> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE tenants SET
+                name = COALESCE($2, name),
+                default_model = COALESCE($3, default_model),
+                default_region = COALESCE($4, default_region)
+             WHERE id = $1",
+            &[&tenant_id, &name, &default_model, &default_region],
+        )
+        .await?;
+    Ok(n)
+}
+
+pub async fn patch_tenant_quota(
+    pool: &PgPool,
+    tenant_id: &str,
+    max_concurrent_runs: Option<i32>,
+    max_handles: Option<i32>,
+    max_runs_per_day: Option<i32>,
+    max_tokens_per_day: Option<i64>,
+    max_qps: Option<i32>,
+) -> anyhow::Result<u64> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE tenants SET
+                max_concurrent_runs = COALESCE($2, max_concurrent_runs),
+                max_handles = COALESCE($3, max_handles),
+                max_runs_per_day = COALESCE($4, max_runs_per_day),
+                max_tokens_per_day = COALESCE($5, max_tokens_per_day),
+                max_qps = COALESCE($6, max_qps)
+             WHERE id = $1",
+            &[
+                &tenant_id,
+                &max_concurrent_runs,
+                &max_handles,
+                &max_runs_per_day,
+                &max_tokens_per_day,
+                &max_qps,
+            ],
+        )
+        .await?;
+    Ok(n)
+}
+
+pub async fn quota_history(
+    pool: &PgPool,
+    tenant_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<(String, i64, i64)>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT day::text, COALESCE(tokens, 0)::bigint, COALESCE(runs, 0)::bigint
+             FROM quota_ledger WHERE tenant_id = $1
+             ORDER BY day DESC LIMIT $2",
+            &[&tenant_id, &limit],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
+}
+
+pub async fn list_api_keys(pool: &PgPool, tenant_id: &str) -> anyhow::Result<Vec<ApiKeyRow>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT id, tenant_id, key_prefix, created_at, revoked_at
+             FROM api_keys WHERE tenant_id = $1
+             ORDER BY created_at DESC",
+            &[&tenant_id],
+        )
+        .await?;
+    Ok(rows.iter().map(map_api_key).collect())
+}
+
+pub async fn get_api_key(pool: &PgPool, id: &str) -> anyhow::Result<Option<ApiKeyRow>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT id, tenant_id, key_prefix, created_at, revoked_at
+             FROM api_keys WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+    Ok(row.as_ref().map(map_api_key))
+}
+
+pub async fn create_api_key(
+    pool: &PgPool,
+    tenant_id: &str,
+    raw_key: &str,
+) -> anyhow::Result<ApiKeyRow> {
+    if load_tenant(pool, tenant_id).await?.is_none() {
+        anyhow::bail!("tenant vanished");
+    }
+    let id = Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_key(raw_key);
+    let prefix = crate::auth::key_prefix(raw_key, 12);
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO api_keys(id, tenant_id, key_hash, key_prefix) VALUES ($1, $2, $3, $4)",
+        &[&id, &tenant_id, &hash, &prefix],
+    )
+    .await?;
+    get_api_key(pool, &id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("api key vanished"))
+}
+
+pub async fn revoke_api_key(pool: &PgPool, id: &str) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+            &[&id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn list_admin_keys(pool: &PgPool) -> anyhow::Result<Vec<AdminKeyRow>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys
+             ORDER BY created_at DESC",
+            &[],
+        )
+        .await?;
+    Ok(rows.iter().map(map_admin_key).collect())
+}
+
+pub async fn get_admin_key(pool: &PgPool, id: &str) -> anyhow::Result<Option<AdminKeyRow>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+    Ok(row.as_ref().map(map_admin_key))
+}
+
+pub async fn create_admin_key(pool: &PgPool, raw_key: &str) -> anyhow::Result<AdminKeyRow> {
+    let id = Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_key(raw_key);
+    let prefix = crate::auth::key_prefix(raw_key, 16);
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO admin_keys(id, key_hash, key_prefix) VALUES ($1, $2, $3)",
+        &[&id, &hash, &prefix],
+    )
+    .await?;
+    get_admin_key(pool, &id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("admin key vanished"))
+}
+
+pub async fn revoke_admin_key(pool: &PgPool, id: &str) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE admin_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+            &[&id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn admin_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Option<AdminKeyRow>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys
+             WHERE key_hash = $1 AND revoked_at IS NULL",
+            &[&hash],
+        )
+        .await?;
+    Ok(row.as_ref().map(map_admin_key))
+}
+
+pub async fn get_session_any(pool: &PgPool, id: &str) -> anyhow::Result<Option<SessionRow>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = $1"),
+            &[&id],
+        )
+        .await?;
+    Ok(row.as_ref().map(map_session))
+}
+
+fn session_status_sql() -> &'static str {
+    r#"(
+        $3 = ''
+        OR ($3 = 'running' AND run_id IS NOT NULL AND run_id <> '')
+        OR ($3 = 'snapshotted' AND COALESCE(workspace_state, 'hot') = 'snapshotted')
+        OR ($3 = 'ready' AND runtime_handle IS NOT NULL
+            AND COALESCE(workspace_state, 'hot') <> 'snapshotted')
+        OR ($3 = 'hot' AND COALESCE(workspace_state, 'hot') = 'hot')
+        OR ($3 = 'none' AND runtime_handle IS NULL
+            AND COALESCE(workspace_state, 'hot') <> 'snapshotted'
+            AND (run_id IS NULL OR run_id = ''))
+    )"#
+}
+
+pub async fn list_sessions_admin(
+    pool: &PgPool,
+    tenant_id: &str,
+    region: &str,
+    status: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<SessionRow>> {
+    let c = pool.get().await?;
+    let sql = format!(
+        "SELECT {SESSION_COLS} FROM sessions
+         WHERE ($1 = '' OR tenant_id = $1)
+           AND ($2 = '' OR region = $2)
+           AND {}
+         ORDER BY updated_at DESC
+         LIMIT $4 OFFSET $5",
+        session_status_sql()
+    );
+    let rows = c
+        .query(&sql, &[&tenant_id, &region, &status, &limit, &offset])
+        .await?;
+    Ok(rows.iter().map(map_session).collect())
+}
+
+pub async fn count_sessions_admin(
+    pool: &PgPool,
+    tenant_id: &str,
+    region: &str,
+    status: &str,
+) -> anyhow::Result<i64> {
+    let c = pool.get().await?;
+    let sql = format!(
+        "SELECT count(*) FROM sessions
+         WHERE ($1 = '' OR tenant_id = $1)
+           AND ($2 = '' OR region = $2)
+           AND {}",
+        session_status_sql()
+    );
+    let n: i64 = c
+        .query_one(&sql, &[&tenant_id, &region, &status])
+        .await?
+        .get(0);
+    Ok(n)
+}
+
+pub async fn overview_counts(pool: &PgPool) -> anyhow::Result<OverviewCounts> {
+    let c = pool.get().await?;
+    let row = c
+        .query_one(
+            "SELECT
+                (SELECT count(*) FROM tenants),
+                (SELECT count(*) FROM sessions),
+                (SELECT count(*) FROM sessions WHERE run_id IS NOT NULL AND run_id <> ''),
+                (SELECT count(*) FROM sessions WHERE COALESCE(workspace_state, 'hot') = 'snapshotted'),
+                (SELECT count(*) FROM sessions WHERE runtime_handle IS NOT NULL),
+                (SELECT count(*) FROM api_keys WHERE revoked_at IS NULL)",
+            &[],
+        )
+        .await?;
+    Ok(OverviewCounts {
+        tenants: row.get(0),
+        sessions: row.get(1),
+        running: row.get(2),
+        snapshotted: row.get(3),
+        allocated: row.get(4),
+        keys_active: row.get(5),
+    })
+}
+
+pub async fn handle_groups(pool: &PgPool) -> anyhow::Result<Vec<HandleGroup>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT COALESCE(runtime_backend, '(none)'),
+                    COALESCE(region, '(none)'),
+                    COALESCE(runtime_kind, '(none)'),
+                    count(*) FILTER (WHERE runtime_handle IS NOT NULL),
+                    count(*) FILTER (WHERE COALESCE(workspace_state, 'hot') = 'hot'),
+                    count(*) FILTER (WHERE COALESCE(workspace_state, 'hot') = 'snapshotted')
+             FROM sessions
+             GROUP BY 1, 2, 3
+             ORDER BY 1, 2, 3",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| HandleGroup {
+            backend: r.get(0),
+            region: r.get(1),
+            kind: r.get(2),
+            allocated: r.get(3),
+            hot: r.get(4),
+            snapshotted: r.get(5),
+        })
+        .collect())
+}
+
+pub async fn list_session_regions(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT DISTINCT region FROM sessions
+             WHERE region IS NOT NULL AND region <> ''
+             ORDER BY 1",
+            &[],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+pub async fn list_tenant_regions(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT DISTINCT default_region FROM tenants
+             WHERE default_region IS NOT NULL AND default_region <> ''
+             ORDER BY 1",
+            &[],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
