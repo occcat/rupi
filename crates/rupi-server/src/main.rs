@@ -37,6 +37,12 @@ struct Cli {
     /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
     #[arg(long)]
     bootstrap_tenant: Option<String>,
+    /// 管理面共享口令。也可用库内 `rupi_admin_*` Key。不要做 OAuth。
+    #[arg(long, env = "RUPI_ADMIN_TOKEN", default_value = "")]
+    admin_token: String,
+    /// 启动时建一把管理 Key 并打印明文（只用于本地/CI）。
+    #[arg(long, default_value_t = false)]
+    bootstrap_admin: bool,
 }
 
 #[tokio::main]
@@ -77,13 +83,21 @@ async fn main() -> anyhow::Result<()> {
         region: cli.region,
         snapshot_dir: cli.snapshot_dir,
         idle_secs: cli.idle_secs,
+        admin_token: cli.admin_token,
     };
-    if let Some(name) = cli.bootstrap_tenant {
+    if cli.bootstrap_admin || cli.bootstrap_tenant.is_some() {
         let pool = db::connect(&cfg.database_url).await?;
         db::migrate(&pool).await?;
-        let key = auth::generate_key();
-        let t = db::create_tenant(&pool, &name, &key).await?;
-        println!("tenant_id={} key={key} name={}", t.id, t.name);
+        if cli.bootstrap_admin {
+            let key = auth::generate_admin_key();
+            let row = db::create_admin_key(&pool, &key).await?;
+            println!("admin_key_id={} key={key} prefix={}", row.id, row.key_prefix);
+        }
+        if let Some(name) = cli.bootstrap_tenant {
+            let key = auth::generate_key();
+            let t = db::create_tenant(&pool, &name, &key).await?;
+            println!("tenant_id={} key={key} name={}", t.id, t.name);
+        }
         return Ok(());
     }
     rupi_server::serve(cfg).await

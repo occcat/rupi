@@ -2,6 +2,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod admin;
 pub mod agui;
 pub mod auth;
 pub mod cache;
@@ -56,6 +57,8 @@ pub struct App {
     pub instance_id: String,
     pub region: String,
     pub idle: IdleConfig,
+    /// 环境变量 / `--admin-token` 共享口令。空则只认库里的 admin Key。
+    pub admin_token: Option<String>,
     /// 租户级 mock 剧本必须跨 run 复用，否则每轮都从第一条重新开始。
     mock_providers: Arc<Mutex<HashMap<String, Arc<MockProvider>>>>,
 }
@@ -79,6 +82,7 @@ impl App {
             instance_id: uuid::Uuid::new_v4().to_string(),
             region: "local".into(),
             idle: IdleConfig::default(),
+            admin_token: None,
             mock_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -105,6 +109,16 @@ impl App {
 
     pub fn with_read_pool(mut self, pool: PgPool) -> Self {
         self.read_pool = Some(pool);
+        self
+    }
+
+    pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
+        let t = token.into();
+        self.admin_token = if t.trim().is_empty() {
+            None
+        } else {
+            Some(t)
+        };
         self
     }
 
@@ -144,6 +158,7 @@ pub struct CloudConfig {
     pub region: String,
     pub snapshot_dir: String,
     pub idle_secs: u64,
+    pub admin_token: String,
 }
 
 pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
@@ -169,7 +184,8 @@ pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
         enabled: true,
         idle_after: Duration::from_secs(cfg.idle_secs.max(1)),
         tick: Duration::from_secs(15),
-    });
+    })
+    .with_admin_token(cfg.admin_token.clone());
     if let Some(r) = read_pool {
         app = app.with_read_pool(r);
     }
