@@ -17,11 +17,17 @@ struct Cli {
     redis_url: String,
     #[arg(long, env = "RUPI_EXECUTOR_URL", default_value = "")]
     executor_url: String,
-    /// 逗号分隔的多个 execd。优先于单个 URL。
+    /// 逗号分隔的多个 execd。可写 `region=url`。优先于单个 URL。
     #[arg(long, env = "RUPI_EXECUTOR_URLS", default_value = "")]
     executor_urls: String,
+    /// 第二种后端：sandbox 集群。逗号分隔，可写 `region=url`。
+    #[arg(long, env = "RUPI_SANDBOX_URLS", default_value = "")]
+    sandbox_urls: String,
     #[arg(long, env = "RUPI_EXEC_TOKEN", default_value = "")]
     executor_token: String,
+    /// 本控制面所在区域（无状态副本可跨区；执行按会话 region 调度）。
+    #[arg(long, env = "RUPI_REGION", default_value = "local")]
+    region: String,
     #[arg(long, env = "RUPI_INSTANCE_ID")]
     instance_id: Option<String>,
     #[arg(long, env = "RUPI_SNAPSHOT_DIR", default_value = "/tmp/rupi-snapshots")]
@@ -49,17 +55,26 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    let sandbox_urls: Vec<String> = cli
+        .sandbox_urls
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
     let cfg = CloudConfig {
         database_url: cli.database_url,
         database_read_url: cli.database_read_url,
         redis_url: cli.redis_url,
         executor_url: cli.executor_url,
         executor_urls: urls,
+        sandbox_urls,
         executor_token: cli.executor_token,
         bind: cli.listen,
         instance_id: cli
             .instance_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        region: cli.region,
         snapshot_dir: cli.snapshot_dir,
         idle_secs: cli.idle_secs,
     };

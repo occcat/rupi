@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "rupi-execd"
 path = "src/bin/rupi-execd.rs"
 
+[[bin]]
+name = "rupi-sandboxd"
+path = "src/bin/rupi-sandboxd.rs"
+
 [dependencies]
 rupi-core = { path = "../rupi-core" }
 rupi-llm = { path = "../rupi-llm" }

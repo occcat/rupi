@@ -301,6 +301,8 @@ async fn idle_snapshot_releases_and_restores() {
     let handle = rupi_runtime::WorkspaceHandle {
         id: row.runtime_handle.clone().unwrap(),
         backend: row.runtime_backend.clone().unwrap(),
+        region: row.region.clone(),
+        kind: row.runtime_kind.clone(),
     };
     h.app_a
         .executor

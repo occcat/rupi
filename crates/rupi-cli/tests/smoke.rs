@@ -1254,3 +1254,20 @@ fn stdin_print_atfile_session_fork_and_slash() {
     assert!(ids.len() >= 2, "应打印两个 /session:\n{out}");
     assert_ne!(ids[0], ids[1], "/new 后 /session 应是新 id:\n{out}");
 }
+
+#[test]
+fn cloud_subcommand_is_http_client() {
+    let home = fresh_home();
+    let o = rupi(&home, &["cloud", "--help"]).output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "cloud --help 失败:\n{out}\n{err}");
+    let help = format!("{out}{err}");
+    assert!(
+        help.contains("AG-UI") || help.contains("瘦客户端") || help.contains("控制面"),
+        "{help}"
+    );
+    assert!(
+        !help.to_lowercase().contains("ratatui"),
+        "cloud 不应绑 TUI:\n{help}"
+    );
+}

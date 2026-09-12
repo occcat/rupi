@@ -410,6 +410,7 @@ pub fn cloud_state(
     auto_compaction: bool,
     pending: &[String],
     backend: Option<&str>,
+    region: Option<&str>,
 ) -> Value {
     json!({
         "sessionId": session_id,
@@ -418,7 +419,12 @@ pub fn cloud_state(
         "thinkingLevel": thinking,
         "autoCompaction": auto_compaction,
         "pendingInterruptIds": pending,
-        "runtime": { "backend": backend.unwrap_or("remote-http"), "status": "ready" }
+        "region": region,
+        "runtime": {
+            "backend": backend.unwrap_or("remote-http"),
+            "status": "ready",
+            "region": region
+        }
     })
 }
 
