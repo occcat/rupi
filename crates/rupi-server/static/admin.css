@@ -49,6 +49,8 @@ input, select, textarea {
 textarea { min-height: 7rem; resize: vertical; }
 label { display: grid; gap: 0.3rem; font-size: 0.82rem; color: var(--muted); }
 
+[hidden] { display: none !important; }
+
 .login {
   min-height: 100vh;
   display: grid;
