@@ -23,6 +23,25 @@ pub trait Approver: Send + Sync {
     fn approve(&self, tool: &str, args: &serde_json::Value, reason: &str) -> bool;
 }
 
+/// Ask 的三种宿主动作。`Interrupt` 供云控制面把提案落盘并以 AG-UI 收尾；
+/// 本机 TUI/CLI 继续走 [`Approver`]（Allow/Deny），不使用此枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAction {
+    Allow,
+    Deny,
+    /// 暂停本轮：不执行该工具、不发 `ToolEnd`。宿主读 [`PendingInterrupt`]。
+    Interrupt,
+}
+
+/// 云路径挂起的工具提案（不进 [`crate::AgentEvent`] serde）。
+#[derive(Debug, Clone)]
+pub struct PendingInterrupt {
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub reason: String,
+}
+
 /// 默认：全放行（与此前行为一致）。
 pub struct AllowAll;
 impl Policy for AllowAll {

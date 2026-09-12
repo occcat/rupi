@@ -62,6 +62,53 @@ jobs:
       - name: test
         run: cargo test --workspace --locked --exclude rupi-benches
 
+  cloud:
+    name: cloud first cut
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rupi
+          POSTGRES_PASSWORD: rupi
+          POSTGRES_DB: rupi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rupi -d rupi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://rupi:rupi@127.0.0.1:5432/rupi
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cloud crates
+        run: cargo test --locked -p rupi-runtime -p rupi-server -p rupi-agent -- --nocapture
+
+      - name: local rpc regression
+        run: cargo test --locked -p rupi-cli --test smoke rpc_mode_prompt_and_state -- --exact
+
   bench:
     name: benches (build)
     runs-on: ubuntu-latest

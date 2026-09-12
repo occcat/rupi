@@ -1,0 +1,726 @@
+//! PostgreSQL 权威存储。所有查询带 `tenant_id`。
+
+use chrono::{DateTime, Utc};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use rupi_core::{Message, Role, SessionNode, SessionTree};
+use serde_json::Value;
+use tokio_postgres::NoTls;
+use uuid::Uuid;
+
+pub type PgPool = Pool;
+
+pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+    let cfg: tokio_postgres::Config = database_url.parse()?;
+    let mgr = Manager::from_config(
+        cfg,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+    Ok(Pool::builder(mgr).max_size(16).build()?)
+}
+
+pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.batch_execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS tenants (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          settings JSONB NOT NULL DEFAULT '{}',
+          default_model TEXT,
+          max_concurrent_runs INT NOT NULL DEFAULT 2,
+          max_handles INT NOT NULL DEFAULT 8
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          key_hash TEXT NOT NULL UNIQUE,
+          key_prefix TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          name TEXT,
+          model TEXT,
+          thinking_level TEXT,
+          auto_compaction BOOLEAN NOT NULL DEFAULT true,
+          runtime_backend TEXT,
+          runtime_handle TEXT,
+          parent_session TEXT,
+          summary TEXT,
+          summary_through TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          run_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS sessions_tenant ON sessions(tenant_id, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          parent TEXT,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          blocks JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS messages_session ON messages(tenant_id, session_id);
+        CREATE TABLE IF NOT EXISTS memories (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          session_id TEXT,
+          scope TEXT NOT NULL,
+          layer TEXT NOT NULL DEFAULT 'extended',
+          content TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS memories_tenant ON memories(tenant_id);
+        CREATE TABLE IF NOT EXISTS interrupts (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          tool_call_id TEXT NOT NULL,
+          tool TEXT NOT NULL,
+          args JSONB NOT NULL,
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS quota_ledger (
+          tenant_id TEXT NOT NULL,
+          day DATE NOT NULL,
+          tokens BIGINT NOT NULL DEFAULT 0,
+          runs INT NOT NULL DEFAULT 0,
+          PRIMARY KEY (tenant_id, day)
+        );
+        "#,
+    )
+    .await?;
+    let _ = c.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;").await;
+    let _ = c
+        .batch_execute(
+            "CREATE INDEX IF NOT EXISTS memories_trgm ON memories USING gin (content gin_trgm_ops);
+             CREATE INDEX IF NOT EXISTS messages_trgm ON messages USING gin (content gin_trgm_ops);",
+        )
+        .await;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct Tenant {
+    pub id: String,
+    pub name: String,
+    pub settings: Value,
+    pub default_model: Option<String>,
+    pub max_concurrent_runs: i32,
+    pub max_handles: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+    pub auto_compaction: bool,
+    pub runtime_backend: Option<String>,
+    pub runtime_handle: Option<String>,
+    pub parent_session: Option<String>,
+    pub summary: Option<String>,
+    pub summary_through: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterruptRow {
+    pub id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub tool: String,
+    pub args: Value,
+    pub reason: String,
+    pub status: String,
+}
+
+pub async fn create_tenant(pool: &PgPool, name: &str, raw_key: &str) -> anyhow::Result<Tenant> {
+    let id = Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_key(raw_key);
+    let prefix: String = raw_key.chars().take(12).collect();
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO tenants(id, name) VALUES ($1, $2)",
+        &[&id, &name],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO api_keys(id, tenant_id, key_hash, key_prefix) VALUES ($1, $2, $3, $4)",
+        &[&Uuid::new_v4().to_string(), &id, &hash, &prefix],
+    )
+    .await?;
+    load_tenant(pool, &id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("tenant insert vanished"))
+}
+
+pub async fn load_tenant(pool: &PgPool, id: &str) -> anyhow::Result<Option<Tenant>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT id, name, settings, default_model, max_concurrent_runs, max_handles
+             FROM tenants WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+    Ok(row.map(|r| Tenant {
+        id: r.get(0),
+        name: r.get(1),
+        settings: r.get(2),
+        default_model: r.get(3),
+        max_concurrent_runs: r.get(4),
+        max_handles: r.get(5),
+    }))
+}
+
+pub async fn tenant_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Option<Tenant>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT t.id, t.name, t.settings, t.default_model, t.max_concurrent_runs, t.max_handles
+             FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE k.key_hash = $1",
+            &[&hash],
+        )
+        .await?;
+    Ok(row.map(|r| Tenant {
+        id: r.get(0),
+        name: r.get(1),
+        settings: r.get(2),
+        default_model: r.get(3),
+        max_concurrent_runs: r.get(4),
+        max_handles: r.get(5),
+    }))
+}
+
+pub async fn update_settings(pool: &PgPool, tenant_id: &str, settings: &Value) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE tenants SET settings = $2 WHERE id = $1",
+        &[&tenant_id, settings],
+    )
+    .await?;
+    Ok(())
+}
+
+fn map_session(r: &tokio_postgres::Row) -> SessionRow {
+    SessionRow {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        name: r.get(2),
+        model: r.get(3),
+        thinking_level: r.get(4),
+        auto_compaction: r.get(5),
+        runtime_backend: r.get(6),
+        runtime_handle: r.get(7),
+        parent_session: r.get(8),
+        summary: r.get(9),
+        summary_through: r.get(10),
+        created_at: r.get(11),
+        updated_at: r.get(12),
+        run_id: r.get(13),
+    }
+}
+
+const SESSION_COLS: &str = "id, tenant_id, name, model, thinking_level, auto_compaction,
+    runtime_backend, runtime_handle, parent_session, summary, summary_through,
+    created_at, updated_at, run_id";
+
+pub async fn insert_session(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    name: Option<&str>,
+    model: Option<&str>,
+    backend: Option<&str>,
+    handle: Option<&str>,
+    parent: Option<&str>,
+) -> anyhow::Result<SessionRow> {
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        &[&id, &tenant_id, &name, &model, &backend, &handle, &parent],
+    )
+    .await?;
+    get_session(pool, tenant_id, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session insert vanished"))
+}
+
+pub async fn get_session(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+) -> anyhow::Result<Option<SessionRow>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = $1 AND tenant_id = $2"),
+            &[&id, &tenant_id],
+        )
+        .await?;
+    Ok(row.as_ref().map(map_session))
+}
+
+pub async fn session_owner(pool: &PgPool, id: &str) -> anyhow::Result<Option<String>> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt("SELECT tenant_id FROM sessions WHERE id = $1", &[&id])
+        .await?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+pub async fn list_sessions(pool: &PgPool, tenant_id: &str) -> anyhow::Result<Vec<SessionRow>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE tenant_id = $1 ORDER BY updated_at DESC"
+            ),
+            &[&tenant_id],
+        )
+        .await?;
+    Ok(rows.iter().map(map_session).collect())
+}
+
+pub async fn count_sessions(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i64> {
+    let c = pool.get().await?;
+    let n: i64 = c
+        .query_one(
+            "SELECT count(*) FROM sessions WHERE tenant_id = $1",
+            &[&tenant_id],
+        )
+        .await?
+        .get(0);
+    Ok(n)
+}
+
+pub async fn update_session_meta(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    name: Option<&str>,
+    model: Option<&str>,
+    thinking: Option<&str>,
+    auto_compaction: Option<bool>,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE sessions SET
+            name = COALESCE($3, name),
+            model = COALESCE($4, model),
+            thinking_level = COALESCE($5, thinking_level),
+            auto_compaction = COALESCE($6, auto_compaction),
+            updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id, &name, &model, &thinking, &auto_compaction],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn set_runtime(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    backend: &str,
+    handle: &str,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE sessions SET runtime_backend = $3, runtime_handle = $4, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id, &backend, &handle],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn set_run_id(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    run_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = if let Some(rid) = run_id {
+        c.execute(
+            "UPDATE sessions SET run_id = $3, updated_at = now()
+             WHERE id = $1 AND tenant_id = $2 AND (run_id IS NULL OR run_id = '')",
+            &[&id, &tenant_id, &rid],
+        )
+        .await?
+    } else {
+        c.execute(
+            "UPDATE sessions SET run_id = NULL, updated_at = now()
+             WHERE id = $1 AND tenant_id = $2",
+            &[&id, &tenant_id],
+        )
+        .await?
+    };
+    Ok(n > 0)
+}
+
+pub async fn persist_tree(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: &str,
+    tree: &SessionTree,
+) -> anyhow::Result<()> {
+    let mut c = pool.get().await?;
+    let tx = c.transaction().await?;
+    tx.execute(
+        "DELETE FROM messages WHERE tenant_id = $1 AND session_id = $2",
+        &[&tenant_id, &session_id],
+    )
+    .await?;
+    let mut order: Vec<&String> = tree.nodes.keys().collect();
+    order.sort_by_key(|id| tree.nodes[*id].created_at);
+    for id in order {
+        let node = &tree.nodes[id];
+        let role = match node.message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        let content = node.message.full_text();
+        let blocks = serde_json::to_value(&node.message).unwrap_or(Value::Null);
+        tx.execute(
+            "INSERT INTO messages(id, tenant_id, session_id, parent, role, content, blocks, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                id,
+                &tenant_id,
+                &session_id,
+                &node.parent,
+                &role,
+                &content,
+                &blocks,
+                &node.message.created_at,
+            ],
+        )
+        .await?;
+    }
+    tx.execute(
+        "UPDATE sessions SET summary = $3, summary_through = $4, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[
+            &session_id,
+            &tenant_id,
+            &tree.summary,
+            &tree.summary_through,
+        ],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn load_tree(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: &str,
+) -> anyhow::Result<SessionTree> {
+    let sess = get_session(pool, tenant_id, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT id, parent, role, content, blocks, created_at
+             FROM messages WHERE tenant_id = $1 AND session_id = $2
+             ORDER BY created_at ASC",
+            &[&tenant_id, &session_id],
+        )
+        .await?;
+    let mut tree = SessionTree::new();
+    tree.id = session_id.to_string();
+    tree.nodes.clear();
+    tree.current_path.clear();
+    tree.summary = sess.summary;
+    tree.summary_through = sess.summary_through;
+    for r in rows {
+        let id: String = r.get(0);
+        let parent: Option<String> = r.get(1);
+        let role_s: String = r.get(2);
+        let content: String = r.get(3);
+        let blocks: Option<Value> = r.get(4);
+        let created_at: DateTime<Utc> = r.get(5);
+        let message = if let Some(Value::Object(_)) = &blocks {
+            serde_json::from_value::<Message>(blocks.unwrap()).unwrap_or_else(|_| {
+                Message::text(parse_role(&role_s), content)
+            })
+        } else {
+            Message::text(parse_role(&role_s), content)
+        };
+        tree.nodes.insert(
+            id.clone(),
+            SessionNode {
+                id: id.clone(),
+                parent,
+                message,
+                summary: None,
+                created_at,
+            },
+        );
+        tree.current_path.push(id);
+    }
+    Ok(tree)
+}
+
+fn parse_role(s: &str) -> Role {
+    match s {
+        "system" => Role::System,
+        "assistant" => Role::Assistant,
+        "tool" => Role::Tool,
+        _ => Role::User,
+    }
+}
+
+pub async fn delete_session(pool: &PgPool, tenant_id: &str, id: &str) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "DELETE FROM sessions WHERE id = $1 AND tenant_id = $2",
+            &[&id, &tenant_id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn insert_memory(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: Option<&str>,
+    scope: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    if rupi_memory::contains_secret(content) {
+        anyhow::bail!("refused: entry looks like a secret; store a reference instead");
+    }
+    let layer = if content.contains("[core]") {
+        "core"
+    } else if content.contains("[user]") {
+        "user"
+    } else if content.contains("[failure]") {
+        "failure"
+    } else {
+        "extended"
+    };
+    let id = Uuid::new_v4().to_string();
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO memories(id, tenant_id, session_id, scope, layer, content)
+         VALUES ($1,$2,$3,$4,$5,$6)",
+        &[&id, &tenant_id, &session_id, &scope, &layer, &content],
+    )
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_memories(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let c = pool.get().await?;
+    let rows = if let Some(sid) = session_id {
+        c.query(
+            "SELECT layer, scope, content FROM memories
+             WHERE tenant_id = $1 AND (session_id IS NULL OR session_id = $2)
+             ORDER BY created_at ASC",
+            &[&tenant_id, &sid],
+        )
+        .await?
+    } else {
+        c.query(
+            "SELECT layer, scope, content FROM memories
+             WHERE tenant_id = $1 ORDER BY created_at ASC",
+            &[&tenant_id],
+        )
+        .await?
+    };
+    Ok(rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
+}
+
+pub async fn search_memories(
+    pool: &PgPool,
+    tenant_id: &str,
+    query: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let c = pool.get().await?;
+    let like = format!("%{query}%");
+    let rows = c
+        .query(
+            "SELECT scope, content FROM memories
+             WHERE tenant_id = $1 AND content ILIKE $2
+             ORDER BY created_at DESC LIMIT $3",
+            &[&tenant_id, &like, &limit],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+}
+
+pub async fn search_sessions(
+    pool: &PgPool,
+    tenant_id: &str,
+    query: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let c = pool.get().await?;
+    let like = format!("%{query}%");
+    let rows = c
+        .query(
+            "SELECT session_id, content FROM messages
+             WHERE tenant_id = $1 AND content ILIKE $2
+             ORDER BY created_at DESC LIMIT $3",
+            &[&tenant_id, &like, &limit],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+}
+
+pub async fn insert_interrupt(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: &str,
+    run_id: &str,
+    tool_call_id: &str,
+    tool: &str,
+    args: &Value,
+    reason: &str,
+) -> anyhow::Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO interrupts(id, tenant_id, session_id, run_id, tool_call_id, tool, args, reason)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        &[
+            &id,
+            &tenant_id,
+            &session_id,
+            &run_id,
+            &tool_call_id,
+            &tool,
+            args,
+            &reason,
+        ],
+    )
+    .await?;
+    Ok(id)
+}
+
+pub async fn pending_interrupts(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: &str,
+) -> anyhow::Result<Vec<InterruptRow>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT id, session_id, run_id, tool_call_id, tool, args, reason, status
+             FROM interrupts WHERE tenant_id = $1 AND session_id = $2 AND status = 'pending'
+             ORDER BY created_at ASC",
+            &[&tenant_id, &session_id],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| InterruptRow {
+            id: r.get(0),
+            session_id: r.get(1),
+            run_id: r.get(2),
+            tool_call_id: r.get(3),
+            tool: r.get(4),
+            args: r.get(5),
+            reason: r.get(6),
+            status: r.get(7),
+        })
+        .collect())
+}
+
+pub async fn set_interrupt_status(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE interrupts SET status = $3 WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id, &status],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn bump_quota_run(pool: &PgPool, tenant_id: &str) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO quota_ledger(tenant_id, day, runs) VALUES ($1, CURRENT_DATE, 1)
+         ON CONFLICT (tenant_id, day) DO UPDATE SET runs = quota_ledger.runs + 1",
+        &[&tenant_id],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn bump_quota_tokens(pool: &PgPool, tenant_id: &str, tokens: i64) -> anyhow::Result<()> {
+    if tokens <= 0 {
+        return Ok(());
+    }
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO quota_ledger(tenant_id, day, tokens) VALUES ($1, CURRENT_DATE, $2)
+         ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = quota_ledger.tokens + $2",
+        &[&tenant_id, &tokens],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn today_quota(pool: &PgPool, tenant_id: &str) -> anyhow::Result<(i64, i64)> {
+    let c = pool.get().await?;
+    let row = c
+        .query_opt(
+            "SELECT tokens, runs FROM quota_ledger WHERE tenant_id = $1 AND day = CURRENT_DATE",
+            &[&tenant_id],
+        )
+        .await?;
+    Ok(row
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+        .unwrap_or((0, 0)))
+}
+
+/// 测试用：清掉本库云表（不碰别的库）。
+pub async fn reset_all(pool: &PgPool) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.batch_execute(
+        "TRUNCATE interrupts, memories, messages, sessions, api_keys, quota_ledger, tenants CASCADE",
+    )
+    .await?;
+    Ok(())
+}

@@ -18,7 +18,8 @@ pub mod context;
 pub use context::{load_context_files, ContextFile};
 pub mod policy;
 pub use policy::{
-    ApprovalAnswer, Approver, ChainPolicy, Decision, Policy, RulePolicy, SessionApprovalCache,
+    ApprovalAnswer, Approver, AskAction, ChainPolicy, Decision, PendingInterrupt, Policy,
+    RulePolicy, SessionApprovalCache,
 };
 pub mod subagent;
 pub use subagent::{run_subagents, SubagentResult, SubagentTask, SubagentTool, SUBAGENT_TOOL_NAME};
@@ -229,6 +230,11 @@ pub struct AgentLoop {
     pub discovered: Arc<std::sync::Mutex<HashSet<String>>>,
     /// 运行中转向信箱：工具执行完、下一轮 LLM 之前注入用户消息。
     pub inbox: Option<Arc<crate::MessageInbox>>,
+    /// 云路径：Ask 时不阻塞 [`Approver`]，由回调决定是否挂起本轮。
+    /// `None` 时保持本机审批语义（TUI/CLI/`--mode rpc` 不变）。
+    pub on_ask: Option<Arc<dyn Fn(&str, &serde_json::Value, &str) -> AskAction + Send + Sync>>,
+    /// `on_ask` 返回 [`AskAction::Interrupt`] 时写入；宿主据此发 AG-UI interrupt。
+    pub pending_interrupt: Arc<std::sync::Mutex<Option<PendingInterrupt>>>,
 }
 
 impl AgentLoop {
@@ -256,7 +262,22 @@ impl AgentLoop {
             thinking: None,
             discovered: Arc::new(std::sync::Mutex::new(HashSet::new())),
             inbox: None,
+            on_ask: None,
+            pending_interrupt: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 云控制面：Ask 时挂起而不是同步阻塞审批。
+    pub fn with_on_ask(
+        mut self,
+        f: impl Fn(&str, &serde_json::Value, &str) -> AskAction + Send + Sync + 'static,
+    ) -> Self {
+        self.on_ask = Some(Arc::new(f));
+        self
+    }
+
+    pub fn take_pending_interrupt(&self) -> Option<PendingInterrupt> {
+        self.pending_interrupt.lock().unwrap().take()
     }
 
     pub fn with_inbox(mut self, inbox: Arc<crate::MessageInbox>) -> Self {
@@ -559,6 +580,71 @@ impl AgentLoop {
     ) -> anyhow::Result<StopReason> {
         let user_input = user.full_text();
         session.push(user);
+        self.run_turns(
+            provider,
+            session,
+            &user_input,
+            tools,
+            mem,
+            frozen,
+            skills,
+            extensions,
+            on_event,
+            cancel,
+        )
+        .await
+    }
+
+    /// 续跑：不追加用户消息（云 interrupt resume 执行完工具结果后继续 LLM）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn continue_session(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        tools: &ToolRegistry,
+        mem: &MemoryManager,
+        frozen: &FrozenMemory,
+        skills: &SkillRegistry,
+        extensions: &[Arc<dyn Extension>],
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<StopReason> {
+        let user_input = session
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.full_text())
+            .unwrap_or_default();
+        self.run_turns(
+            provider,
+            session,
+            &user_input,
+            tools,
+            mem,
+            frozen,
+            skills,
+            extensions,
+            on_event,
+            cancel,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turns(
+        &self,
+        provider: &dyn LlmProvider,
+        session: &mut SessionTree,
+        user_input: &str,
+        tools: &ToolRegistry,
+        mem: &MemoryManager,
+        frozen: &FrozenMemory,
+        skills: &SkillRegistry,
+        extensions: &[Arc<dyn Extension>],
+        on_event: &(dyn Fn(AgentEvent) + Sync),
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<StopReason> {
         // 长会话先压缩：摘要最旧部分（树不动，只影响 prompt 窗口）
         self.maybe_compress_with_event(provider, session, mem, on_event)
             .await;
@@ -812,37 +898,58 @@ impl AgentLoop {
                             "denied by policy: {reason}"
                         ))),
                         Decision::Ask(reason) => {
-                            // 审批问询前后广播 UiPrompt 事件（对标上游 ui_prompt_start/end），
-                            // 无审批器则不问直接拒绝，此时不发事件（没有等待发生）。
-                            let ok = match &self.approver {
-                                None => false,
-                                Some(a) => {
-                                    let start = AgentEvent::UiPromptStart {
-                                        tool: name.clone(),
-                                        reason: reason.clone(),
-                                    };
-                                    on_event(start.clone());
-                                    for e in extensions {
-                                        e.on_event(&start).await?;
+                            if let Some(cb) = &self.on_ask {
+                                match cb(&name, &args, &reason) {
+                                    AskAction::Allow => None,
+                                    AskAction::Deny => Some(rupi_tools::ToolOutput::err(format!(
+                                        "denied (approval required): {reason}"
+                                    ))),
+                                    AskAction::Interrupt => {
+                                        *self.pending_interrupt.lock().unwrap() =
+                                            Some(PendingInterrupt {
+                                                tool_call_id: id.clone(),
+                                                name: name.clone(),
+                                                arguments: args.clone(),
+                                                reason,
+                                            });
+                                        // ToolStart 已发出；不执行、不发 ToolEnd、不发 RunEnd。
+                                        // 宿主（AG-UI）据此落盘 interrupt 并结束本轮 SSE。
+                                        return Ok(StopReason::Aborted);
                                     }
-                                    let ok = a.approve(&name, &args, &reason);
-                                    let end = AgentEvent::UiPromptEnd {
-                                        tool: name.clone(),
-                                        approved: ok,
-                                    };
-                                    on_event(end.clone());
-                                    for e in extensions {
-                                        e.on_event(&end).await?;
-                                    }
-                                    ok
                                 }
-                            };
-                            if ok {
-                                None
                             } else {
-                                Some(rupi_tools::ToolOutput::err(format!(
-                                    "denied (approval required): {reason}"
-                                )))
+                                // 本机：审批问询前后广播 UiPrompt（对标上游 ui_prompt_start/end），
+                                // 无审批器则不问直接拒绝，此时不发事件（没有等待发生）。
+                                let ok = match &self.approver {
+                                    None => false,
+                                    Some(a) => {
+                                        let start = AgentEvent::UiPromptStart {
+                                            tool: name.clone(),
+                                            reason: reason.clone(),
+                                        };
+                                        on_event(start.clone());
+                                        for e in extensions {
+                                            e.on_event(&start).await?;
+                                        }
+                                        let ok = a.approve(&name, &args, &reason);
+                                        let end = AgentEvent::UiPromptEnd {
+                                            tool: name.clone(),
+                                            approved: ok,
+                                        };
+                                        on_event(end.clone());
+                                        for e in extensions {
+                                            e.on_event(&end).await?;
+                                        }
+                                        ok
+                                    }
+                                };
+                                if ok {
+                                    None
+                                } else {
+                                    Some(rupi_tools::ToolOutput::err(format!(
+                                        "denied (approval required): {reason}"
+                                    )))
+                                }
                             }
                         }
                     });
@@ -2739,6 +2846,79 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(all.contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn on_ask_interrupt_stops_before_tool_execution() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        struct Probe(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl rupi_tools::Tool for Probe {
+            fn definition(&self) -> rupi_core::ToolDefinition {
+                rupi_core::ToolDefinition {
+                    name: "write".into(),
+                    description: "probe".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    prompt_snippet: Some("write".into()),
+                }
+            }
+            async fn execute(&self, _a: serde_json::Value) -> anyhow::Result<rupi_tools::ToolOutput> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(rupi_tools::ToolOutput::ok("should not run"))
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Probe(ran.clone())));
+        let agent = AgentLoop::new(3)
+            .with_policy(Arc::new(RulePolicy {
+                ask_tools: vec!["write".into()],
+                ..Default::default()
+            }))
+            .with_on_ask(|_, _, _| AskAction::Interrupt);
+        let mut session = SessionTree::new();
+        let home = std::env::temp_dir().join("rupi-agent-interrupt");
+        let mem = MemoryManager::new(MemoryStore::new(home));
+        let call = ChatResponse {
+            message: Message {
+                id: "a".into(),
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "tc-write".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path": "x.txt", "content": "nope"}),
+                }],
+                provider: None,
+                created_at: chrono::Utc::now(),
+            },
+            stop_reason: "tool_calls".into(),
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let reason = agent
+            .run(
+                &MockProvider::new(vec![call, MockProvider::text_response("later")]),
+                &mut session,
+                "write a file",
+                &tools,
+                &mem,
+                &FrozenMemory::default(),
+                &SkillRegistry::default(),
+                &[],
+                &move |e| seen2.lock().unwrap().push(format!("{e:?}")),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reason, StopReason::Aborted));
+        assert!(!ran.load(Ordering::SeqCst), "write must not execute");
+        let pending = agent.take_pending_interrupt().expect("interrupt slot");
+        assert_eq!(pending.tool_call_id, "tc-write");
+        assert_eq!(pending.name, "write");
+        let ev = seen.lock().unwrap().join("\n");
+        assert!(ev.contains("ToolStart"), "{ev}");
+        assert!(!ev.contains("ToolEnd"), "{ev}");
+        assert!(!ev.contains("RunEnd"), "{ev}");
     }
 
     #[tokio::test]
