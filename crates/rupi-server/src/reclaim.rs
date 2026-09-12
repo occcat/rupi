@@ -2,7 +2,7 @@
 
 use crate::db::{self, SessionRow};
 use crate::App;
-use rupi_runtime::WorkspaceHandle;
+use rupi_runtime::{AllocRequest, BackendKind, WorkspaceHandle};
 use std::time::Duration;
 
 pub async fn loop_forever(app: App) {
@@ -67,6 +67,8 @@ pub async fn snapshot_and_release(app: &App, sess: &SessionRow) -> anyhow::Resul
     let handle = WorkspaceHandle {
         id: hid.clone(),
         backend: backend.clone(),
+        region: sess.region.clone(),
+        kind: sess.runtime_kind.clone(),
     };
     let blob = app.executor.snapshot(&handle).await?;
     let key = format!("ws/{}/{}/{}.tgz", sess.tenant_id, sess.id, handle.id);
@@ -99,12 +101,21 @@ pub async fn ensure_hot(
             return Ok(WorkspaceHandle {
                 id: h.clone(),
                 backend: b.clone(),
+                region: sess.region.clone(),
+                kind: sess.runtime_kind.clone(),
             });
         }
     }
+    let mut req = AllocRequest::new(tenant_id, &sess.id);
+    if let Some(r) = sess.region.as_deref() {
+        req = req.with_region(r);
+    }
+    if let Some(k) = sess.runtime_kind.as_deref().and_then(BackendKind::parse) {
+        req = req.with_kind(k);
+    }
     let mut last = None;
     for _ in 0..2 {
-        match app.executor.alloc(tenant_id, &sess.id).await {
+        match app.executor.alloc_pref(&req).await {
             Ok(wh) => {
                 if let Some(key) = sess.snapshot_key.as_deref() {
                     match app.object_store.get(key).await {
@@ -123,6 +134,8 @@ pub async fn ensure_hot(
                     &wh.backend,
                     &wh.id,
                     sess.snapshot_key.as_deref(),
+                    wh.kind.as_deref(),
+                    wh.region.as_deref(),
                 )
                 .await?;
                 return Ok(wh);

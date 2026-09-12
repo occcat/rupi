@@ -1,5 +1,6 @@
 //! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
 
+mod cloud;
 mod rpc;
 
 use clap::{Parser, Subcommand};
@@ -329,6 +330,14 @@ enum Cmd {
     Packages {
         #[arg(short = 'l', long)]
         local: bool,
+    },
+    /// 连云控制面：AG-UI/HTTP 瘦客户端。本机不执行 bash，不进 TUI。
+    Cloud {
+        /// 控制面根 URL（`RUPI_CLOUD_URL`）
+        #[arg(long, env = "RUPI_CLOUD_URL")]
+        url: String,
+        #[command(subcommand)]
+        action: cloud::Action,
     },
 }
 
@@ -922,6 +931,17 @@ async fn main() -> anyhow::Result<()> {
                     p.extensions.join(",")
                 );
             }
+        }
+        Some(Cmd::Cloud { url, action }) => {
+            let key = cli
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("RUPI_CLOUD_KEY").ok())
+                .or_else(|| std::env::var("RUPI_API_KEY").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cloud 需要 --api-key 或环境变量 RUPI_CLOUD_KEY")
+                })?;
+            cloud::run(&url, &key, action).await?;
         }
         Some(Cmd::McpList { command, args, url }) => {
             let mut cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);

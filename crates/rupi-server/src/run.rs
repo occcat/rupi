@@ -287,6 +287,7 @@ async fn drive(
             sess.auto_compaction,
             &pending_ids,
             sess.runtime_backend.as_deref(),
+            sess.region.as_deref(),
         )),
     );
 
@@ -411,6 +412,7 @@ async fn drive(
                 sess.auto_compaction,
                 std::slice::from_ref(&iid),
                 sess.runtime_backend.as_deref(),
+                sess.region.as_deref(),
             )),
         );
         quota::release_lease(

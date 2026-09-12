@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use futures::{Stream, StreamExt};
 use rupi_core::CancelFlag;
 use rupi_memory::{export_tree_html, export_tree_jsonl, import_jsonl, remap_tree};
-use rupi_runtime::{BootstrapKind, WorkspaceHandle};
+use rupi_runtime::{AllocRequest, BackendKind, BootstrapKind, WorkspaceHandle};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -43,8 +43,10 @@ async fn ready(State(app): State<App>) -> Json<Value> {
     let pg = app.pool.get().await.is_ok();
     Json(json!({
         "instanceId": app.instance_id,
+        "region": app.region,
         "postgres": pg,
-        "redis": app.cache.available().await
+        "redis": app.cache.available().await,
+        "executors": app.executor.topology()
     }))
 }
 
@@ -107,6 +109,8 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, R
         "tenantId": t.id,
         "name": t.name,
         "defaultModel": t.default_model,
+        "defaultRegion": t.default_region,
+        "region": app.region,
         "quota": {
             "maxConcurrentRuns": t.max_concurrent_runs,
             "maxHandles": t.max_handles,
@@ -177,6 +181,10 @@ struct CreateSession {
     bootstrap: Option<String>,
     #[serde(default)]
     git_url: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 async fn create_session(
@@ -185,45 +193,68 @@ async fn create_session(
     Json(body): Json<CreateSession>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
     let t = tenant_of(&app, &headers).await?;
-    let n = db::count_hot_handles(&app.pool, &t.id).await.unwrap_or(0);
-    if n >= t.max_handles as i64 {
-        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
-    }
     let id = Uuid::new_v4().to_string();
-    let wh = match alloc_workspace(&app, &t.id, &id).await {
-        Ok(h) => h,
-        Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error":"execution pool exhausted"})),
-            )
-                .into_response());
-        }
-        Err(e) => {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
-        }
-    };
-    let kind = match body.bootstrap.as_deref() {
-        Some("git") => BootstrapKind::Git {
-            url: body.git_url.unwrap_or_default(),
-        },
-        _ => BootstrapKind::Empty,
-    };
-    let _ = app.executor.bootstrap(&wh, kind).await;
-    let row = db::insert_session(
+    let region = resolve_region(&app, &t, body.region.as_deref());
+    let backend_kind = body.backend.as_deref().and_then(BackendKind::parse);
+    let reserved = db::insert_session_if_under_cap(
         &app.pool,
         &t.id,
         &id,
         body.name.as_deref(),
         body.model.as_deref(),
-        Some(&wh.backend),
-        Some(&wh.id),
         None,
+        None,
+        None,
+        Some(&region),
+        backend_kind.map(|k| k.as_str()),
     )
     .await
     .map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
     })?;
+    if reserved.is_none() {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
+    }
+    let wh = match alloc_workspace(&app, &t.id, &id, Some(&region), backend_kind).await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = db::delete_session(&app.pool, &t.id, &id).await;
+            if rupi_runtime::is_pool_exhausted(&e) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error":"execution pool exhausted"})),
+                )
+                    .into_response());
+            }
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+        }
+    };
+    let _ = db::set_runtime(&app.pool, &t.id, &id, &wh.backend, &wh.id).await;
+    let _ = db::mark_hot(
+        &app.pool,
+        &t.id,
+        &id,
+        &wh.backend,
+        &wh.id,
+        None,
+        wh.kind.as_deref(),
+        Some(&region),
+    )
+    .await;
+    let boot = match body.bootstrap.as_deref() {
+        Some("git") => BootstrapKind::Git {
+            url: body.git_url.unwrap_or_default(),
+        },
+        _ => BootstrapKind::Empty,
+    };
+    let _ = app.executor.bootstrap(&wh, boot).await;
+    let row = db::get_session(&app.pool, &t.id, &id)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
+        })?;
     Ok((StatusCode::CREATED, Json(session_json(&row, None))))
 }
 
@@ -264,6 +295,8 @@ async fn delete_session(
             .destroy(&WorkspaceHandle {
                 id: h,
                 backend: b,
+                region: row.region.clone(),
+                kind: row.runtime_kind.clone(),
             })
             .await;
     }
@@ -317,40 +350,72 @@ async fn duplicate(
     }
     let new_tree = remap_tree(&tree, path_only);
     let new_id = Uuid::new_v4().to_string();
-    let wh = match alloc_workspace(app, &t.id, &new_id).await {
-        Ok(h) => h,
-        Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error":"execution pool exhausted"})),
-            )
-                .into_response());
-        }
-        Err(e) => {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
-        }
-    };
-    let _ = app.executor.bootstrap(&wh, BootstrapKind::Empty).await;
-    let row = db::insert_session(
+    let region = src
+        .region
+        .clone()
+        .unwrap_or_else(|| resolve_region(app, &t, None));
+    let kind = src
+        .runtime_kind
+        .as_deref()
+        .and_then(BackendKind::parse);
+    let reserved = db::insert_session_if_under_cap(
         &app.pool,
         &t.id,
         &new_id,
         src.name.as_deref(),
         src.model.as_deref(),
-        Some(&wh.backend),
-        Some(&wh.id),
+        None,
+        None,
         Some(id),
+        Some(&region),
+        kind.map(|k| k.as_str()),
     )
     .await
     .map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
     })?;
+    if reserved.is_none() {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
+    }
+    let wh = match alloc_workspace(app, &t.id, &new_id, Some(&region), kind).await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = db::delete_session(&app.pool, &t.id, &new_id).await;
+            if rupi_runtime::is_pool_exhausted(&e) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error":"execution pool exhausted"})),
+                )
+                    .into_response());
+            }
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+        }
+    };
+    let _ = db::mark_hot(
+        &app.pool,
+        &t.id,
+        &new_id,
+        &wh.backend,
+        &wh.id,
+        None,
+        wh.kind.as_deref(),
+        Some(&region),
+    )
+    .await;
+    let _ = app.executor.bootstrap(&wh, BootstrapKind::Empty).await;
     let mut new_tree = new_tree;
     new_tree.id = new_id.clone();
     db::persist_tree(&app.pool, &t.id, &new_id, &new_tree)
         .await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        })?;
+    let row = db::get_session(&app.pool, &t.id, &new_id)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
         })?;
     Ok(Json(session_json(&row, None)))
 }
@@ -432,19 +497,45 @@ async fn agent_run(
     }
 }
 
+fn resolve_region(app: &App, tenant: &Tenant, requested: Option<&str>) -> String {
+    requested
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            tenant
+                .default_region
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| app.region.clone())
+}
+
 async fn alloc_workspace(
     app: &App,
     tenant_id: &str,
     session_id: &str,
+    region: Option<&str>,
+    kind: Option<BackendKind>,
 ) -> anyhow::Result<WorkspaceHandle> {
-    match app.executor.alloc(tenant_id, session_id).await {
+    let mut req = AllocRequest::new(tenant_id, session_id);
+    if let Some(r) = region.filter(|s| !s.is_empty()) {
+        req = req.with_region(r);
+    }
+    if let Some(k) = kind {
+        req = req.with_kind(k);
+    }
+    match app.executor.alloc_pref(&req).await {
         Ok(h) => {
             app.cache.clear_missing_session(tenant_id, session_id).await;
             Ok(h)
         }
         Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
             if reclaim::preempt_one(app, tenant_id).await {
-                let h = app.executor.alloc(tenant_id, session_id).await?;
+                let h = app.executor.alloc_pref(&req).await?;
                 app.cache.clear_missing_session(tenant_id, session_id).await;
                 Ok(h)
             } else {
@@ -469,10 +560,13 @@ fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {
         "model": row.model,
         "thinkingLevel": row.thinking_level,
         "autoCompaction": row.auto_compaction,
+        "region": row.region.clone(),
         "runtime": {
             "backend": row.runtime_backend,
+            "kind": row.runtime_kind,
             "handle": row.runtime_handle,
-            "status": status
+            "status": status,
+            "region": row.region.clone()
         },
         "runId": row.run_id,
         "parentSession": row.parent_session,

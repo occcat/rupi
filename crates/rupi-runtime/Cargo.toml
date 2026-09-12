@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
-description = "Cloud Executor trait and remote HTTP execution backend"
+description = "Cloud Executor trait, remote-http execd, and sandbox-cluster backend"
 
 [[bin]]
 name = "rupi-execd"
 path = "src/bin/rupi-execd.rs"
+
+[[bin]]
+name = "rupi-sandboxd"
+path = "src/bin/rupi-sandboxd.rs"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }

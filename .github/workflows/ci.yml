@@ -109,6 +109,9 @@ jobs:
       - name: local rpc regression
         run: cargo test --locked -p rupi-cli --test smoke rpc_mode_prompt_and_state -- --exact
 
+      - name: thin cloud client
+        run: cargo test --locked -p rupi-cli --test cloud_thin -- --nocapture
+
   bench:
     name: benches (build)
     runs-on: ubuntu-latest

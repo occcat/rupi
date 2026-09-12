@@ -18,7 +18,19 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
             recycling_method: RecyclingMethod::Fast,
         },
     );
-    Ok(Pool::builder(mgr).max_size(16).build()?)
+    Ok(Pool::builder(mgr).max_size(32).build()?)
+}
+
+pub async fn connect_with_size(database_url: &str, max_size: usize) -> anyhow::Result<PgPool> {
+    let cfg: tokio_postgres::Config = database_url.parse()?;
+    let mgr = Manager::from_config(
+        cfg,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+    Ok(Pool::builder(mgr).max_size(max_size.max(1)).build()?)
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -117,7 +129,11 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
              ALTER TABLE sessions ADD COLUMN IF NOT EXISTS instance_id TEXT;
              ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace_state TEXT NOT NULL DEFAULT 'hot';
              ALTER TABLE sessions ADD COLUMN IF NOT EXISTS snapshot_key TEXT;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;",
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS region TEXT;
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
+             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS default_region TEXT;
+             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_qps INT NOT NULL DEFAULT 8;",
         )
         .await;
     let _ = c.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;").await;
@@ -156,6 +172,8 @@ pub struct Tenant {
     pub max_handles: i32,
     pub max_runs_per_day: i32,
     pub max_tokens_per_day: i64,
+    pub default_region: Option<String>,
+    pub max_qps: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +196,8 @@ pub struct SessionRow {
     pub workspace_state: Option<String>,
     pub snapshot_key: Option<String>,
     pub last_used_at: Option<DateTime<Utc>>,
+    pub region: Option<String>,
+    pub runtime_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +237,8 @@ pub async fn load_tenant(pool: &PgPool, id: &str) -> anyhow::Result<Option<Tenan
     let row = c
         .query_opt(
             "SELECT id, name, settings, default_model, max_concurrent_runs, max_handles,
-                    COALESCE(max_runs_per_day, 10000), COALESCE(max_tokens_per_day, 100000000)
+                    COALESCE(max_runs_per_day, 10000), COALESCE(max_tokens_per_day, 100000000),
+                    default_region, COALESCE(max_qps, 8)
              FROM tenants WHERE id = $1",
             &[&id],
         )
@@ -230,7 +251,8 @@ pub async fn tenant_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Opt
     let row = c
         .query_opt(
             "SELECT t.id, t.name, t.settings, t.default_model, t.max_concurrent_runs, t.max_handles,
-                    COALESCE(t.max_runs_per_day, 10000), COALESCE(t.max_tokens_per_day, 100000000)
+                    COALESCE(t.max_runs_per_day, 10000), COALESCE(t.max_tokens_per_day, 100000000),
+                    t.default_region, COALESCE(t.max_qps, 8)
              FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
              WHERE k.key_hash = $1",
             &[&hash],
@@ -249,7 +271,62 @@ fn map_tenant(r: tokio_postgres::Row) -> Tenant {
         max_handles: r.get(5),
         max_runs_per_day: r.get(6),
         max_tokens_per_day: r.get(7),
+        default_region: r.get(8),
+        max_qps: r.get(9),
     }
+}
+
+pub async fn set_tenant_region(pool: &PgPool, tenant_id: &str, region: &str) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE tenants SET default_region = $2 WHERE id = $1",
+        &[&tenant_id, &region],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn set_tenant_caps(
+    pool: &PgPool,
+    tenant_id: &str,
+    max_concurrent_runs: i32,
+    max_handles: i32,
+    max_runs_per_day: i32,
+) -> anyhow::Result<()> {
+    set_tenant_caps_ex(
+        pool,
+        tenant_id,
+        max_concurrent_runs,
+        max_handles,
+        max_runs_per_day,
+        8,
+    )
+    .await
+}
+
+pub async fn set_tenant_caps_ex(
+    pool: &PgPool,
+    tenant_id: &str,
+    max_concurrent_runs: i32,
+    max_handles: i32,
+    max_runs_per_day: i32,
+    max_qps: i32,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE tenants SET max_concurrent_runs = $2, max_handles = $3, max_runs_per_day = $4,
+                max_qps = $5
+         WHERE id = $1",
+        &[
+            &tenant_id,
+            &max_concurrent_runs,
+            &max_handles,
+            &max_runs_per_day,
+            &max_qps,
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn list_tenant_ids(pool: &PgPool) -> anyhow::Result<Vec<String>> {
@@ -288,12 +365,15 @@ fn map_session(r: &tokio_postgres::Row) -> SessionRow {
         workspace_state: r.get(15),
         snapshot_key: r.get(16),
         last_used_at: r.get(17),
+        region: r.get(18),
+        runtime_kind: r.get(19),
     }
 }
 
 const SESSION_COLS: &str = "id, tenant_id, name, model, thinking_level, auto_compaction,
     runtime_backend, runtime_handle, parent_session, summary, summary_through,
-    created_at, updated_at, run_id, instance_id, workspace_state, snapshot_key, last_used_at";
+    created_at, updated_at, run_id, instance_id, workspace_state, snapshot_key, last_used_at,
+    region, runtime_kind";
 
 pub async fn insert_session(
     pool: &PgPool,
@@ -304,12 +384,24 @@ pub async fn insert_session(
     backend: Option<&str>,
     handle: Option<&str>,
     parent: Option<&str>,
+    region: Option<&str>,
+    runtime_kind: Option<&str>,
 ) -> anyhow::Result<SessionRow> {
     let c = pool.get().await?;
     c.execute(
-        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session, workspace_state, last_used_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7, 'hot', now())",
-        &[&id, &tenant_id, &name, &model, &backend, &handle, &parent],
+        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session, workspace_state, last_used_at, region, runtime_kind)
+         VALUES ($1,$2,$3,$4,$5,$6,$7, 'hot', now(), $8, $9)",
+        &[
+            &id,
+            &tenant_id,
+            &name,
+            &model,
+            &backend,
+            &handle,
+            &parent,
+            &region,
+            &runtime_kind,
+        ],
     )
     .await?;
     get_session(pool, tenant_id, id)
@@ -365,20 +457,78 @@ pub async fn count_sessions(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i6
     Ok(n)
 }
 
-/// 并发句柄：热卷才占配额；已 snapshot 的不占执行池。
+/// 并发句柄：未 snapshot 的会话都占配额（含刚入院、尚未 alloc 完的）。
 pub async fn count_hot_handles(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i64> {
     let c = pool.get().await?;
     let n: i64 = c
         .query_one(
             "SELECT count(*) FROM sessions
              WHERE tenant_id = $1
-               AND runtime_handle IS NOT NULL
                AND COALESCE(workspace_state, 'hot') <> 'snapshotted'",
             &[&tenant_id],
         )
         .await?
         .get(0);
     Ok(n)
+}
+
+/// 租户行锁下建会话。超额返回 `Ok(None)`，由调用方 `429`。
+pub async fn insert_session_if_under_cap(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    name: Option<&str>,
+    model: Option<&str>,
+    backend: Option<&str>,
+    handle: Option<&str>,
+    parent: Option<&str>,
+    region: Option<&str>,
+    runtime_kind: Option<&str>,
+) -> anyhow::Result<Option<SessionRow>> {
+    let mut c = pool.get().await?;
+    let tx = c.transaction().await?;
+    let locked = tx
+        .query_opt(
+            "SELECT max_handles FROM tenants WHERE id = $1 FOR UPDATE",
+            &[&tenant_id],
+        )
+        .await?;
+    let Some(locked) = locked else {
+        tx.rollback().await?;
+        anyhow::bail!("tenant vanished");
+    };
+    let max: i32 = locked.get(0);
+    let n: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM sessions
+             WHERE tenant_id = $1
+               AND COALESCE(workspace_state, 'hot') <> 'snapshotted'",
+            &[&tenant_id],
+        )
+        .await?
+        .get(0);
+    if n >= max as i64 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session, workspace_state, last_used_at, region, runtime_kind)
+         VALUES ($1,$2,$3,$4,$5,$6,$7, 'hot', now(), $8, $9)",
+        &[
+            &id,
+            &tenant_id,
+            &name,
+            &model,
+            &backend,
+            &handle,
+            &parent,
+            &region,
+            &runtime_kind,
+        ],
+    )
+    .await?;
+    tx.commit().await?;
+    get_session(pool, tenant_id, id).await
 }
 
 pub async fn count_active_runs(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i64> {
@@ -544,13 +694,24 @@ pub async fn mark_hot(
     backend: &str,
     handle: &str,
     snapshot_key: Option<&str>,
+    kind: Option<&str>,
+    region: Option<&str>,
 ) -> anyhow::Result<()> {
     let c = pool.get().await?;
     c.execute(
         "UPDATE sessions SET workspace_state = 'hot', runtime_backend = $3, runtime_handle = $4,
-                snapshot_key = COALESCE($5, snapshot_key), last_used_at = now(), updated_at = now()
+                snapshot_key = COALESCE($5, snapshot_key), last_used_at = now(), updated_at = now(),
+                runtime_kind = COALESCE($6, runtime_kind), region = COALESCE($7, region)
          WHERE id = $1 AND tenant_id = $2",
-        &[&id, &tenant_id, &backend, &handle, &snapshot_key],
+        &[
+            &id,
+            &tenant_id,
+            &backend,
+            &handle,
+            &snapshot_key,
+            &kind,
+            &region,
+        ],
     )
     .await?;
     Ok(())

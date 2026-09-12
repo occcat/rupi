@@ -71,7 +71,8 @@ pub async fn admit_run(cache: &Cache, pool: &PgPool, tenant: &Tenant) -> Admit {
             .incr_ex(&Cache::rl_qps_key(&tenant.id), 1)
             .await
             .unwrap_or(0);
-        if qps > 8 {
+        let qps_cap = tenant.max_qps.max(1) as i64;
+        if qps > qps_cap {
             cache.decr(&Cache::rl_conc_key(&tenant.id)).await;
             return Admit::TooMany;
         }

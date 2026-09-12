@@ -1,57 +1,66 @@
-//! `rupi-execd`：平台登记的远程执行进程。工作区与 `sh -c` 只出现在这里。
+//! `rupi-sandboxd`：外部 sandbox 集群 API（与 `rupi-execd` 协议并列、可插拔）。
+//!
+//! 控制面只认 HTTP；本进程才碰工作区与命令。不是本机 Docker 默认执行面。
 
 use crate::engine::{Engine, EngineConfig, EngineError};
-use crate::{store, BootstrapKind, ExecResult, ExecutorStats, ToolText, WorkspaceHandle};
-use axum::extract::State;
+use crate::{store, BootstrapKind, ExecResult, ExecutorStats, ToolText};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
-pub struct ExecdConfig {
+pub struct SandboxdConfig {
     pub bind: String,
     pub root: PathBuf,
     pub token: String,
-    /// 同时租出的工作区上限。满了 `alloc` 返回 429。
-    pub max_workspaces: u32,
-    /// 预热空仓数量（不计入已租出，但 `used + warm <= capacity`）。
+    pub max_sandboxes: u32,
     pub warm_pool: u32,
+    pub region: String,
 }
 
-impl Default for ExecdConfig {
+impl Default for SandboxdConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:8090".into(),
-            root: PathBuf::from("/tmp/rupi-execd"),
+            bind: "127.0.0.1:8190".into(),
+            root: PathBuf::from("/tmp/rupi-sandboxd"),
             token: String::new(),
-            max_workspaces: 64,
+            max_sandboxes: 64,
             warm_pool: 2,
+            region: "local".into(),
         }
     }
 }
 
 struct Inner {
-    cfg: ExecdConfig,
+    cfg: SandboxdConfig,
     engine: Engine,
 }
 
-pub async fn serve(cfg: ExecdConfig) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct SandboxCreated {
+    id: String,
+    backend: String,
+    kind: String,
+    region: String,
+}
+
+pub async fn serve(cfg: SandboxdConfig) -> anyhow::Result<()> {
     let (_addr, handle) = spawn(cfg).await?;
     handle.await??;
     Ok(())
 }
 
-/// 绑定并在后台跑；测试与控制面拉起时用。
 pub async fn spawn(
-    cfg: ExecdConfig,
+    cfg: SandboxdConfig,
 ) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>)> {
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
-    tracing::info!("rupi-execd listen {addr}");
+    tracing::info!("rupi-sandboxd listen {addr} region={}", cfg.region);
     let app = router(cfg);
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -61,10 +70,10 @@ pub async fn spawn(
     Ok((addr, handle))
 }
 
-pub fn router(cfg: ExecdConfig) -> Router {
+pub fn router(cfg: SandboxdConfig) -> Router {
     let engine = Engine::new(EngineConfig {
         root: cfg.root.clone(),
-        max_workspaces: cfg.max_workspaces,
+        max_workspaces: cfg.max_sandboxes,
         warm_pool: cfg.warm_pool,
     });
     let state = Arc::new(Inner { cfg, engine });
@@ -74,19 +83,19 @@ pub fn router(cfg: ExecdConfig) -> Router {
     });
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/v1/stats", get(stats))
-        .route("/v1/alloc", post(alloc))
-        .route("/v1/release", post(release))
-        .route("/v1/destroy", post(destroy))
-        .route("/v1/exec", post(exec))
-        .route("/v1/fs/read", post(fs_read))
-        .route("/v1/fs/write", post(fs_write))
-        .route("/v1/fs/edit", post(fs_edit))
-        .route("/v1/glob", post(glob))
-        .route("/v1/grep", post(grep))
-        .route("/v1/bootstrap", post(bootstrap))
-        .route("/v1/snapshot", post(snapshot))
-        .route("/v1/restore", post(restore))
+        .route("/v1/cluster", get(cluster))
+        .route("/v1/sandboxes", post(create))
+        .route("/v1/sandboxes/{id}", delete(destroy))
+        .route("/v1/sandboxes/{id}/release", post(release))
+        .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route("/v1/sandboxes/{id}/fs/read", post(fs_read))
+        .route("/v1/sandboxes/{id}/fs/write", post(fs_write))
+        .route("/v1/sandboxes/{id}/fs/edit", post(fs_edit))
+        .route("/v1/sandboxes/{id}/glob", post(glob))
+        .route("/v1/sandboxes/{id}/grep", post(grep))
+        .route("/v1/sandboxes/{id}/bootstrap", post(bootstrap))
+        .route("/v1/sandboxes/{id}/snapshot", post(snapshot))
+        .route("/v1/sandboxes/{id}/restore", post(restore))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -109,12 +118,12 @@ fn deny() -> (StatusCode, String) {
 fn map_err(e: EngineError) -> (StatusCode, String) {
     match e {
         EngineError::Exhausted => (StatusCode::TOO_MANY_REQUESTS, "pool_exhausted".into()),
-        EngineError::NotFound => (StatusCode::NOT_FOUND, "unknown handle".into()),
+        EngineError::NotFound => (StatusCode::NOT_FOUND, "unknown sandbox".into()),
         EngineError::Other(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     }
 }
 
-async fn stats(
+async fn cluster(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
 ) -> Result<Json<ExecutorStats>, (StatusCode, String)> {
@@ -123,30 +132,33 @@ async fn stats(
     }
     let (used, capacity, warm) = state.engine.stats().await;
     Ok(Json(ExecutorStats {
-        backend: "remote-http".into(),
+        backend: "sandbox".into(),
         node_id: state.cfg.bind.clone(),
         used,
         capacity,
         warm,
-        region: None,
-        kind: Some("remote-http".into()),
+        region: Some(state.cfg.region.clone()),
+        kind: Some("sandbox".into()),
     }))
 }
 
 #[derive(Deserialize)]
-struct AllocIn {
+struct CreateIn {
     tenant_id: String,
     session_id: String,
+    #[serde(default)]
+    image: Option<String>,
 }
 
-async fn alloc(
+async fn create(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
-    Json(body): Json<AllocIn>,
-) -> Result<Json<WorkspaceHandle>, (StatusCode, String)> {
+    Json(body): Json<CreateIn>,
+) -> Result<Json<SandboxCreated>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let _ = body.image;
     let lease = state
         .engine
         .alloc(&body.tenant_id, &body.session_id)
@@ -156,46 +168,40 @@ async fn alloc(
     tokio::spawn(async move {
         refill.engine.refill_warm().await;
     });
-    Ok(Json(WorkspaceHandle {
+    Ok(Json(SandboxCreated {
         id: lease.id,
-        backend: "remote-http".into(),
-        region: None,
-        kind: Some("remote-http".into()),
+        backend: "sandbox".into(),
+        kind: "sandbox".into(),
+        region: state.cfg.region.clone(),
     }))
-}
-
-#[derive(Deserialize)]
-struct HandleIn {
-    handle: String,
-}
-
-async fn release(
-    State(state): State<Arc<Inner>>,
-    headers: HeaderMap,
-    Json(body): Json<HandleIn>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !auth_ok(&state, &headers) {
-        return Err(deny());
-    }
-    state.engine.release(&body.handle).await.map_err(map_err)?;
-    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn destroy(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
-    Json(body): Json<HandleIn>,
+    Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    state.engine.destroy(&body.handle).await.map_err(map_err)?;
+    state.engine.destroy(&id).await.map_err(map_err)?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn release(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !auth_ok(&state, &headers) {
+        return Err(deny());
+    }
+    state.engine.release(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
 #[derive(Deserialize)]
 struct ExecIn {
-    handle: String,
     command: String,
     timeout_secs: Option<u64>,
 }
@@ -203,6 +209,7 @@ struct ExecIn {
 async fn exec(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<ExecIn>,
 ) -> Result<Json<ExecResult>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -211,7 +218,7 @@ async fn exec(
     Ok(Json(
         state
             .engine
-            .exec(&body.handle, &body.command, body.timeout_secs)
+            .exec(&id, &body.command, body.timeout_secs)
             .await
             .map_err(map_err)?,
     ))
@@ -219,7 +226,6 @@ async fn exec(
 
 #[derive(Deserialize)]
 struct FsReadIn {
-    handle: String,
     path: String,
     offset: Option<u64>,
     limit: Option<u64>,
@@ -228,6 +234,7 @@ struct FsReadIn {
 async fn fs_read(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<FsReadIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -243,7 +250,7 @@ async fn fs_read(
     Ok(Json(
         state
             .engine
-            .fs_tool(&body.handle, "read", args)
+            .fs_tool(&id, "read", args)
             .await
             .map_err(map_err)?,
     ))
@@ -251,7 +258,6 @@ async fn fs_read(
 
 #[derive(Deserialize)]
 struct FsWriteIn {
-    handle: String,
     path: String,
     content: String,
 }
@@ -259,6 +265,7 @@ struct FsWriteIn {
 async fn fs_write(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<FsWriteIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -268,7 +275,7 @@ async fn fs_write(
         state
             .engine
             .fs_tool(
-                &body.handle,
+                &id,
                 "write",
                 serde_json::json!({"path": body.path, "content": body.content}),
             )
@@ -279,7 +286,6 @@ async fn fs_write(
 
 #[derive(Deserialize)]
 struct FsEditIn {
-    handle: String,
     path: String,
     arguments: serde_json::Value,
 }
@@ -287,6 +293,7 @@ struct FsEditIn {
 async fn fs_edit(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<FsEditIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -299,7 +306,7 @@ async fn fs_edit(
     Ok(Json(
         state
             .engine
-            .fs_tool(&body.handle, "edit", args)
+            .fs_tool(&id, "edit", args)
             .await
             .map_err(map_err)?,
     ))
@@ -307,7 +314,6 @@ async fn fs_edit(
 
 #[derive(Deserialize)]
 struct GlobIn {
-    handle: String,
     pattern: String,
     path: Option<String>,
 }
@@ -315,18 +321,19 @@ struct GlobIn {
 async fn glob(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<GlobIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let dir = state.engine.dir(&body.handle).await.map_err(map_err)?;
+    let dir = state.engine.dir(&id).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
     args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     Ok(Json(
         state
             .engine
-            .fs_tool(&body.handle, "glob", args)
+            .fs_tool(&id, "glob", args)
             .await
             .map_err(map_err)?,
     ))
@@ -334,7 +341,6 @@ async fn glob(
 
 #[derive(Deserialize)]
 struct GrepIn {
-    handle: String,
     pattern: String,
     path: Option<String>,
     include: Option<String>,
@@ -344,12 +350,13 @@ struct GrepIn {
 async fn grep(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<GrepIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let dir = state.engine.dir(&body.handle).await.map_err(map_err)?;
+    let dir = state.engine.dir(&id).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
     args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     if let Some(inc) = body.include {
@@ -361,7 +368,7 @@ async fn grep(
     Ok(Json(
         state
             .engine
-            .fs_tool(&body.handle, "grep", args)
+            .fs_tool(&id, "grep", args)
             .await
             .map_err(map_err)?,
     ))
@@ -369,13 +376,13 @@ async fn grep(
 
 #[derive(Deserialize)]
 struct BootstrapIn {
-    handle: String,
     kind: BootstrapKind,
 }
 
 async fn bootstrap(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<BootstrapIn>,
 ) -> Result<Json<ToolText>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -384,26 +391,21 @@ async fn bootstrap(
     Ok(Json(
         state
             .engine
-            .bootstrap(&body.handle, &body.kind)
+            .bootstrap(&id, &body.kind)
             .await
             .map_err(map_err)?,
     ))
 }
 
-#[derive(Deserialize)]
-struct SnapshotIn {
-    handle: String,
-}
-
 async fn snapshot(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
-    Json(body): Json<SnapshotIn>,
+    Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let bytes = state.engine.snapshot(&body.handle).await.map_err(map_err)?;
+    let bytes = state.engine.snapshot(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({
         "bytes": bytes.len(),
         "archive_b64": store::b64_encode(&bytes),
@@ -412,13 +414,13 @@ async fn snapshot(
 
 #[derive(Deserialize)]
 struct RestoreIn {
-    handle: String,
     archive_b64: String,
 }
 
 async fn restore(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
+    Path(id): Path<String>,
     Json(body): Json<RestoreIn>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
@@ -426,70 +428,74 @@ async fn restore(
     }
     let bytes = store::b64_decode(&body.archive_b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    state
-        .engine
-        .restore(&body.handle, &bytes)
-        .await
-        .map_err(map_err)?;
+    state.engine.restore(&id, &bytes).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true, "bytes": bytes.len()})))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::HttpExecutor;
-    use crate::{Executor, FsWriteRequest};
+    use crate::sandbox_http::SandboxExecutor;
+    use crate::{AllocRequest, BackendKind, Executor, FsWriteRequest};
 
     #[tokio::test]
-    async fn pool_capacity_snapshot_restore() {
-        let root = std::env::temp_dir().join(format!("rupi-execd-scale-{}", uuid::Uuid::new_v4()));
+    async fn sandbox_api_is_not_execd() {
+        let root = std::env::temp_dir().join(format!("rupi-sb-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let (addr, _h) = spawn(ExecdConfig {
+        let (addr, _h) = spawn(SandboxdConfig {
             bind: "127.0.0.1:0".into(),
             root: root.clone(),
-            token: "t".into(),
-            max_workspaces: 1,
-            warm_pool: 1,
+            token: "sb".into(),
+            max_sandboxes: 2,
+            warm_pool: 0,
+            region: "eu-west".into(),
         })
         .await
         .unwrap();
-        let exec = HttpExecutor::new(format!("http://{addr}"), "t");
+        let exec = SandboxExecutor::new(format!("http://{addr}"), "sb");
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let a = exec.alloc("ten", "s1").await.unwrap();
+        assert_eq!(exec.backend_name(), "sandbox");
+        let h = exec
+            .alloc_pref(&AllocRequest::new("ten", "s1").with_kind(BackendKind::Sandbox))
+            .await
+            .unwrap();
+        assert_eq!(h.kind.as_deref(), Some("sandbox"));
+        assert_eq!(h.region.as_deref(), Some("eu-west"));
         exec.fs_write(
-            &a,
+            &h,
             FsWriteRequest {
-                path: "keep.txt".into(),
-                content: "snap-me".into(),
+                path: "box.txt".into(),
+                content: "sandbox-ok".into(),
             },
         )
         .await
         .unwrap();
-        let blob = exec.snapshot(&a).await.unwrap();
-        assert!(blob.len() > 20);
-        assert!(crate::is_pool_exhausted(
-            &exec.alloc("ten", "s2").await.unwrap_err()
-        ));
-        exec.release(&a).await.unwrap();
-        let b = exec.alloc("ten", "s2").await.unwrap();
-        exec.restore(&b, &blob).await.unwrap();
         let got = exec
             .fs_read(
-                &b,
+                &h,
                 crate::FsReadRequest {
-                    path: "keep.txt".into(),
+                    path: "box.txt".into(),
                     offset: None,
                     limit: None,
                 },
             )
             .await
             .unwrap();
-        assert!(got.content.contains("snap-me"), "{}", got.content);
+        assert!(got.content.contains("sandbox-ok"), "{}", got.content);
         let st = exec.stats().await.unwrap();
-        assert_eq!(st.capacity, 1);
+        assert_eq!(st.backend, "sandbox");
         assert_eq!(st.used, 1);
-        exec.destroy(&b).await.unwrap();
+        // 协议面：sandbox 没有 /v1/alloc（那是 execd）。
+        let miss = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/alloc"))
+            .bearer_auth("sb")
+            .json(&serde_json::json!({"tenant_id":"t","session_id":"s"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status().as_u16(), 404, "sandboxd must not speak execd /v1/alloc");
+        exec.destroy(&h).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }
