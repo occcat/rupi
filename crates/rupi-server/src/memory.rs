@@ -1,5 +1,6 @@
 //! 云记忆：权威在 Postgres。`MEMORY.md` 不是主存。
 
+use crate::cache::Cache;
 use crate::db::{self, PgPool};
 use async_trait::async_trait;
 use rupi_core::ToolDefinition;
@@ -10,14 +11,16 @@ pub struct PostgresMemory {
     pool: PgPool,
     tenant_id: String,
     session_id: String,
+    cache: Cache,
 }
 
 impl PostgresMemory {
-    pub fn new(pool: PgPool, tenant_id: String, session_id: String) -> Self {
+    pub fn new(pool: PgPool, tenant_id: String, session_id: String, cache: Cache) -> Self {
         Self {
             pool,
             tenant_id,
             session_id,
+            cache,
         }
     }
 
@@ -125,6 +128,10 @@ impl MemoryProvider for PostgresMemory {
                         entry,
                     )
                     .await?;
+                    self.cache.invalidate_memory(&self.tenant_id).await;
+                    self.cache
+                        .invalidate_session(&self.tenant_id, &self.session_id)
+                        .await;
                 }
                 "replace" | "remove" => {
                     // 第一刀：追加一条说明性写入，权威仍在库。
@@ -136,6 +143,7 @@ impl MemoryProvider for PostgresMemory {
                         &format!("[{op}] {entry}"),
                     )
                     .await?;
+                    self.cache.invalidate_memory(&self.tenant_id).await;
                 }
                 _ => anyhow::bail!("unknown memory op: {op}"),
             }

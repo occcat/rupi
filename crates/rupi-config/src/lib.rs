@@ -530,18 +530,57 @@ fn read_optional(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// `Settings::load` 读进程 `HOME`（`~/.pi/agent/settings.json`）。
+    /// 并行改 HOME 会让坏 JSON 用例读到隔壁 `.pi` 夹具；macOS 大小写不敏感盘上更明显。
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn isolated_base(tag: &str) -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rupi-cfg-{tag}-{}-{n}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn write(dir: &Path, name: &str, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(name), body).unwrap();
     }
 
+    fn with_isolated_home(user: &Path, f: impl FnOnce()) {
+        let g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::fs::create_dir_all(user).unwrap();
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", user.as_os_str()) };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("HOME", v) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        drop(g);
+        if let Err(e) = res {
+            std::panic::resume_unwind(e);
+        }
+    }
+
     #[test]
     fn project_overrides_global_nested_compaction() {
-        let base = std::env::temp_dir().join(format!("rupi-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = isolated_base("merge");
         let home = base.join("home");
         let proj = base.join("proj");
+        let empty_user = base.join("empty-home");
         write(
             &home,
             "settings.json",
@@ -552,22 +591,23 @@ mod tests {
             "settings.json",
             r#"{"compaction":{"reserveTokens":8192},"tools":["read","bash"]}"#,
         );
-        let s = Settings::load(&home, &proj);
-        assert_eq!(s.theme(), "dark");
-        assert_eq!(s.model.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(s.reserve_tokens(), 8192);
-        assert_eq!(s.compaction_enabled(), true);
-        assert_eq!(
-            s.tools.as_deref(),
-            Some(&["read".into(), "bash".into()][..])
-        );
+        with_isolated_home(&empty_user, || {
+            let s = Settings::load(&home, &proj);
+            assert_eq!(s.theme(), "dark");
+            assert_eq!(s.model.as_deref(), Some("gpt-4o-mini"));
+            assert_eq!(s.reserve_tokens(), 8192);
+            assert_eq!(s.compaction_enabled(), true);
+            assert_eq!(
+                s.tools.as_deref(),
+                Some(&["read".into(), "bash".into()][..])
+            );
+        });
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn rupi_keys_win_over_pi_and_core_keys_roundtrip() {
-        let base = std::env::temp_dir().join(format!("rupi-cfg-pi-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = isolated_base("pi");
         let home = base.join("rupi-home");
         let user = base.join("user");
         let proj = base.join("proj");
@@ -591,20 +631,15 @@ mod tests {
             "settings.json",
             r#"{"enabledModels":["openai/gpt-4o-mini"],"defaultProjectTrust":"never"}"#,
         );
-        let saved = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", user.as_os_str()) };
-        let s = Settings::load(&home, &proj);
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        assert_eq!(s.steering_mode_str(), "one-at-a-time");
-        assert_eq!(s.follow_up_mode_str(), "all");
-        assert_eq!(s.project_trust(), ProjectTrust::Never);
-        assert_eq!(s.external_editor(), Some("hx"));
-        assert_eq!(s.enabled_models, vec!["openai/gpt-4o-mini".to_string()]);
-        assert_eq!(s.model.as_deref(), Some("from-pi"));
+        with_isolated_home(&user, || {
+            let s = Settings::load(&home, &proj);
+            assert_eq!(s.steering_mode_str(), "one-at-a-time");
+            assert_eq!(s.follow_up_mode_str(), "all");
+            assert_eq!(s.project_trust(), ProjectTrust::Never);
+            assert_eq!(s.external_editor(), Some("hx"));
+            assert_eq!(s.enabled_models, vec!["openai/gpt-4o-mini".to_string()]);
+            assert_eq!(s.model.as_deref(), Some("from-pi"));
+        });
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -680,11 +715,21 @@ mod tests {
 
     #[test]
     fn bad_json_is_ignored() {
-        let base = std::env::temp_dir().join(format!("rupi-cfg-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        write(&base, "settings.json", "{nope");
-        let s = Settings::load(&base, &base);
-        assert_eq!(s, Settings::default());
+        let base = isolated_base("bad");
+        let home = base.join("home");
+        let proj = base.join("proj");
+        let empty_home = base.join("empty-home");
+        write(&home, "settings.json", "{nope");
+        write(&home.join(".rupi"), "settings.json", "{also not");
+        write(&proj, "settings.json", "{nope");
+        write(&proj.join(".rupi"), "settings.json", "{also not");
+        write(&proj.join(".pi"), "settings.json", "{nope");
+        // Isolate HOME so a sibling test's `~/.pi/agent/settings.json` cannot
+        // leak into this process (the macOS CI flake).
+        with_isolated_home(&empty_home, || {
+            assert_eq!(Settings::load(&home, &proj), Settings::default());
+            assert_eq!(Settings::load(&home, &home), Settings::default());
+        });
         let _ = std::fs::remove_dir_all(&base);
     }
 }

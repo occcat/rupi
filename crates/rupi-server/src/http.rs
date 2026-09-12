@@ -1,6 +1,7 @@
 use crate::agui::RunAgentInput;
 use crate::auth;
 use crate::db::{self, Tenant};
+use crate::reclaim;
 use crate::run::{self, Preflight};
 use crate::App;
 use axum::extract::{Path, Query, State};
@@ -9,17 +10,21 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use rupi_core::CancelFlag;
 use rupi_memory::{export_tree_html, export_tree_jsonl, import_jsonl, remap_tree};
 use rupi_runtime::{BootstrapKind, WorkspaceHandle};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use uuid::Uuid;
 
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(ready))
         .route("/v1/me", get(me))
         .route("/v1/settings", get(get_settings).patch(patch_settings))
         .route("/v1/models", get(models))
@@ -32,6 +37,33 @@ pub fn router(app: App) -> Router {
         .route("/v1/agent", post(agent_run))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(app)
+}
+
+async fn ready(State(app): State<App>) -> Json<Value> {
+    let pg = app.pool.get().await.is_ok();
+    Json(json!({
+        "instanceId": app.instance_id,
+        "postgres": pg,
+        "redis": app.cache.available().await
+    }))
+}
+
+struct CancelOnDrop<S> {
+    inner: S,
+    cancel: CancelFlag,
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 async fn tenant_of(app: &App, headers: &HeaderMap) -> Result<Tenant, Response> {
@@ -153,18 +185,24 @@ async fn create_session(
     Json(body): Json<CreateSession>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
     let t = tenant_of(&app, &headers).await?;
-    let n = db::count_sessions(&app.pool, &t.id).await.unwrap_or(0);
+    let n = db::count_hot_handles(&app.pool, &t.id).await.unwrap_or(0);
     if n >= t.max_handles as i64 {
         return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
     }
     let id = Uuid::new_v4().to_string();
-    let wh = app
-        .executor
-        .alloc(&t.id, &id)
-        .await
-        .map_err(|e| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response()
-        })?;
+    let wh = match alloc_workspace(&app, &t.id, &id).await {
+        Ok(h) => h,
+        Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error":"execution pool exhausted"})),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+        }
+    };
     let kind = match body.bootstrap.as_deref() {
         Some("git") => BootstrapKind::Git {
             url: body.git_url.unwrap_or_default(),
@@ -191,7 +229,7 @@ async fn create_session(
 
 async fn list_sessions(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, Response> {
     let t = tenant_of(&app, &headers).await?;
-    let rows = db::list_sessions(&app.pool, &t.id).await.map_err(|e| {
+    let rows = db::list_sessions(app.reader(), &t.id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
     })?;
     Ok(Json(json!({
@@ -220,7 +258,7 @@ async fn delete_session(
 ) -> Result<StatusCode, Response> {
     let t = tenant_of(&app, &headers).await?;
     let row = session_guard(&app, &t, &id).await?;
-    if let (Some(b), Some(h)) = (row.runtime_backend, row.runtime_handle) {
+    if let (Some(b), Some(h)) = (row.runtime_backend.clone(), row.runtime_handle.clone()) {
         let _ = app
             .executor
             .destroy(&WorkspaceHandle {
@@ -228,6 +266,9 @@ async fn delete_session(
                 backend: b,
             })
             .await;
+    }
+    if let Some(key) = row.snapshot_key.as_deref() {
+        let _ = app.object_store.delete(key).await;
     }
     let _ = db::delete_session(&app.pool, &t.id, &id).await;
     app.cache.invalidate_session(&t.id, &id).await;
@@ -276,9 +317,19 @@ async fn duplicate(
     }
     let new_tree = remap_tree(&tree, path_only);
     let new_id = Uuid::new_v4().to_string();
-    let wh = app.executor.alloc(&t.id, &new_id).await.map_err(|e| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response()
-    })?;
+    let wh = match alloc_workspace(app, &t.id, &new_id).await {
+        Ok(h) => h,
+        Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error":"execution pool exhausted"})),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+        }
+    };
     let _ = app.executor.bootstrap(&wh, BootstrapKind::Empty).await;
     let row = db::insert_session(
         &app.pool,
@@ -366,10 +417,14 @@ async fn agent_run(
             let st = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
             Ok((st, Json(body)).into_response())
         }
-        Preflight::Stream(rx, _join) => {
-            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
+        Preflight::Stream(rx, cancel) => {
+            let inner = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
                 Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
             });
+            let stream = CancelOnDrop {
+                inner,
+                cancel,
+            };
             Ok(Sse::new(stream)
                 .keep_alive(axum::response::sse::KeepAlive::default())
                 .into_response())
@@ -377,7 +432,37 @@ async fn agent_run(
     }
 }
 
+async fn alloc_workspace(
+    app: &App,
+    tenant_id: &str,
+    session_id: &str,
+) -> anyhow::Result<WorkspaceHandle> {
+    match app.executor.alloc(tenant_id, session_id).await {
+        Ok(h) => {
+            app.cache.clear_missing_session(tenant_id, session_id).await;
+            Ok(h)
+        }
+        Err(e) if rupi_runtime::is_pool_exhausted(&e) => {
+            if reclaim::preempt_one(app, tenant_id).await {
+                let h = app.executor.alloc(tenant_id, session_id).await?;
+                app.cache.clear_missing_session(tenant_id, session_id).await;
+                Ok(h)
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {
+    let status = if row.workspace_state.as_deref() == Some("snapshotted") {
+        "snapshotted"
+    } else if row.runtime_handle.is_some() {
+        "ready"
+    } else {
+        "none"
+    };
     let mut v = json!({
         "id": row.id,
         "name": row.name,
@@ -387,8 +472,9 @@ fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {
         "runtime": {
             "backend": row.runtime_backend,
             "handle": row.runtime_handle,
-            "status": if row.runtime_handle.is_some() { "ready" } else { "none" }
+            "status": status
         },
+        "runId": row.run_id,
         "parentSession": row.parent_session,
         "createdAt": row.created_at,
         "updatedAt": row.updated_at

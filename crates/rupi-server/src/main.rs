@@ -10,12 +10,24 @@ struct Cli {
     listen: String,
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
+    /// 只读副本，可选。hydrate / 写路径仍走主库。
+    #[arg(long, env = "DATABASE_READ_URL")]
+    database_read_url: Option<String>,
     #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
-    #[arg(long, env = "RUPI_EXECUTOR_URL")]
+    #[arg(long, env = "RUPI_EXECUTOR_URL", default_value = "")]
     executor_url: String,
+    /// 逗号分隔的多个 execd。优先于单个 URL。
+    #[arg(long, env = "RUPI_EXECUTOR_URLS", default_value = "")]
+    executor_urls: String,
     #[arg(long, env = "RUPI_EXEC_TOKEN", default_value = "")]
     executor_token: String,
+    #[arg(long, env = "RUPI_INSTANCE_ID")]
+    instance_id: Option<String>,
+    #[arg(long, env = "RUPI_SNAPSHOT_DIR", default_value = "/tmp/rupi-snapshots")]
+    snapshot_dir: String,
+    #[arg(long, env = "RUPI_IDLE_SECS", default_value_t = 1800)]
+    idle_secs: u64,
     /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
     #[arg(long)]
     bootstrap_tenant: Option<String>,
@@ -30,12 +42,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let urls: Vec<String> = cli
+        .executor_urls
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
     let cfg = CloudConfig {
         database_url: cli.database_url,
+        database_read_url: cli.database_read_url,
         redis_url: cli.redis_url,
         executor_url: cli.executor_url,
+        executor_urls: urls,
         executor_token: cli.executor_token,
         bind: cli.listen,
+        instance_id: cli
+            .instance_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        snapshot_dir: cli.snapshot_dir,
+        idle_secs: cli.idle_secs,
     };
     if let Some(name) = cli.bootstrap_tenant {
         let pool = db::connect(&cfg.database_url).await?;

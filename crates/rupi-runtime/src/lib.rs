@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod execd;
 pub mod http;
+pub mod pool;
+pub mod store;
+
+pub use pool::{is_pool_exhausted, PoolExhausted, PoolNode, PoolScheduler};
+pub use store::{LocalObjectStore, ObjectStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceHandle {
@@ -96,6 +101,16 @@ impl ToolText {
     }
 }
 
+/// 单节点容量。调度器用它挑最闲的 `rupi-execd`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutorStats {
+    pub backend: String,
+    pub node_id: String,
+    pub used: u32,
+    pub capacity: u32,
+    pub warm: u32,
+}
+
 /// 可插拔执行后端。控制面不得在默认路径上对本机 `sh -c`。
 #[async_trait]
 pub trait Executor: Send + Sync {
@@ -127,6 +142,26 @@ pub trait Executor: Send + Sync {
         handle: &WorkspaceHandle,
         kind: BootstrapKind,
     ) -> anyhow::Result<ToolText>;
+
+    /// 把工作区打成 tar.gz 字节。默认后端不支持。
+    async fn snapshot(&self, _handle: &WorkspaceHandle) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("snapshot not supported by this backend")
+    }
+
+    /// 把快照解到已 alloc 的句柄。默认后端不支持。
+    async fn restore(&self, _handle: &WorkspaceHandle, _blob: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("restore not supported by this backend")
+    }
+
+    async fn stats(&self) -> anyhow::Result<ExecutorStats> {
+        Ok(ExecutorStats {
+            backend: self.backend_name().into(),
+            node_id: self.backend_name().into(),
+            used: 0,
+            capacity: 0,
+            warm: 0,
+        })
+    }
 }
 
 #[cfg(test)]

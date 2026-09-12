@@ -36,10 +36,13 @@ impl HttpExecutor {
         let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 || text.contains("pool_exhausted") {
+            return Err(crate::PoolExhausted.into());
+        }
         if !status.is_success() {
             anyhow::bail!("executor {path} {status}: {text}");
         }
-        Ok(serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))?)
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
     }
 }
 
@@ -236,5 +239,49 @@ impl Executor for HttpExecutor {
             },
         )
         .await
+    }
+
+    async fn snapshot(&self, handle: &WorkspaceHandle) -> anyhow::Result<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct Out {
+            archive_b64: String,
+        }
+        let out: Out = self
+            .post("/v1/snapshot", &HandleBody { handle: &handle.id })
+            .await?;
+        crate::store::b64_decode(&out.archive_b64)
+    }
+
+    async fn restore(&self, handle: &WorkspaceHandle, blob: &[u8]) -> anyhow::Result<()> {
+        #[derive(Serialize)]
+        struct In<'a> {
+            handle: &'a str,
+            archive_b64: String,
+        }
+        let _: serde_json::Value = self
+            .post(
+                "/v1/restore",
+                &In {
+                    handle: &handle.id,
+                    archive_b64: crate::store::b64_encode(blob),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn stats(&self) -> anyhow::Result<crate::ExecutorStats> {
+        let url = format!("{}/v1/stats", self.base);
+        let mut req = self.client.get(&url);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("executor /v1/stats {status}: {text}");
+        }
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
     }
 }

@@ -98,14 +98,49 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
           runs INT NOT NULL DEFAULT 0,
           PRIMARY KEY (tenant_id, day)
         );
+        CREATE TABLE IF NOT EXISTS workspace_snapshots (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          object_key TEXT NOT NULL,
+          bytes BIGINT NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS snapshots_session ON workspace_snapshots(tenant_id, session_id);
         "#,
     )
     .await?;
+    let _ = c
+        .batch_execute(
+            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_runs_per_day INT NOT NULL DEFAULT 10000;
+             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_tokens_per_day BIGINT NOT NULL DEFAULT 100000000;
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS instance_id TEXT;
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace_state TEXT NOT NULL DEFAULT 'hot';
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS snapshot_key TEXT;
+             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;",
+        )
+        .await;
     let _ = c.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;").await;
     let _ = c
         .batch_execute(
             "CREATE INDEX IF NOT EXISTS memories_trgm ON memories USING gin (content gin_trgm_ops);
-             CREATE INDEX IF NOT EXISTS messages_trgm ON messages USING gin (content gin_trgm_ops);",
+             CREATE INDEX IF NOT EXISTS messages_trgm ON messages USING gin (content gin_trgm_ops);
+             CREATE INDEX IF NOT EXISTS messages_tenant_created ON messages(tenant_id, created_at DESC);
+             CREATE INDEX IF NOT EXISTS memories_tenant_created ON memories(tenant_id, created_at DESC);
+             CREATE INDEX IF NOT EXISTS sessions_tenant_run ON sessions(tenant_id) WHERE run_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS sessions_idle ON sessions(tenant_id, last_used_at)
+               WHERE workspace_state = 'hot';",
+        )
+        .await;
+    // FTS：simple 配置对中英都可用；查询仍带 tenant_id，按 tenant 分区时可剪枝。
+    let _ = c
+        .batch_execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
+               GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED;
+             ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
+               GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED;
+             CREATE INDEX IF NOT EXISTS messages_tsv ON messages USING gin (content_tsv);
+             CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (content_tsv);",
         )
         .await;
     Ok(())
@@ -119,6 +154,8 @@ pub struct Tenant {
     pub default_model: Option<String>,
     pub max_concurrent_runs: i32,
     pub max_handles: i32,
+    pub max_runs_per_day: i32,
+    pub max_tokens_per_day: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +174,10 @@ pub struct SessionRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub run_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub workspace_state: Option<String>,
+    pub snapshot_key: Option<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,39 +216,46 @@ pub async fn load_tenant(pool: &PgPool, id: &str) -> anyhow::Result<Option<Tenan
     let c = pool.get().await?;
     let row = c
         .query_opt(
-            "SELECT id, name, settings, default_model, max_concurrent_runs, max_handles
+            "SELECT id, name, settings, default_model, max_concurrent_runs, max_handles,
+                    COALESCE(max_runs_per_day, 10000), COALESCE(max_tokens_per_day, 100000000)
              FROM tenants WHERE id = $1",
             &[&id],
         )
         .await?;
-    Ok(row.map(|r| Tenant {
-        id: r.get(0),
-        name: r.get(1),
-        settings: r.get(2),
-        default_model: r.get(3),
-        max_concurrent_runs: r.get(4),
-        max_handles: r.get(5),
-    }))
+    Ok(row.map(map_tenant))
 }
 
 pub async fn tenant_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Option<Tenant>> {
     let c = pool.get().await?;
     let row = c
         .query_opt(
-            "SELECT t.id, t.name, t.settings, t.default_model, t.max_concurrent_runs, t.max_handles
+            "SELECT t.id, t.name, t.settings, t.default_model, t.max_concurrent_runs, t.max_handles,
+                    COALESCE(t.max_runs_per_day, 10000), COALESCE(t.max_tokens_per_day, 100000000)
              FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
              WHERE k.key_hash = $1",
             &[&hash],
         )
         .await?;
-    Ok(row.map(|r| Tenant {
+    Ok(row.map(map_tenant))
+}
+
+fn map_tenant(r: tokio_postgres::Row) -> Tenant {
+    Tenant {
         id: r.get(0),
         name: r.get(1),
         settings: r.get(2),
         default_model: r.get(3),
         max_concurrent_runs: r.get(4),
         max_handles: r.get(5),
-    }))
+        max_runs_per_day: r.get(6),
+        max_tokens_per_day: r.get(7),
+    }
+}
+
+pub async fn list_tenant_ids(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+    let c = pool.get().await?;
+    let rows = c.query("SELECT id FROM tenants", &[]).await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 pub async fn update_settings(pool: &PgPool, tenant_id: &str, settings: &Value) -> anyhow::Result<()> {
@@ -236,12 +284,16 @@ fn map_session(r: &tokio_postgres::Row) -> SessionRow {
         created_at: r.get(11),
         updated_at: r.get(12),
         run_id: r.get(13),
+        instance_id: r.get(14),
+        workspace_state: r.get(15),
+        snapshot_key: r.get(16),
+        last_used_at: r.get(17),
     }
 }
 
 const SESSION_COLS: &str = "id, tenant_id, name, model, thinking_level, auto_compaction,
     runtime_backend, runtime_handle, parent_session, summary, summary_through,
-    created_at, updated_at, run_id";
+    created_at, updated_at, run_id, instance_id, workspace_state, snapshot_key, last_used_at";
 
 pub async fn insert_session(
     pool: &PgPool,
@@ -255,8 +307,8 @@ pub async fn insert_session(
 ) -> anyhow::Result<SessionRow> {
     let c = pool.get().await?;
     c.execute(
-        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO sessions(id, tenant_id, name, model, runtime_backend, runtime_handle, parent_session, workspace_state, last_used_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7, 'hot', now())",
         &[&id, &tenant_id, &name, &model, &backend, &handle, &parent],
     )
     .await?;
@@ -313,6 +365,35 @@ pub async fn count_sessions(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i6
     Ok(n)
 }
 
+/// 并发句柄：热卷才占配额；已 snapshot 的不占执行池。
+pub async fn count_hot_handles(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i64> {
+    let c = pool.get().await?;
+    let n: i64 = c
+        .query_one(
+            "SELECT count(*) FROM sessions
+             WHERE tenant_id = $1
+               AND runtime_handle IS NOT NULL
+               AND COALESCE(workspace_state, 'hot') <> 'snapshotted'",
+            &[&tenant_id],
+        )
+        .await?
+        .get(0);
+    Ok(n)
+}
+
+pub async fn count_active_runs(pool: &PgPool, tenant_id: &str) -> anyhow::Result<i64> {
+    let c = pool.get().await?;
+    let n: i64 = c
+        .query_one(
+            "SELECT count(*) FROM sessions
+             WHERE tenant_id = $1 AND run_id IS NOT NULL AND run_id <> ''",
+            &[&tenant_id],
+        )
+        .await?
+        .get(0);
+    Ok(n)
+}
+
 pub async fn update_session_meta(
     pool: &PgPool,
     tenant_id: &str,
@@ -359,24 +440,189 @@ pub async fn set_run_id(
     tenant_id: &str,
     id: &str,
     run_id: Option<&str>,
+    instance_id: Option<&str>,
 ) -> anyhow::Result<bool> {
     let c = pool.get().await?;
     let n = if let Some(rid) = run_id {
         c.execute(
-            "UPDATE sessions SET run_id = $3, updated_at = now()
+            "UPDATE sessions SET run_id = $3, instance_id = $4, last_used_at = now(), updated_at = now()
              WHERE id = $1 AND tenant_id = $2 AND (run_id IS NULL OR run_id = '')",
-            &[&id, &tenant_id, &rid],
+            &[&id, &tenant_id, &rid, &instance_id],
         )
         .await?
     } else {
         c.execute(
-            "UPDATE sessions SET run_id = NULL, updated_at = now()
+            "UPDATE sessions SET run_id = NULL, instance_id = NULL, updated_at = now()
              WHERE id = $1 AND tenant_id = $2",
             &[&id, &tenant_id],
         )
         .await?
     };
     Ok(n > 0)
+}
+
+pub async fn clear_run_id(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    run_id: &str,
+) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE sessions SET run_id = NULL, instance_id = NULL, updated_at = now()
+             WHERE id = $1 AND tenant_id = $2 AND run_id = $3",
+            &[&id, &tenant_id, &run_id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn touch_run(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    run_id: &str,
+) -> anyhow::Result<bool> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE sessions SET last_used_at = now(), updated_at = now()
+             WHERE id = $1 AND tenant_id = $2 AND run_id = $3",
+            &[&id, &tenant_id, &run_id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn touch_session(pool: &PgPool, tenant_id: &str, id: &str) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE sessions SET last_used_at = now(), updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// 副本被杀后 Redis 租约过期，但 PG `run_id` 可能残留。扫掉超过 `older_secs` 没心跳的。
+pub async fn reap_stale_runs(pool: &PgPool, older_secs: i64) -> anyhow::Result<u64> {
+    let c = pool.get().await?;
+    let n = c
+        .execute(
+            "UPDATE sessions SET run_id = NULL, instance_id = NULL, updated_at = now()
+             WHERE run_id IS NOT NULL
+               AND updated_at < now() - ($1::double precision * interval '1 second')",
+            &[&(older_secs as f64)],
+        )
+        .await?;
+    Ok(n)
+}
+
+pub async fn mark_snapshotted(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    snapshot_key: &str,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE sessions SET workspace_state = 'snapshotted', runtime_handle = NULL,
+                snapshot_key = $3, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id, &snapshot_key],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_hot(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: &str,
+    backend: &str,
+    handle: &str,
+    snapshot_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let c = pool.get().await?;
+    c.execute(
+        "UPDATE sessions SET workspace_state = 'hot', runtime_backend = $3, runtime_handle = $4,
+                snapshot_key = COALESCE($5, snapshot_key), last_used_at = now(), updated_at = now()
+         WHERE id = $1 AND tenant_id = $2",
+        &[&id, &tenant_id, &backend, &handle, &snapshot_key],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn insert_snapshot(
+    pool: &PgPool,
+    tenant_id: &str,
+    session_id: &str,
+    object_key: &str,
+    bytes: i64,
+) -> anyhow::Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let c = pool.get().await?;
+    c.execute(
+        "INSERT INTO workspace_snapshots(id, tenant_id, session_id, object_key, bytes)
+         VALUES ($1,$2,$3,$4,$5)",
+        &[&id, &tenant_id, &session_id, &object_key, &bytes],
+    )
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_reclaim_candidates(
+    pool: &PgPool,
+    tenant_id: Option<&str>,
+    min_idle: std::time::Duration,
+    limit: i64,
+) -> anyhow::Result<Vec<SessionRow>> {
+    let c = pool.get().await?;
+    let secs = min_idle.as_secs_f64();
+    let rows = if let Some(tid) = tenant_id {
+        c.query(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions
+                 WHERE tenant_id = $1
+                   AND COALESCE(workspace_state, 'hot') = 'hot'
+                   AND runtime_handle IS NOT NULL
+                   AND (run_id IS NULL OR run_id = '')
+                   AND COALESCE(last_used_at, created_at) <= now() - ($2::double precision * interval '1 second')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM interrupts i
+                     WHERE i.session_id = sessions.id AND i.tenant_id = sessions.tenant_id
+                       AND i.status = 'pending'
+                   )
+                 ORDER BY COALESCE(last_used_at, created_at) ASC
+                 LIMIT $3"
+            ),
+            &[&tid, &secs, &limit],
+        )
+        .await?
+    } else {
+        c.query(
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions
+                 WHERE COALESCE(workspace_state, 'hot') = 'hot'
+                   AND runtime_handle IS NOT NULL
+                   AND (run_id IS NULL OR run_id = '')
+                   AND COALESCE(last_used_at, created_at) <= now() - ($1::double precision * interval '1 second')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM interrupts i
+                     WHERE i.session_id = sessions.id AND i.tenant_id = sessions.tenant_id
+                       AND i.status = 'pending'
+                   )
+                 ORDER BY COALESCE(last_used_at, created_at) ASC
+                 LIMIT $2"
+            ),
+            &[&secs, &limit],
+        )
+        .await?
+    };
+    Ok(rows.iter().map(map_session).collect())
 }
 
 pub async fn persist_tree(
@@ -573,14 +819,33 @@ pub async fn search_memories(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let c = pool.get().await?;
     let like = format!("%{query}%");
-    let rows = c
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows = match c
         .query(
             "SELECT scope, content FROM memories
-             WHERE tenant_id = $1 AND content ILIKE $2
-             ORDER BY created_at DESC LIMIT $3",
-            &[&tenant_id, &like, &limit],
+             WHERE tenant_id = $1 AND (
+               content ILIKE $2
+               OR content_tsv @@ plainto_tsquery('simple', $3)
+             )
+             ORDER BY created_at DESC LIMIT $4",
+            &[&tenant_id, &like, &q, &limit],
         )
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            c.query(
+                "SELECT scope, content FROM memories
+                 WHERE tenant_id = $1 AND content ILIKE $2
+                 ORDER BY created_at DESC LIMIT $3",
+                &[&tenant_id, &like, &limit],
+            )
+            .await?
+        }
+    };
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
@@ -592,14 +857,33 @@ pub async fn search_sessions(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let c = pool.get().await?;
     let like = format!("%{query}%");
-    let rows = c
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows = match c
         .query(
             "SELECT session_id, content FROM messages
-             WHERE tenant_id = $1 AND content ILIKE $2
-             ORDER BY created_at DESC LIMIT $3",
-            &[&tenant_id, &like, &limit],
+             WHERE tenant_id = $1 AND (
+               content ILIKE $2
+               OR content_tsv @@ plainto_tsquery('simple', $3)
+             )
+             ORDER BY created_at DESC LIMIT $4",
+            &[&tenant_id, &like, &q, &limit],
         )
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            c.query(
+                "SELECT session_id, content FROM messages
+                 WHERE tenant_id = $1 AND content ILIKE $2
+                 ORDER BY created_at DESC LIMIT $3",
+                &[&tenant_id, &like, &limit],
+            )
+            .await?
+        }
+    };
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
@@ -706,7 +990,8 @@ pub async fn today_quota(pool: &PgPool, tenant_id: &str) -> anyhow::Result<(i64,
     let c = pool.get().await?;
     let row = c
         .query_opt(
-            "SELECT tokens, runs FROM quota_ledger WHERE tenant_id = $1 AND day = CURRENT_DATE",
+            "SELECT COALESCE(tokens, 0)::bigint, COALESCE(runs, 0)::bigint
+             FROM quota_ledger WHERE tenant_id = $1 AND day = CURRENT_DATE",
             &[&tenant_id],
         )
         .await?;
@@ -719,7 +1004,7 @@ pub async fn today_quota(pool: &PgPool, tenant_id: &str) -> anyhow::Result<(i64,
 pub async fn reset_all(pool: &PgPool) -> anyhow::Result<()> {
     let c = pool.get().await?;
     c.batch_execute(
-        "TRUNCATE interrupts, memories, messages, sessions, api_keys, quota_ledger, tenants CASCADE",
+        "TRUNCATE interrupts, memories, messages, sessions, api_keys, quota_ledger, workspace_snapshots, tenants CASCADE",
     )
     .await?;
     Ok(())
