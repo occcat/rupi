@@ -13,6 +13,8 @@ members = [
   "crates/rupi-cli",
   "crates/rupi-pkg",
   "crates/rupi-benches",
+  "crates/rupi-runtime",
+  "crates/rupi-server",
 ]
 resolver = "2"
 

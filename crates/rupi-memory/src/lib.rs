@@ -788,7 +788,7 @@ impl MemoryManager {
         name: &str,
         args: serde_json::Value,
     ) -> anyhow::Result<Option<String>> {
-        if name == "memory" {
+        if name == "memory" && self.store.memory_enabled {
             let op = args
                 .get("op")
                 .and_then(|v| v.as_str())
@@ -821,7 +821,7 @@ impl MemoryManager {
                 "memory updated (live). Takes effect in prompt next session.\n{live}"
             )));
         }
-        if name == "memory_search" {
+        if name == "memory_search" && self.store.memory_enabled {
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -864,7 +864,7 @@ impl MemoryManager {
                 .collect();
             return Ok(Some(lines.join("\n---\n")));
         }
-        if name == "session_search" {
+        if name == "session_search" && self.store.memory_enabled {
             // 会话是“聊过的”：跨会话 FTS，按 session_id 分组展示，snippet 即上下文。
             let query = args
                 .get("query")

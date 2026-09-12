@@ -1,0 +1,49 @@
+//! `rupi-server`：无状态控制面。不链 TUI。
+
+use clap::Parser;
+use rupi_server::{auth, db, CloudConfig};
+
+#[derive(Parser)]
+#[command(name = "rupi-server", about = "Rupi cloud control plane")]
+struct Cli {
+    #[arg(long, env = "RUPI_LISTEN", default_value = "127.0.0.1:8080")]
+    listen: String,
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: String,
+    #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
+    #[arg(long, env = "RUPI_EXECUTOR_URL")]
+    executor_url: String,
+    #[arg(long, env = "RUPI_EXEC_TOKEN", default_value = "")]
+    executor_token: String,
+    /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
+    #[arg(long)]
+    bootstrap_tenant: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let cli = Cli::parse();
+    let cfg = CloudConfig {
+        database_url: cli.database_url,
+        redis_url: cli.redis_url,
+        executor_url: cli.executor_url,
+        executor_token: cli.executor_token,
+        bind: cli.listen,
+    };
+    if let Some(name) = cli.bootstrap_tenant {
+        let pool = db::connect(&cfg.database_url).await?;
+        db::migrate(&pool).await?;
+        let key = auth::generate_key();
+        let t = db::create_tenant(&pool, &name, &key).await?;
+        println!("tenant_id={} key={key} name={}", t.id, t.name);
+        return Ok(());
+    }
+    rupi_server::serve(cfg).await
+}

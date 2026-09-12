@@ -1,0 +1,27 @@
+[package]
+name = "rupi-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "Cloud Executor trait and remote HTTP execution backend"
+
+[[bin]]
+name = "rupi-execd"
+path = "src/bin/rupi-execd.rs"
+
+[dependencies]
+rupi-core = { path = "../rupi-core" }
+rupi-tools = { path = "../rupi-tools" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tower-http = { version = "0.6", features = ["trace"] }
+clap = { workspace = true, features = ["env"] }
+tracing-subscriber = { workspace = true }
