@@ -115,6 +115,7 @@ function pill(k, v, ok) {
 }
 
 async function render() {
+  closeModal();
   if (!token()) {
     showLogin();
     return;
