@@ -15,9 +15,10 @@ pub mod tools;
 pub use cache::Cache;
 
 use crate::db::{PgPool, Tenant};
-use rupi_llm::LlmProvider;
+use rupi_llm::{LlmProvider, MockProvider};
 use rupi_runtime::Executor;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 pub type ProviderFactory = Arc<dyn Fn(&Tenant) -> Arc<dyn LlmProvider> + Send + Sync>;
@@ -28,11 +29,42 @@ pub struct App {
     pub cache: Cache,
     pub executor: Arc<dyn Executor>,
     pub provider_factory: ProviderFactory,
+    /// 租户级 mock 剧本必须跨 run 复用，否则每轮都从第一条重新开始。
+    mock_providers: Arc<Mutex<HashMap<String, Arc<MockProvider>>>>,
 }
 
 impl App {
+    pub fn new(
+        pool: PgPool,
+        cache: Cache,
+        executor: Arc<dyn Executor>,
+        provider_factory: ProviderFactory,
+    ) -> Self {
+        Self {
+            pool,
+            cache,
+            executor,
+            provider_factory,
+            mock_providers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     pub fn provider_for(&self, tenant: &Tenant) -> Arc<dyn LlmProvider> {
-        (self.provider_factory)(tenant)
+        {
+            let g = self.mock_providers.lock().unwrap();
+            if let Some(p) = g.get(&tenant.id) {
+                return p.clone();
+            }
+        }
+        if let Some(p) = run::cached_mock(tenant) {
+            self.mock_providers
+                .lock()
+                .unwrap()
+                .insert(tenant.id.clone(), p.clone());
+            p
+        } else {
+            (self.provider_factory)(tenant)
+        }
     }
 }
 
@@ -52,12 +84,12 @@ pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
         cfg.executor_url.clone(),
         cfg.executor_token.clone(),
     ));
-    Ok(App {
+    Ok(App::new(
         pool,
         cache,
         executor,
-        provider_factory: Arc::new(|t| run::default_provider(t)),
-    })
+        Arc::new(|t| run::default_provider(t)),
+    ))
 }
 
 pub async fn serve(cfg: CloudConfig) -> anyhow::Result<()> {

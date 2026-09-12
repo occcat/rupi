@@ -15,7 +15,6 @@ use rupi_runtime::{BootstrapKind, WorkspaceHandle};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 pub fn router(app: App) -> Router {
@@ -368,7 +367,7 @@ async fn agent_run(
             Ok((st, Json(body)).into_response())
         }
         Preflight::Stream(rx, _join) => {
-            let stream = ReceiverStream::new(rx).map(|ev| {
+            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
                 Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
             });
             Ok(Sse::new(stream)

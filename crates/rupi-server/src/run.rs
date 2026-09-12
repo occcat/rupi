@@ -22,8 +22,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub enum Preflight {
-    Stream(mpsc::Receiver<AguiEvent>, tokio::task::JoinHandle<()>),
+    Stream(mpsc::UnboundedReceiver<AguiEvent>, tokio::task::JoinHandle<()>),
     Status { code: u16, body: serde_json::Value },
+}
+
+fn emit(tx: &mpsc::UnboundedSender<AguiEvent>, ev: AguiEvent) {
+    let _ = tx.send(ev);
 }
 
 pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Preflight {
@@ -107,10 +111,10 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         };
     }
 
-    let (tx, rx) = mpsc::channel::<AguiEvent>(64);
+    let (tx, rx) = mpsc::unbounded_channel::<AguiEvent>();
     let handle = tokio::spawn(async move {
         if let Err(e) = drive(app.clone(), tenant, sess, input, tx.clone()).await {
-            let _ = tx.send(agui::run_error(&e.to_string(), None)).await;
+            emit(&tx, agui::run_error(&e.to_string(), None));
         }
     });
     Preflight::Stream(rx, handle)
@@ -121,16 +125,16 @@ async fn drive(
     tenant: Tenant,
     sess: db::SessionRow,
     input: RunAgentInput,
-    tx: mpsc::Sender<AguiEvent>,
+    tx: mpsc::UnboundedSender<AguiEvent>,
 ) -> anyhow::Result<()> {
-    let _ = tx
-        .send(agui::run_started(
+    emit(
+        &tx,
+        agui::run_started(
             &input.thread_id,
             &input.run_id,
             input.parent_run_id.as_deref(),
-        ))
-        .await;
-
+        ),
+    );
     apply_state(&app.pool, &tenant.id, &input).await?;
 
     let mut tree = {
@@ -150,7 +154,6 @@ async fn drive(
             t
         }
     };
-
     let handle = match (&sess.runtime_backend, &sess.runtime_handle) {
         (Some(b), Some(h)) => WorkspaceHandle {
             id: h.clone(),
@@ -196,11 +199,13 @@ async fn drive(
 
     let pending = db::pending_interrupts(&app.pool, &tenant.id, &input.thread_id).await?;
     let pending_ids: Vec<String> = pending.iter().map(|p| p.id.clone()).collect();
-    let _ = tx
-        .send(agui::messages_snapshot(tree_to_agui_messages(&tree)))
-        .await;
-    let _ = tx
-        .send(agui::state_snapshot(cloud_state(
+    emit(
+        &tx,
+        agui::messages_snapshot(tree_to_agui_messages(&tree)),
+    );
+    emit(
+        &tx,
+        agui::state_snapshot(cloud_state(
             &input.thread_id,
             sess.name.as_deref(),
             sess.model.as_deref(),
@@ -208,8 +213,8 @@ async fn drive(
             sess.auto_compaction,
             &pending_ids,
             sess.runtime_backend.as_deref(),
-        )))
-        .await;
+        )),
+    );
 
     let mut mapper = EventMapper::new(input.thread_id.clone(), input.run_id.clone());
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<rupi_core::AgentEvent>();
@@ -217,19 +222,16 @@ async fn drive(
     let map_task = tokio::spawn(async move {
         while let Some(ev) = ev_rx.recv().await {
             for a in mapper.map(&ev) {
-                let _ = map_tx.send(a).await;
+                emit(&map_tx, a);
             }
         }
         for a in mapper.finish_open() {
-            let _ = map_tx.send(a).await;
+            emit(&map_tx, a);
         }
     });
 
-    let on_event = {
-        let ev_tx = ev_tx.clone();
-        move |e: rupi_core::AgentEvent| {
-            let _ = ev_tx.send(e);
-        }
+    let on_event = move |e: rupi_core::AgentEvent| {
+        let _ = ev_tx.send(e);
     };
 
     let mut agent = AgentLoop::new(12)
@@ -291,13 +293,13 @@ async fn drive(
             .await
     };
 
-    drop(ev_tx);
+    drop(on_event);
     let _ = map_task.await;
 
     match result {
         Ok(_) => {}
         Err(e) => {
-            let _ = tx.send(agui::run_error(&e.to_string(), None)).await;
+            emit(&tx, agui::run_error(&e.to_string(), None));
             finish(&app, &tenant, &input.thread_id, &tree).await;
             return Ok(());
         }
@@ -320,24 +322,27 @@ async fn drive(
             .invalidate_session(&tenant.id, &input.thread_id)
             .await;
         let snap = db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?;
-        let _ = tx
-            .send(agui::messages_snapshot(tree_to_agui_messages(&snap)))
-            .await;
-        let _ = tx
-            .send(agui::state_snapshot(cloud_state(
+        emit(
+            &tx,
+            agui::messages_snapshot(tree_to_agui_messages(&snap)),
+        );
+        emit(
+            &tx,
+            agui::state_snapshot(cloud_state(
                 &input.thread_id,
                 sess.name.as_deref(),
                 sess.model.as_deref(),
                 sess.thinking_level.as_deref(),
                 sess.auto_compaction,
-                &[iid.clone()],
+                std::slice::from_ref(&iid),
                 sess.runtime_backend.as_deref(),
-            )))
-            .await;
+            )),
+        );
         quota::release_lease(&app.cache, &app.pool, &tenant.id, &input.thread_id).await;
         quota::release_run(&app.cache, &tenant.id).await;
-        let _ = tx
-            .send(agui::run_finished_interrupt(
+        emit(
+            &tx,
+            agui::run_finished_interrupt(
                 &input.thread_id,
                 &input.run_id,
                 vec![serde_json::json!({
@@ -354,16 +359,14 @@ async fn drive(
                         "required": ["approved"]
                     }
                 })],
-            ))
-            .await;
+            ),
+        );
     } else {
         finish(&app, &tenant, &input.thread_id, &tree).await;
-        let _ = tx
-            .send(agui::run_finished_success(
-                &input.thread_id,
-                &input.run_id,
-            ))
-            .await;
+        emit(
+            &tx,
+            agui::run_finished_success(&input.thread_id, &input.run_id),
+        );
     }
     Ok(())
 }
@@ -586,11 +589,11 @@ async fn finish(app: &App, tenant: &Tenant, thread: &str, tree: &SessionTree) {
     quota::release_run(&app.cache, &tenant.id).await;
 }
 
-/// 测试可注入剧本；默认 Mock（无 BYOK）或租户 settings 里的模型。
-pub fn default_provider(tenant: &Tenant) -> Arc<dyn LlmProvider> {
+/// 有 mock 剧本时返回可跨 run 复用的实例；由 [`crate::App`] 按租户缓存。
+pub fn cached_mock(tenant: &Tenant) -> Option<Arc<MockProvider>> {
     if let Some(script) = tenant.settings.get("mock_script") {
         if let Ok(resps) = serde_json::from_value::<Vec<rupi_llm::ChatResponse>>(script.clone()) {
-            return Arc::new(MockProvider::new(resps));
+            return Some(Arc::new(MockProvider::new(resps)));
         }
     }
     if tenant
@@ -607,13 +610,21 @@ pub fn default_provider(tenant: &Tenant) -> Arc<dyn LlmProvider> {
                         .into_iter()
                         .map(script_item_to_response)
                         .collect();
-                    return Arc::new(MockProvider::new(script));
+                    return Some(Arc::new(MockProvider::new(script)));
                 }
             }
         }
-        return Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        return Some(Arc::new(MockProvider::new(vec![MockProvider::text_response(
             "hello from rupi-server (mock)",
-        )]));
+        )])));
+    }
+    None
+}
+
+/// 测试可注入剧本；默认 Mock（无 BYOK）或租户 settings 里的模型。
+pub fn default_provider(tenant: &Tenant) -> Arc<dyn LlmProvider> {
+    if let Some(p) = cached_mock(tenant) {
+        return p;
     }
     let model = tenant
         .settings

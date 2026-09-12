@@ -43,7 +43,6 @@ async fn ping_deps(db_url: &str, redis_url: &str) -> bool {
 struct Harness {
     base: String,
     execd_root: std::path::PathBuf,
-    exec_url: String,
     redis_url: String,
     key_a: String,
     key_b: String,
@@ -100,21 +99,20 @@ impl Harness {
         .ok()?;
         let exec_url = format!("http://{exec_addr}");
         let cache = Cache::connect(&redis_url).await;
-        let app = App {
-            pool: pool.clone(),
+        let app = App::new(
+            pool.clone(),
             cache,
-            executor: Arc::new(rupi_runtime::http::HttpExecutor::new(
+            Arc::new(rupi_runtime::http::HttpExecutor::new(
                 exec_url.clone(),
                 "exec-secret",
             )),
-            provider_factory: Arc::new(|t| rupi_server::run::default_provider(t)),
-        };
+            Arc::new(|t| rupi_server::run::default_provider(t)),
+        );
         let (addr, srv) = spawn(app, "127.0.0.1:0").await.ok()?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         Some(Self {
             base: format!("http://{addr}"),
             execd_root: root,
-            exec_url,
             redis_url,
             key_a,
             key_b,
@@ -128,7 +126,10 @@ impl Harness {
     }
 
     fn client(&self) -> reqwest::Client {
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap()
     }
 }
 
@@ -192,11 +193,14 @@ async fn post_agent(h: &Harness, key: &str, body: Value) -> (u16, String) {
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => format!("__read_error__:{e}"),
+    };
     (status, text)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_tenants_isolated_and_agui_interrupt() {
     let Some(h) = Harness::start().await else {
         return;
@@ -275,7 +279,7 @@ async fn two_tenants_isolated_and_agui_interrupt() {
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
         .collect();
-    assert!(types.contains(&"RUN_STARTED"), "{types:?}");
+    assert!(types.contains(&"RUN_STARTED"), "{types:?}\n{body}");
     assert!(
         types.contains(&"TEXT_MESSAGE_CONTENT") || types.contains(&"TEXT_MESSAGE_START"),
         "{types:?}\n{body}"
@@ -436,31 +440,16 @@ async fn two_tenants_isolated_and_agui_interrupt() {
     let _ = Command::new("redis-cli")
         .args(["-u", &h.redis_url, "FLUSHDB"])
         .status();
-    let disabled = App {
-        pool: h.pool.clone(),
-        cache: Cache::disabled(),
-        executor: Arc::new(rupi_runtime::http::HttpExecutor::new(
-            h.exec_url.clone(),
-            "exec-secret",
-        )),
-        provider_factory: Arc::new(|t| rupi_server::run::default_provider(t)),
-    };
-    let (addr2, _srv2) = spawn(disabled, "127.0.0.1:0").await.unwrap();
-    let (st, body) = {
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr2}/v1/agent"))
-            .bearer_auth(&h.key_a)
-            .header("Accept", "text/event-stream")
-            .json(&json!({
-                "threadId": sid,
-                "runId": "run-5",
-                "messages": [{"id":"u5","role":"user","content":"still there?"}]
-            }))
-            .send()
-            .await
-            .unwrap();
-        (resp.status().as_u16(), resp.text().await.unwrap_or_default())
-    };
+    let (st, body) = post_agent(
+        &h,
+        &h.key_a,
+        json!({
+            "threadId": sid,
+            "runId": "run-5",
+            "messages": [{"id":"u5","role":"user","content":"still there?"}]
+        }),
+    )
+    .await;
     assert_eq!(st, 200, "{body}");
     let evs = parse_sse(&body);
     let types: Vec<&str> = evs
@@ -468,7 +457,10 @@ async fn two_tenants_isolated_and_agui_interrupt() {
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
         .collect();
     assert!(types.contains(&"RUN_FINISHED"), "{types:?}\n{body}");
-    assert!(body.contains("still-here-after-cache-flush") || types.contains(&"TEXT_MESSAGE_CONTENT"), "{body}");
+    assert!(
+        body.contains("still-here-after-cache-flush") || types.contains(&"TEXT_MESSAGE_CONTENT"),
+        "{body}"
+    );
     let _ = sid_b;
 }
 
@@ -491,7 +483,7 @@ fn free_port() -> u16 {
 }
 
 /// 独立进程：API 进程树看不到用户 bash 命令。
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_process_table_does_not_see_user_bash() {
     let _guard = HARNESS_LOCK.lock().await;
     let Some((db_url, redis_url)) = env_urls() else {
@@ -589,6 +581,8 @@ async fn api_process_table_does_not_see_user_bash() {
     if !up {
         let _ = execd.kill();
         let _ = server.kill();
+        let _ = execd.wait();
+        let _ = server.wait();
         panic!("rupi-server did not become healthy on {api}");
     }
 
@@ -602,11 +596,15 @@ async fn api_process_table_does_not_see_user_bash() {
     let Ok(created) = created else {
         let _ = execd.kill();
         let _ = server.kill();
+        let _ = execd.wait();
+        let _ = server.wait();
         return;
     };
     if created.status() != 201 {
         let _ = execd.kill();
         let _ = server.kill();
+        let _ = execd.wait();
+        let _ = server.wait();
         panic!("create session {}", created.status());
     }
     let sid = created.json::<Value>().await.unwrap()["id"]
@@ -664,6 +662,8 @@ async fn api_process_table_does_not_see_user_bash() {
     let _ = join.await;
     let _ = execd.kill();
     let _ = server.kill();
+    let _ = execd.wait();
+    let _ = server.wait();
     assert!(
         !leak,
         "API process tree must not contain user command {marker}: {tree:?}"
