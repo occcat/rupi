@@ -203,7 +203,7 @@ async function pageTenants() {
       <form id="f-tenant" class="toolbar" style="display:grid;gap:.7rem">
         <label>名称 <input name="name" required></label>
         <label>默认模型 <input name="defaultModel" placeholder="gpt-4o-mini"></label>
-        <label>默认区域 <input name="defaultRegion" placeholder="local"></label>
+        <label>默认区域 <input name="defaultRegion" value="local" placeholder="local"></label>
         <button type="submit">创建并颁发 Key</button>
       </form>`);
     $("f-tenant").onsubmit = async (ev) => {
