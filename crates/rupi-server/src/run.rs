@@ -8,6 +8,7 @@ use crate::cache::Cache;
 use crate::db::{self, PgPool, Tenant};
 use crate::memory::PostgresMemory;
 use crate::quota;
+use crate::reclaim;
 use crate::tools::cloud_tools;
 use crate::App;
 use rupi_agent::{
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub enum Preflight {
-    Stream(mpsc::UnboundedReceiver<AguiEvent>, tokio::task::JoinHandle<()>),
+    Stream(mpsc::UnboundedReceiver<AguiEvent>, rupi_core::CancelFlag),
     Status { code: u16, body: serde_json::Value },
 }
 
@@ -42,6 +43,16 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         tracing::debug!("forwardedProps ignored (not an RPC tunnel)");
     }
 
+    if app
+        .cache
+        .is_missing_session(&tenant.id, &input.thread_id)
+        .await
+    {
+        return Preflight::Status {
+            code: 404,
+            body: serde_json::json!({"error": "session not found"}),
+        };
+    }
     let Some(sess) = (match db::get_session(&app.pool, &tenant.id, &input.thread_id).await {
         Ok(s) => s,
         Err(e) => {
@@ -56,10 +67,15 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
                 code: 403,
                 body: serde_json::json!({"error": "forbidden"}),
             },
-            _ => Preflight::Status {
-                code: 404,
-                body: serde_json::json!({"error": "session not found"}),
-            },
+            _ => {
+                app.cache
+                    .remember_missing_session(&tenant.id, &input.thread_id)
+                    .await;
+                Preflight::Status {
+                    code: 404,
+                    body: serde_json::json!({"error": "session not found"}),
+                }
+            }
         };
     };
 
@@ -101,6 +117,7 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         &tenant.id,
         &input.thread_id,
         &input.run_id,
+        &app.instance_id,
     )
     .await
     {
@@ -112,12 +129,23 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<AguiEvent>();
-    let handle = tokio::spawn(async move {
-        if let Err(e) = drive(app.clone(), tenant, sess, input, tx.clone()).await {
+    let cancel = CancelFlag::new();
+    let cancel_drive = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drive(
+            app.clone(),
+            tenant,
+            sess,
+            input,
+            tx.clone(),
+            cancel_drive,
+        )
+        .await
+        {
             emit(&tx, agui::run_error(&e.to_string(), None));
         }
     });
-    Preflight::Stream(rx, handle)
+    Preflight::Stream(rx, cancel)
 }
 
 async fn drive(
@@ -126,6 +154,7 @@ async fn drive(
     sess: db::SessionRow,
     input: RunAgentInput,
     tx: mpsc::UnboundedSender<AguiEvent>,
+    cancel: CancelFlag,
 ) -> anyhow::Result<()> {
     emit(
         &tx,
@@ -139,30 +168,75 @@ async fn drive(
 
     let mut tree = {
         let key = Cache::sess_tree_key(&tenant.id, &input.thread_id);
-        let _g = app.cache.singleflight(&key).await;
-        let _g = _g.lock().await;
+        let fill = Cache::fill_key("tree", &tenant.id, &input.thread_id);
+        let local = app.cache.singleflight(&key).await;
+        let _g = local.lock().await;
         if let Some(raw) = app.cache.get(&key).await {
             serde_json::from_str::<SessionTree>(&raw)
                 .ok()
                 .unwrap_or(db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?)
         } else {
-            let t = db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?;
-            let _ = app
-                .cache
-                .set_ex(&key, &serde_json::to_string(&t).unwrap_or_default(), 300)
-                .await;
-            t
+            let locked = app.cache.fill_lock(&fill, 5).await;
+            if !locked {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if let Some(raw) = app.cache.get(&key).await {
+                    if let Ok(t) = serde_json::from_str::<SessionTree>(&raw) {
+                        t
+                    } else {
+                        db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?
+                    }
+                } else {
+                    db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?
+                }
+            } else {
+                let t = db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?;
+                let _ = app
+                    .cache
+                    .set_ex(&key, &serde_json::to_string(&t).unwrap_or_default(), 300)
+                    .await;
+                app.cache.fill_unlock(&fill).await;
+                t
+            }
         }
     };
-    let handle = match (&sess.runtime_backend, &sess.runtime_handle) {
-        (Some(b), Some(h)) => WorkspaceHandle {
-            id: h.clone(),
-            backend: b.clone(),
-        },
-        _ => anyhow::bail!("session has no executor handle"),
-    };
+    let handle = reclaim::ensure_hot(&app, &tenant.id, &sess).await?;
+    let _ = db::touch_session(&app.pool, &tenant.id, &input.thread_id).await;
 
-    let pgmem = PostgresMemory::new(app.pool.clone(), tenant.id.clone(), input.thread_id.clone());
+    let hb_app = app.clone();
+    let hb_tenant = tenant.id.clone();
+    let hb_thread = input.thread_id.clone();
+    let hb_run = input.run_id.clone();
+    let hb_inst = app.instance_id.clone();
+    let hb_cancel = cancel.clone();
+    let hb = tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(quota::HEARTBEAT_SECS));
+        loop {
+            iv.tick().await;
+            if hb_cancel.is_cancelled() {
+                break;
+            }
+            if !quota::heartbeat(
+                &hb_app.cache,
+                &hb_app.pool,
+                &hb_tenant,
+                &hb_thread,
+                &hb_run,
+                &hb_inst,
+            )
+            .await
+            {
+                hb_cancel.cancel();
+                break;
+            }
+        }
+    });
+
+    let pgmem = PostgresMemory::new(
+        app.pool.clone(),
+        tenant.id.clone(),
+        input.thread_id.clone(),
+        app.cache.clone(),
+    );
     let frozen_key = Cache::mem_frozen_key(&tenant.id);
     let frozen = if let Some(raw) = app.cache.get(&frozen_key).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -300,7 +374,8 @@ async fn drive(
         Ok(_) => {}
         Err(e) => {
             emit(&tx, agui::run_error(&e.to_string(), None));
-            finish(&app, &tenant, &input.thread_id, &tree).await;
+            finish(&app, &tenant, &input.thread_id, &input.run_id, &tree).await;
+            hb.abort();
             return Ok(());
         }
     }
@@ -338,8 +413,17 @@ async fn drive(
                 sess.runtime_backend.as_deref(),
             )),
         );
-        quota::release_lease(&app.cache, &app.pool, &tenant.id, &input.thread_id).await;
+        quota::release_lease(
+            &app.cache,
+            &app.pool,
+            &tenant.id,
+            &input.thread_id,
+            &input.run_id,
+            &app.instance_id,
+        )
+        .await;
         quota::release_run(&app.cache, &tenant.id).await;
+        hb.abort();
         emit(
             &tx,
             agui::run_finished_interrupt(
@@ -362,7 +446,8 @@ async fn drive(
             ),
         );
     } else {
-        finish(&app, &tenant, &input.thread_id, &tree).await;
+        finish(&app, &tenant, &input.thread_id, &input.run_id, &tree).await;
+        hb.abort();
         emit(
             &tx,
             agui::run_finished_success(&input.thread_id, &input.run_id),
@@ -581,11 +666,19 @@ async fn apply_state(pool: &PgPool, tenant_id: &str, input: &RunAgentInput) -> a
     .await
 }
 
-async fn finish(app: &App, tenant: &Tenant, thread: &str, tree: &SessionTree) {
+async fn finish(app: &App, tenant: &Tenant, thread: &str, run_id: &str, tree: &SessionTree) {
     let _ = db::persist_tree(&app.pool, &tenant.id, thread, tree).await;
     app.cache.invalidate_session(&tenant.id, thread).await;
     app.cache.invalidate_memory(&tenant.id).await;
-    quota::release_lease(&app.cache, &app.pool, &tenant.id, thread).await;
+    quota::release_lease(
+        &app.cache,
+        &app.pool,
+        &tenant.id,
+        thread,
+        run_id,
+        &app.instance_id,
+    )
+    .await;
     quota::release_run(&app.cache, &tenant.id).await;
 }
 

@@ -1,6 +1,8 @@
 //! 云第一刀验收：双租户隔离、AG-UI 流式 + interrupt、write/bash 只经 Executor。
 //! 无 DATABASE_URL 时跳过（macOS CI）；Ubuntu cloud job 会带 Postgres/Redis。
 
+mod common;
+
 use rupi_core::ContentBlock;
 use rupi_llm::{ChatResponse, MockProvider};
 use rupi_runtime::execd::{self, ExecdConfig};
@@ -11,10 +13,8 @@ use serde_json::{json, Value};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-/// 共享本机/CI 的 Postgres，验收用例互斥。
-static HARNESS_LOCK: Mutex<()> = Mutex::const_new(());
+use common::lock_harness;
 
 fn env_urls() -> Option<(String, String)> {
     let db = std::env::var("DATABASE_URL")
@@ -52,12 +52,12 @@ struct Harness {
     pool: db::PgPool,
     _server: tokio::task::JoinHandle<anyhow::Result<()>>,
     _execd: tokio::task::JoinHandle<anyhow::Result<()>>,
-    _guard: tokio::sync::MutexGuard<'static, ()>,
+    _guard: common::HarnessGuard,
 }
 
 impl Harness {
     async fn start() -> Option<Self> {
-        let guard = HARNESS_LOCK.lock().await;
+        let guard = lock_harness().await?;
         let (db_url, redis_url) = env_urls()?;
         if !ping_deps(&db_url, &redis_url).await {
             return None;
@@ -94,6 +94,7 @@ impl Harness {
             bind: "127.0.0.1:0".into(),
             root: root.clone(),
             token: "exec-secret".into(),
+            ..Default::default()
         })
         .await
         .ok()?;
@@ -485,7 +486,9 @@ fn free_port() -> u16 {
 /// 独立进程：API 进程树看不到用户 bash 命令。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_process_table_does_not_see_user_bash() {
-    let _guard = HARNESS_LOCK.lock().await;
+    let Some(_guard) = lock_harness().await else {
+        return;
+    };
     let Some((db_url, redis_url)) = env_urls() else {
         return;
     };

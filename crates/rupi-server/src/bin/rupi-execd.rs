@@ -12,6 +12,10 @@ struct Cli {
     root: PathBuf,
     #[arg(long, env = "RUPI_EXEC_TOKEN", default_value = "")]
     token: String,
+    #[arg(long, env = "RUPI_EXEC_MAX", default_value_t = 64)]
+    max_workspaces: u32,
+    #[arg(long, env = "RUPI_EXEC_WARM", default_value_t = 2)]
+    warm_pool: u32,
 }
 
 #[tokio::main]
@@ -28,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         bind: cli.listen,
         root: cli.root,
         token: cli.token,
+        max_workspaces: cli.max_workspaces,
+        warm_pool: cli.warm_pool,
     })
     .await
 }

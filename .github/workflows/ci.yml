@@ -63,7 +63,7 @@ jobs:
         run: cargo test --workspace --locked --exclude rupi-benches
 
   cloud:
-    name: cloud first cut
+    name: cloud control plane
     runs-on: ubuntu-latest
     services:
       postgres:
