@@ -144,10 +144,10 @@ fn bwrap_command(root: &Path, script: &str, isolation: Isolation) -> Command {
 #[cfg(target_os = "macos")]
 fn macos_sandbox_command(root: &Path, script: &str) -> Command {
     let root_s = root.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
-    // 允许跑 sh/cat，并写管道 / /dev/fd（否则 echo 成功但 stdout 是空的）。
+    // 允许跑 sh/cat，并写 /dev/fd 管道（否则 echo 成功但 stdout 是空的）。
     // 禁止读句柄根以外的用户文件。不要放行整个 /tmp、/private/var/folders、/Users。
     let profile = format!(
-        r#"(version 1)
+        r##"(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
@@ -168,23 +168,24 @@ fn macos_sandbox_command(root: &Path, script: &str) -> Command {
   (subpath "/private/etc")
   (subpath "/private/var/db")
 )
-(allow file-write* file-ioctl file-read*
+(allow file-write-data
   (literal "/dev/null")
-  (literal "/dev/zero")
   (literal "/dev/stdout")
   (literal "/dev/stderr")
-  (literal "/dev/stdin")
-  (literal "/dev/tty")
-  (subpath "/dev/fd")
+  (regex #"^/dev/fd/")
 )
-(allow file-write-data file-ioctl
-  (vnode-type PIPE)
-  (vnode-type SOCKET)
+(allow file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+)
+(allow file-read*
+  (literal "/dev/null")
+  (regex #"^/dev/fd/")
 )
 (allow file-read* file-write*
   (subpath "{root_s}")
 )
-"#
+"##
     );
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(script);
