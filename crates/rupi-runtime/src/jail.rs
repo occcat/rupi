@@ -144,54 +144,37 @@ fn bwrap_command(root: &Path, script: &str, isolation: Isolation) -> Command {
 #[cfg(target_os = "macos")]
 fn macos_sandbox_command(root: &Path, script: &str) -> Command {
     let root_s = root.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
-    // 允许跑 sh/cat，并写 /dev/fd 管道（否则 echo 成功但 stdout 是空的）。
-    // 禁止读句柄根以外的用户文件。不要放行整个 /tmp、/private/var/folders、/Users。
+    // GH macOS runner 上 (deny default) 会掐死 echo。改为 allow default，
+    // 再 deny 邻居可能在的树，并 require-not 放行句柄根。
     let profile = format!(
         r##"(version 1)
-(deny default)
-(allow process-exec)
-(allow process-fork)
-(allow signal)
-(allow sysctl-read)
-(allow mach-lookup)
-(allow file-ioctl)
-(allow file-read-metadata)
-(allow file-read*
-  (subpath "/usr")
-  (subpath "/bin")
-  (subpath "/sbin")
-  (subpath "/opt")
-  (subpath "/System")
-  (subpath "/Library")
-  (subpath "/dev")
-  (subpath "/etc")
-  (subpath "/private/etc")
-  (subpath "/private/var/db")
+(allow default)
+(deny file-read-data
+  (require-all
+    (subpath "/private/var/folders")
+    (require-not (subpath "{root_s}"))
+  )
 )
-(allow file-write-data
-  (literal "/dev/null")
-  (literal "/dev/stdout")
-  (literal "/dev/stderr")
-  (regex #"^/dev/fd/")
+(deny file-read-data
+  (require-all
+    (subpath "/var/folders")
+    (require-not (subpath "{root_s}"))
+  )
 )
-(allow file-ioctl
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
+(deny file-read-data
+  (require-all
+    (subpath "/tmp")
+    (require-not (subpath "{root_s}"))
+  )
 )
-(allow file-read*
-  (literal "/dev/null")
-  (regex #"^/dev/fd/")
+(deny file-read-data
+  (require-all
+    (subpath "/private/tmp")
+    (require-not (subpath "{root_s}"))
+  )
 )
-(allow file-write-data
-  (vnode-type FIFO)
-  (vnode-type SOCKET)
-)
-(allow file-ioctl
-  (vnode-type FIFO)
-  (vnode-type SOCKET)
-)
-(allow file-read* file-write*
-  (subpath "{root_s}")
+(deny file-read-data
+  (subpath "/Users")
 )
 "##
     );
