@@ -639,7 +639,7 @@ async fn cloud_loop_reads_agents_and_skills_via_executor() {
     .await;
     h.exec_write(
         &handle,
-        ".rupi/skills/launch-guide/SKILL.md",
+        "skills/launch-guide/SKILL.md",
         "---\nname: launch-guide\ndescription: launch checklist helper for workspace tests\n---\nFollow the launch checklist.\n",
     )
     .await;
@@ -655,7 +655,9 @@ async fn cloud_loop_reads_agents_and_skills_via_executor() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
     let systems = mock.seen_systems.lock().unwrap().clone();
     let joined = systems.join("\n");
     assert!(
@@ -703,7 +705,9 @@ async fn usage_event_increments_tokens_today() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
     let after = h
         .client()
         .get(format!("{}/v1/me", h.base))
