@@ -490,7 +490,8 @@ mod tests {
             .expect("in-volume bash must start");
         assert!(
             inside.stdout.contains("IN-VOLUME"),
-            "in-volume bash failed: stdout={} stderr={}",
+            "in-volume bash failed: exit={} stdout={:?} stderr={:?}",
+            inside.exit_code,
             inside.stdout,
             inside.stderr
         );
@@ -507,7 +508,8 @@ mod tests {
             .expect("jailed bash must start");
         assert!(
             out.stdout.contains("DONE"),
-            "jailed bash did not finish: stdout={} stderr={}",
+            "jailed bash did not finish: exit={} stdout={:?} stderr={:?}",
+            out.exit_code,
             out.stdout,
             out.stderr
         );

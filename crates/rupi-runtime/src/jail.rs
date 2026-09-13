@@ -182,6 +182,14 @@ fn macos_sandbox_command(root: &Path, script: &str) -> Command {
   (literal "/dev/null")
   (regex #"^/dev/fd/")
 )
+(allow file-write-data
+  (vnode-type PIPE)
+  (vnode-type SOCKET)
+)
+(allow file-ioctl
+  (vnode-type PIPE)
+  (vnode-type SOCKET)
+)
 (allow file-read* file-write*
   (subpath "{root_s}")
 )
