@@ -484,6 +484,16 @@ mod tests {
         let a = eng.alloc("ten-a", "s1").await.unwrap();
         let b = eng.alloc("ten-b", "s1").await.unwrap();
         std::fs::write(a.dir.join("secret.txt"), "NEIGHBOR-SECRET").unwrap();
+        let inside = eng
+            .exec_for(&b.id, Some("ten-b"), "echo IN-VOLUME", Some(10))
+            .await
+            .expect("in-volume bash must start");
+        assert!(
+            inside.stdout.contains("IN-VOLUME"),
+            "in-volume bash failed: stdout={} stderr={}",
+            inside.stdout,
+            inside.stderr
+        );
         let escaped = format!(
             "cat {} 2>/dev/null || cat ../{}/s1/{}/secret.txt 2>/dev/null || cat ../../ten-a/s1/{}/secret.txt 2>/dev/null; echo DONE",
             a.dir.join("secret.txt").display(),
@@ -494,7 +504,13 @@ mod tests {
         let out = eng
             .exec_for(&b.id, Some("ten-b"), &escaped, Some(10))
             .await
-            .unwrap();
+            .expect("jailed bash must start");
+        assert!(
+            out.stdout.contains("DONE"),
+            "jailed bash did not finish: stdout={} stderr={}",
+            out.stdout,
+            out.stderr
+        );
         assert!(
             !out.stdout.contains("NEIGHBOR-SECRET"),
             "jail leaked neighbor: {}",
