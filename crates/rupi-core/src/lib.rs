@@ -1,5 +1,5 @@
-//! rupi-core: Pi Agent 核心类型 —— 消息、会话树、事件、工具定义、扩展点。
-//! 对标 `pi-agent-core` 的最小运行时无关层：只放类型与 trait，不依赖任何 LLM 或 IO。
+//! rupi-core：消息、会话树、事件、工具定义、扩展点。
+//! 对标 `pi-agent-core`：只放类型与 trait，不依赖 LLM 或 IO。
 
 pub mod commands;
 pub mod template;
@@ -592,7 +592,7 @@ pub struct ExtensionCommand {
     pub description: String,
 }
 
-/// 扩展点：工具 / 命令 / 事件钩子。Pi 哲学：core 极小，一切能力走扩展组合。
+/// 扩展点：工具 / 命令 / 事件钩子。本 crate 只放类型与 trait。
 #[async_trait::async_trait]
 pub trait Extension: Send + Sync {
     fn name(&self) -> &str;

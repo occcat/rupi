@@ -146,14 +146,8 @@ impl HeuristicReviewer {
         };
         let name = format!("auto-{}", &slug[..slug.len().min(50)]);
         Some(SkillDraftSuggestion {
-            description: format!(
-                "distilled from: {}",
-                t.user.chars().take(100).collect::<String>()
-            ),
-            steps: distinct
-                .iter()
-                .map(|d| format!("use tool `{d}` as done in the session"))
-                .collect(),
+            description: t.user.chars().take(100).collect::<String>(),
+            steps: distinct.iter().map(|d| format!("use tool `{d}`")).collect(),
             name,
         })
     }

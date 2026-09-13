@@ -4,7 +4,7 @@ use clap::Parser;
 use rupi_server::{auth, db, CloudConfig};
 
 #[derive(Parser)]
-#[command(name = "rupi-server", about = "Rupi cloud control plane")]
+#[command(name = "rupi-server", about = "Cloud control plane: AG-UI + REST, Postgres, external Executor")]
 struct Cli {
     #[arg(long, env = "RUPI_LISTEN", default_value = "127.0.0.1:8080")]
     listen: String,
@@ -37,7 +37,7 @@ struct Cli {
     /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
     #[arg(long)]
     bootstrap_tenant: Option<String>,
-    /// 管理面共享口令。也可用库内 `rupi_admin_*` Key。不要做 OAuth。
+    /// 管理面共享口令。也可用库内 `rupi_admin_*` Key。
     #[arg(long, env = "RUPI_ADMIN_TOKEN", default_value = "")]
     admin_token: String,
     /// 启动时建一把管理 Key 并打印明文（只用于本地/CI）。

@@ -1,8 +1,7 @@
 # 上游对照（Upstream alignment）
 
-目标：**earendil-works/pi `@earendil-works/pi-coding-agent` 0.85.x** 的 Rust 复刻，外加 Pi 刻意留给扩展层、
-但现代 agent harness 常见的三块：MCP、Hermes 风格记忆、Skill 自积累。
-本文说明每个子系统对应上游哪一部分、哪些是有意偏离、哪些明确不移植。（形式借鉴 `rupi-pi-agent-9492` 分支的 `docs/UPSTREAM.md`。）
+目标：[`earendil-works/pi`](https://github.com/earendil-works/pi) `@earendil-works/pi-coding-agent` 0.85.x 的 Rust 复刻，外加 MCP、Hermes 风格记忆、Skill 自积累（Pi 把这三块留给扩展层）。
+每个子系统对应上游哪一部分、哪些有意偏离、哪些不移植。形式借鉴 `rupi-pi-agent-9492` 的 `docs/UPSTREAM.md`。
 
 参考：
 - Pi 源码：https://github.com/earendil-works/pi （`packages/agent`、`packages/coding-agent`、`packages/ai`）
@@ -58,7 +57,7 @@
 - 模型目录：内置 `crates/rupi-llm/models.json`，可被 `RUPI_MODELS` 或 `~/.rupi/models.json` 覆盖合并；`--list-models` / `rupi models`。
 - 图片：`ContentBlock::Image` 映射三家（OpenAI `image_url` data URL / Anthropic `image` source / Gemini `inline_data`）；`read` 先 `metadata` 再分页；`@file` 图片先判大小再整读（上限 5MB）。
 - 成本：内建粗粒度价目（`TokenMeter` footer `↑↓ tokens / context% / $`）。
-- OAuth：`rupi login [provider]` **仅 stub**（打印 API key 用法，无浏览器/设备码）。未落地：Claude Pro/Max、ChatGPT Codex、GitHub Copilot 订阅登录；Bedrock SigV4。
+- `rupi login [provider]` 只打印 API key 环境变量，无浏览器/设备码。Bedrock 现走 Bearer，无 SigV4。
 
 ## MCP（Pi 生态 `pi-mcp-adapter` / 官方规范 2024-11-05 + Streamable HTTP）
 
@@ -78,7 +77,7 @@
 
 - 递归发现（honor `.gitignore/.ignore`），`SKILL.md` frontmatter 校验，三阶段渐进披露，`/skillname args` 即斜杠命令（兼容 `/skill:name`），每轮热刷新。
 - 发现目录对齐 Pi / Agent Skills：全局 `~/.pi/agent/skills` 与 `~/.agents/skills`；项目 `.pi/skills` 与 `.agents/skills` 从 cwd 上溯（有 `.git` 停在仓库根，否则到文件系统根）。另保留 `skills/builtin`、`~/.rupi/skills`、`.rupi/skills`。
-- 自积累：默认启发式复盘只建议不落盘，`--review-apply` 落盘，`--review-llm` 用模型复盘；`skill-distill` 手工蒸馏。
+- 自积累：默认启发式复盘只建议不落盘，`--review-apply` 落盘，`--review-llm` 改用模型做 JSON 复盘（多一次 LLM 调用）；`skill-distill` 手工蒸馏。
 
 ## 扩展（Pi 进程内 TS → `crates/rupi-ext`）
 
@@ -114,4 +113,4 @@
 5. 搬运：`truncate.rs`（bash 尾截 2000 行/50KB）、`sse.rs`（多行 data、跨 chunk UTF-8）、`run --json`、usage 统计。
 6. 借鉴：`[core]` 记忆分层、本文档。
 
-已知未做：完整 OAuth 设备码流；子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。
+已知未做：子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。`rupi login` 没有设备码流。

@@ -1,7 +1,6 @@
 //! rupi-ext: 外部进程扩展（对标 Pi 的 extension + hot reload）。
 //!
-//! Pi 哲学："No MCP. Build CLI tools with READMEs, or build an extension"。
-//! 本 crate 落的是前半句：每个扩展 = 一个 manifest（`*.json`）+ 任意可执行命令。
+//! 每个扩展 = 一个 manifest（`*.json`）+ 一条可执行命令。
 //!
 //! 契约：
 //! - `protocol: oneshot`（默认）：调用时把 `arguments` JSON 写进子进程 stdin，stdout 即工具结果。
@@ -9,9 +8,8 @@
 //!   可 `initialize` 注册斜杠命令、订阅 `tool_call`/`turn_end`/`session_*`、回 UI 提示。
 //! WASM 不在本 crate 范围。
 //!
-//! 非零退出码 → tool error（`stderr` 并入），绝不崩主循环。
-//! 热重载：`ExtensionSet::refresh()` 按 mtime 增量重载，agent 写新工具后
-//! `/reload`（或每轮自动检查）即刻可用；修工具开 side-quest branch，修完 rewind 回来。
+//! 非零退出码 → tool error（`stderr` 并入），主循环不崩。
+//! 热重载：`ExtensionSet::refresh()` 按 mtime 增量重载；`/reload` 或每轮自动检查。
 
 use rupi_core::{Extension, ExtensionCommand, ToolDefinition};
 use serde::{Deserialize, Serialize};

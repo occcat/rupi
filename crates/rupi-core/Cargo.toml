@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "Message, SessionTree, AgentEvent, ToolDefinition; no LLM, no IO"
 
 [dependencies]
 serde = { workspace = true }

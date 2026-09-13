@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "Agent Skills discovery, progressive disclosure, skill-distill"
 
 [dependencies]
 tokio = { workspace = true }

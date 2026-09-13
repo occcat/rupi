@@ -1,4 +1,4 @@
-//! rupi CLI：coding agent 交互入口 + MCP / 记忆 / Skill / 会话管理子命令。
+//! `rupi`：本机 TUI/CLI，以及 `rupi cloud` 连控制面。
 
 mod cloud;
 mod rpc;
@@ -71,7 +71,7 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
 #[command(
     name = "rupi",
     version,
-    about = "rupi — Pi Agent 的 Rust 复刻：最小 Harness + MCP + 记忆 + Skills"
+    about = "Pi coding agent 的 Rust 复刻。本机 TUI/CLI；连云用 `rupi cloud`"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -103,7 +103,7 @@ struct Cli {
     /// 把 review 建议直接落盘（memory add + skill 草稿）
     #[arg(long, default_value_t = false)]
     review_apply: bool,
-    /// 用模型做后台复盘（默认启发式离线 review；LLM 版烧 token 但提炼质量更高）
+    /// 用模型做后台 JSON 复盘（多一次 LLM 调用；默认是离线启发式）
     #[arg(long, default_value_t = false)]
     review_llm: bool,
     /// 压实 reserveTokens：为模型回复预留的 token（`used > window - reserve` 触发）
@@ -212,9 +212,9 @@ struct Cli {
 }
 
 impl Cli {
-    /// 后台复盘总开关：离开启发式默认开启（空建议零打扰，非空才打印）；
+    /// 后台复盘总开关：离开启发式默认开启（空建议不打印，非空才打印）；
     /// `--review` 是旧显式开关，保留兼容；`--no-review` 关闭。
-    /// 落盘仍需 `--review-apply` 显式授权（无自主写盘，对标 Hermes write_approval 精神）。
+    /// 落盘仍需 `--review-apply`。不传则只打印建议。
     fn review_enabled(&self) -> bool {
         !self.no_review || self.review
     }
@@ -294,7 +294,7 @@ enum Cmd {
     Sessions,
     /// 查看会话明细
     SessionShow { id: String },
-    /// OAuth 登录占位（本版只打印用法；完整设备码流未落地）
+    /// 打印该 provider 的 API key 环境变量。没有浏览器/设备码流。
     Login {
         /// anthropic | openai | copilot | vertex | bedrock
         provider: Option<String>,
@@ -331,7 +331,7 @@ enum Cmd {
         #[arg(short = 'l', long)]
         local: bool,
     },
-    /// 连云控制面：AG-UI/HTTP 瘦客户端。本机不执行 bash，不进 TUI。
+    /// 连 `rupi-server`：只发 AG-UI/HTTP。bash 在 Executor 上跑，不进 TUI。
     Cloud {
         /// 控制面根 URL（`RUPI_CLOUD_URL`）
         #[arg(long, env = "RUPI_CLOUD_URL")]
@@ -595,16 +595,16 @@ fn print_login_stub(provider: Option<&str>) {
     println!("Use an API key instead, e.g. `--api-key $KEY --model provider/model`.\n");
     let detail = match provider.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("anthropic") | Some("claude") => {
-            "anthropic: export ANTHROPIC_API_KEY or RUPI_ANTHROPIC_KEY\n  planned: Claude Pro/Max OAuth → ~/.rupi/oauth/anthropic.json"
+            "anthropic: export ANTHROPIC_API_KEY or RUPI_ANTHROPIC_KEY"
         }
         Some("openai") | Some("codex") | Some("chatgpt") => {
-            "openai/codex: export OPENAI_API_KEY or RUPI_API_KEY\n  planned: ChatGPT Codex OAuth → ~/.rupi/oauth/openai.json"
+            "openai/codex: export OPENAI_API_KEY or RUPI_API_KEY"
         }
         Some("copilot") | Some("github") => {
-            "copilot: not implemented\n  planned: GitHub device-code → ~/.rupi/oauth/copilot.json"
+            "copilot: no API key path in this binary"
         }
         Some("vertex") | Some("google") => {
-            "vertex: export VERTEX_TOKEN or GOOGLE_OAUTH_ACCESS_TOKEN\n  (gcloud auth print-access-token is the current workaround)"
+            "vertex: export VERTEX_TOKEN or GOOGLE_OAUTH_ACCESS_TOKEN\n  (gcloud auth print-access-token works as a token source)"
         }
         Some("bedrock") | Some("aws") => {
             "bedrock: export AWS_BEARER_TOKEN_BEDROCK or BEDROCK_API_KEY"
@@ -614,7 +614,7 @@ fn print_login_stub(provider: Option<&str>) {
             ""
         }
         None => {
-            "providers you can pass: anthropic | openai | copilot | vertex | bedrock\n  none of these OAuth flows are implemented yet."
+            "providers you can pass: anthropic | openai | copilot | vertex | bedrock"
         }
     };
     if !detail.is_empty() {
@@ -2081,7 +2081,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }));
     if cli.review_enabled() {
         let pending_clone = pending.clone();
-        // --review-llm 用模型复盘（烧 token 但提炼质量更高），默认离线启发式
+        // --review-llm 用模型做 JSON 复盘（多一次 LLM 调用）；默认离线启发式
         let reviewer: Arc<dyn rupi_agent::Reviewer> = if cli.review_llm {
             Arc::new(rupi_agent::LlmReviewer::new(provider.clone()))
         } else {
@@ -2127,7 +2127,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
     apply_tool_filter(&mut tools, &rt);
 
-    println!("rupi v0.1.0 — 输入 /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/settings 改 steeringMode/followUpMode/defaultProjectTrust/externalEditor/enabledModels，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/new /session /sessions /export /import /fork /clone /name");
+    println!("rupi v0.1.0. /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/settings 改 steeringMode/followUpMode/defaultProjectTrust/externalEditor/enabledModels，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/new /session /sessions /export /import /fork /clone /name");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "MCP bridge: stdio JSON-RPC and Streamable HTTP"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }

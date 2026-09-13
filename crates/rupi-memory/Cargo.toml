@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "Hermes MEMORY.md/USER.md plus SQLite SessionStore"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }

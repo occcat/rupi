@@ -4,7 +4,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "rupi-sandboxd", about = "Rupi sandbox-cluster executor daemon")]
+#[command(name = "rupi-sandboxd", about = "Sandbox-cluster backend for rupi-server")]
 struct Cli {
     #[arg(long, default_value = "127.0.0.1:8190")]
     listen: String,
