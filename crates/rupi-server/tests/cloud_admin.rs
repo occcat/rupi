@@ -302,6 +302,35 @@ async fn admin_tenants_keys_quota_settings() {
     let stored = db::load_tenant(&h.pool, &new_id).await.unwrap().unwrap();
     assert_eq!(stored.settings["api_key"], "sk-test");
     assert_eq!(stored.settings["provider"], "mock");
+
+    let rows = db::list_admin_audit(&h.pool, 50).await.unwrap();
+    assert!(
+        rows.iter().any(|r| r.action == "create_key"),
+        "{:?}",
+        rows.iter().map(|r| &r.action).collect::<Vec<_>>()
+    );
+    assert!(rows.iter().any(|r| r.action == "patch_quota"), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.action == "patch_settings"),
+        "{rows:?}"
+    );
+    let (ca, listed) = h
+        .admin_json(reqwest::Method::GET, "/admin/api/audit?limit=50", None)
+        .await;
+    assert_eq!(ca, 200, "{listed}");
+    let audits = listed["audits"].as_array().cloned().unwrap_or_default();
+    assert!(
+        audits.iter().any(|a| a["action"] == "create_key"),
+        "{listed}"
+    );
+    assert!(
+        audits.iter().any(|a| a["action"] == "patch_quota"),
+        "{listed}"
+    );
+    assert!(
+        audits.iter().any(|a| a["action"] == "patch_settings"),
+        "{listed}"
+    );
 }
 
 #[tokio::test]

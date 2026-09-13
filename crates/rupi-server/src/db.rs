@@ -9,8 +9,28 @@ use uuid::Uuid;
 
 pub type PgPool = Pool;
 
-fn database_url_ok(database_url: &str) -> anyhow::Result<()> {
-    let insecure = std::env::var("RUPI_DB_INSECURE").ok().as_deref() == Some("1");
+/// 控制面连 Postgres 的线协议。`sslmode=*` 字面量不能当 TLS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbWireMode {
+    /// 回环允许明文 `NoTls`。
+    PlaintextLoopback,
+    /// 非回环明文，仅 `RUPI_DB_INSECURE=1`。
+    PlaintextInsecure,
+    /// 非回环默认：进程内 rustls，并强制 `sslmode=require`。
+    Rustls,
+}
+
+impl DbWireMode {
+    pub fn uses_tls(self) -> bool {
+        matches!(self, Self::Rustls)
+    }
+}
+
+pub fn db_insecure_from_env() -> bool {
+    std::env::var("RUPI_DB_INSECURE").ok().as_deref() == Some("1")
+}
+
+fn database_host(database_url: &str) -> String {
     let lower = database_url.to_ascii_lowercase();
     let host = lower
         .split("://")
@@ -22,50 +42,72 @@ fn database_url_ok(database_url: &str) -> anyhow::Result<()> {
         .split('/')
         .next()
         .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or("")
         .split(':')
         .next()
         .unwrap_or("");
-    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "");
-    let wants_tls = lower.contains("sslmode=require")
-        || lower.contains("sslmode=verify-full")
-        || lower.contains("sslmode=verify-ca");
-    if !loopback && !wants_tls && !insecure {
-        anyhow::bail!(
-            "plaintext DATABASE_URL only allowed for loopback (got host {host}); use sslmode=require or RUPI_DB_INSECURE=1"
-        );
+    host.to_string()
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "")
+}
+
+/// 非回环默认 rustls；明文只给回环或显式 insecure。不认 `sslmode=` 字面放行。
+pub fn db_wire_mode(database_url: &str) -> anyhow::Result<DbWireMode> {
+    db_wire_mode_with(database_url, db_insecure_from_env())
+}
+
+pub fn db_wire_mode_with(database_url: &str, insecure: bool) -> anyhow::Result<DbWireMode> {
+    let host = database_host(database_url);
+    if host_is_loopback(&host) {
+        return Ok(DbWireMode::PlaintextLoopback);
     }
-    if wants_tls && !loopback {
-        tracing::warn!(
-            "DATABASE_URL requests TLS; this build still uses NoTls on the wire — put the control plane on a private network or terminate TLS at the proxy"
-        );
+    if insecure {
+        return Ok(DbWireMode::PlaintextInsecure);
     }
-    Ok(())
+    Ok(DbWireMode::Rustls)
+}
+
+fn rustls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots()
+}
+
+fn pg_manager(database_url: &str) -> anyhow::Result<Manager> {
+    let mode = db_wire_mode(database_url)?;
+    let mut cfg: tokio_postgres::Config = database_url.parse()?;
+    let mgr_cfg = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    Ok(match mode {
+        DbWireMode::PlaintextLoopback | DbWireMode::PlaintextInsecure => {
+            Manager::from_config(cfg, NoTls, mgr_cfg)
+        }
+        DbWireMode::Rustls => {
+            cfg.ssl_mode(tokio_postgres::config::SslMode::Require);
+            Manager::from_config(cfg, rustls_connector(), mgr_cfg)
+        }
+    })
 }
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    database_url_ok(database_url)?;
-    let cfg: tokio_postgres::Config = database_url.parse()?;
-    let mgr = Manager::from_config(
-        cfg,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
-    Ok(Pool::builder(mgr).max_size(32).build()?)
+    Ok(Pool::builder(pg_manager(database_url)?).max_size(32).build()?)
 }
 
 pub async fn connect_with_size(database_url: &str, max_size: usize) -> anyhow::Result<PgPool> {
-    database_url_ok(database_url)?;
-    let cfg: tokio_postgres::Config = database_url.parse()?;
-    let mgr = Manager::from_config(
-        cfg,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
-    Ok(Pool::builder(mgr).max_size(max_size.max(1)).build()?)
+    Ok(Pool::builder(pg_manager(database_url)?)
+        .max_size(max_size.max(1))
+        .build()?)
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -1089,6 +1131,41 @@ pub async fn insert_admin_audit(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct AdminAuditRow {
+    pub id: String,
+    pub actor: String,
+    pub action: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub detail: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_admin_audit(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<AdminAuditRow>> {
+    let c = pool.get().await?;
+    let lim = limit.clamp(1, 200);
+    let rows = c
+        .query(
+            "SELECT id, actor, action, target_type, target_id, detail, created_at
+             FROM admin_audit ORDER BY created_at DESC LIMIT $1",
+            &[&lim],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| AdminAuditRow {
+            id: r.get(0),
+            actor: r.get(1),
+            action: r.get(2),
+            target_type: r.get(3),
+            target_id: r.get(4),
+            detail: r.get(5),
+            created_at: r.get(6),
+        })
+        .collect())
+}
+
 pub async fn list_memories(
     pool: &PgPool,
     tenant_id: &str,
@@ -1774,17 +1851,37 @@ mod tests {
 
     #[test]
     fn database_url_plaintext_only_loopback_or_explicit() {
-        assert!(database_url_ok("postgres://rupi:rupi@127.0.0.1:5432/rupi").is_ok());
-        assert!(database_url_ok("postgresql://rupi:rupi@localhost:5432/rupi").is_ok());
-        assert!(
-            database_url_ok("postgres://rupi:rupi@db.example.com:5432/rupi?sslmode=require").is_ok()
+        assert_eq!(
+            db_wire_mode_with("postgres://rupi:rupi@127.0.0.1:5432/rupi", false).unwrap(),
+            DbWireMode::PlaintextLoopback
         );
-        if std::env::var("RUPI_DB_INSECURE").ok().as_deref() != Some("1") {
-            let err = database_url_ok("postgres://rupi:rupi@db.example.com:5432/rupi").unwrap_err();
-            assert!(
-                err.to_string().contains("loopback") || err.to_string().contains("sslmode"),
-                "{err:#}"
-            );
-        }
+        assert_eq!(
+            db_wire_mode_with("postgresql://rupi:rupi@localhost:5432/rupi", false).unwrap(),
+            DbWireMode::PlaintextLoopback
+        );
+        assert!(!db_wire_mode_with("postgres://rupi:rupi@127.0.0.1:5432/rupi", false)
+            .unwrap()
+            .uses_tls());
+
+        let remote_plain =
+            db_wire_mode_with("postgres://rupi:rupi@db.example.com:5432/rupi", false).unwrap();
+        assert_eq!(remote_plain, DbWireMode::Rustls);
+        assert!(remote_plain.uses_tls());
+
+        let remote_sslmode = db_wire_mode_with(
+            "postgres://rupi:rupi@db.example.com:5432/rupi?sslmode=require",
+            false,
+        )
+        .unwrap();
+        assert_eq!(remote_sslmode, DbWireMode::Rustls);
+        assert!(
+            remote_sslmode.uses_tls(),
+            "sslmode=require must select a real rustls client, not NoTls"
+        );
+
+        let insecure =
+            db_wire_mode_with("postgres://rupi:rupi@db.example.com:5432/rupi", true).unwrap();
+        assert_eq!(insecure, DbWireMode::PlaintextInsecure);
+        assert!(!insecure.uses_tls());
     }
 }

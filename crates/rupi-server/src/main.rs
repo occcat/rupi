@@ -30,8 +30,9 @@ struct Cli {
     region: String,
     #[arg(long, env = "RUPI_INSTANCE_ID")]
     instance_id: Option<String>,
-    #[arg(long, env = "RUPI_SNAPSHOT_DIR", default_value = "/tmp/rupi-snapshots")]
-    snapshot_dir: String,
+    /// 未指定时用 `./rupi-data/snapshots`（相对 cwd），不用 `/tmp`。
+    #[arg(long, env = "RUPI_SNAPSHOT_DIR")]
+    snapshot_dir: Option<String>,
     /// 共享对象存储：`s3://bucket/prefix` 或 `memory:`（测试）。优先于 snapshot-dir。
     #[arg(long, env = "RUPI_SNAPSHOT_URI")]
     snapshot_uri: Option<String>,
@@ -87,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
             .instance_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         region: cli.region,
-        snapshot_dir: cli.snapshot_dir,
+        snapshot_dir: cli
+            .snapshot_dir
+            .unwrap_or_else(|| rupi_server::default_snapshot_dir().display().to_string()),
         snapshot_uri: cli.snapshot_uri,
         idle_secs: cli.idle_secs,
         admin_token: cli.admin_token,

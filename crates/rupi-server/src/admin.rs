@@ -96,6 +96,7 @@ pub fn router() -> Router<App> {
             get(list_admin_keys).post(create_admin_key),
         )
         .route("/admin/api/admin-keys/{id}/revoke", post(revoke_admin_key))
+        .route("/admin/api/audit", get(list_audit))
 }
 
 async fn ui_index() -> impl IntoResponse {
@@ -147,6 +148,11 @@ fn internal(e: impl ToString) -> Response {
         Json(json!({"error": e.to_string()})),
     )
         .into_response()
+}
+
+async fn write_audit(app: &App, action: &str, target_type: &str, target_id: &str, detail: Value) {
+    let _ = db::insert_admin_audit(&app.pool, "admin", action, target_type, target_id, &detail)
+        .await;
 }
 
 async fn require_admin(app: &App, headers: &HeaderMap) -> Result<(), Response> {
@@ -556,6 +562,14 @@ async fn create_key(
     let row = db::create_api_key(&app.pool, &id, &raw)
         .await
         .map_err(internal)?;
+    write_audit(
+        &app,
+        "create_key",
+        "api_key",
+        &row.id,
+        json!({"tenantId": id, "prefix": row.key_prefix}),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -672,6 +686,20 @@ async fn patch_quota(
         .map_err(internal)?
         .ok_or_else(not_found)?;
     apply_quota(&app, &id, &body).await?;
+    write_audit(
+        &app,
+        "patch_quota",
+        "tenant",
+        &id,
+        json!({
+            "maxConcurrentRuns": body.max_concurrent_runs,
+            "maxHandles": body.max_handles,
+            "maxRunsPerDay": body.max_runs_per_day,
+            "maxTokensPerDay": body.max_tokens_per_day,
+            "maxQps": body.max_qps
+        }),
+    )
+    .await;
     get_quota(State(app), headers, Path(id)).await
 }
 
@@ -707,9 +735,53 @@ async fn patch_settings(
     db::update_settings(&app.pool, &id, &merged)
         .await
         .map_err(internal)?;
+    let keys: Vec<String> = body
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    write_audit(
+        &app,
+        "patch_settings",
+        "tenant",
+        &id,
+        json!({"keys": keys}),
+    )
+    .await;
     Ok(Json(json!({
         "ok": true,
         "settings": mask_settings(merged)
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct AuditQ {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn list_audit(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<AuditQ>,
+) -> Result<Json<Value>, Response> {
+    require_admin(&app, &headers).await?;
+    let limit = i64::from(q.limit.unwrap_or(50).min(200));
+    let rows = db::list_admin_audit(app.reader(), limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "audits": rows
+            .iter()
+            .map(|r| json!({
+                "id": r.id,
+                "actor": r.actor,
+                "action": r.action,
+                "targetType": r.target_type,
+                "targetId": r.target_id,
+                "detail": r.detail,
+                "createdAt": r.created_at
+            }))
+            .collect::<Vec<_>>()
     })))
 }
 

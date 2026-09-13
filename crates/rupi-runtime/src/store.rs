@@ -156,4 +156,14 @@ mod tests {
         assert!(store.put("../x", b"no").await.is_err());
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn local_store_two_instances_share_directory() {
+        let root = std::env::temp_dir().join(format!("rupi-obj-share-{}", uuid::Uuid::new_v4()));
+        let a = LocalObjectStore::new(&root);
+        let b = LocalObjectStore::new(&root);
+        a.put("ws/t/s/h.tgz", b"cross-replica").await.unwrap();
+        assert_eq!(b.get("ws/t/s/h.tgz").await.unwrap(), b"cross-replica");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
