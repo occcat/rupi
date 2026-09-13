@@ -646,7 +646,7 @@ async fn run_loop(
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI — Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
+    view.push_system("rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();

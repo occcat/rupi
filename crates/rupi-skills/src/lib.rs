@@ -618,7 +618,7 @@ impl SkillAccumulator {
             .replace('"', "\\\"");
         let mut body =
             format!("---\nname: {name}\ndescription: \"{safe_description}\"\n---\n\n# {name}\n\n");
-        body.push_str(" distilled from a successful session. Follow these steps:\n\n");
+        body.push_str("Steps:\n\n");
         for (i, st) in steps.iter().take(50).enumerate() {
             body.push_str(&format!("{}. {}\n", i + 1, st));
         }

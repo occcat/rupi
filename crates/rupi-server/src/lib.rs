@@ -1,4 +1,4 @@
-//! 无状态云控制面：AG-UI + 薄 REST。不链 `rupi-tui`。
+//! 无状态云控制面：AG-UI + 薄 REST。会话在 Postgres。不链接 `rupi-tui`。
 
 #![allow(clippy::too_many_arguments)]
 

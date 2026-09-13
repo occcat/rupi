@@ -1,5 +1,4 @@
-//! 管理面：独立 admin 凭证 + 运营 REST + 同进程静态控制台。
-//! 不是聊天 IDE，也不复刻 TUI。
+//! 管理面：独立 admin 凭证 + 运营 REST + 同进程静态页。
 
 use crate::agui::{self, RunAgentInput};
 use crate::auth;

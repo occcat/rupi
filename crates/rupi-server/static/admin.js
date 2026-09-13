@@ -130,7 +130,7 @@ async function render() {
     tenant: ["租户详情", "配额、settings、会话与 Key。"],
     sessions: ["会话目录", "按租户 / 区域 / 状态查看，可删除。"],
     executors: ["区域 / 执行池", "execd / sandboxd 容量与句柄。"],
-    keys: ["管理凭证", "独立 admin 口令或高权限 Key，无 OAuth。"],
+    keys: ["管理凭证", "环境口令 RUPI_ADMIN_TOKEN，或库内 rupi_admin_* Key。"],
   };
   const t = titles[r.name] || titles.overview;
   $("page-title").textContent = t[0];
@@ -456,12 +456,12 @@ async function openSession(id) {
         <strong>会话 ${esc(s.id)}</strong>
         <p class="muted">租户 ${esc(s.tenantId)} · ${badge(s.status)} · ${esc(s.runtime?.backend || "无后端")}</p>
         <div class="hint">
-          <div>打开某会话：对话仍走 AG-UI，不是本控制台。</div>
+          <div>对话：<code>POST /v1/agent</code> 或 <code>rupi cloud prompt</code>。</div>
           <pre>${esc(JSON.stringify(hint.bodyExample, null, 2))}</pre>
           <pre>${esc(hint.cli || "")}</pre>
         </div>
         <form id="f-debug" style="display:grid;gap:.55rem;margin-top:.8rem">
-          <label>最小 prompt 调试（运营试跑，不是 IDE）
+          <label>试跑一轮（<code>POST /admin/api/sessions/{id}/debug-run</code>）
             <textarea name="prompt" placeholder="hello"></textarea>
           </label>
           <button type="submit">试跑一轮</button>

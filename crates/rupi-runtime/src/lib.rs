@@ -1,7 +1,6 @@
 //! 云执行面：控制面只认 [`Executor`]，工具/bash 在外部进程落地。
 //!
-//! 本 crate **不含**「在 API 机起 Docker / `sh -c` 当默认执行面」。
-//! 可插拔后端：
+//! 后端：
 //! - `remote-http`：登记的 `rupi-execd`（远程机器池）
 //! - `sandbox`：`rupi-sandboxd` 集群 API（与 execd 协议并列）
 

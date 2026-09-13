@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "ratatui chat UI; cloud control plane does not link this crate"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }

@@ -1,5 +1,5 @@
-//! rupi-mcp: MCP-Direct 桥（Pi 官方立场：core 无 MCP，能力走扩展）。
-//! 实现 `spawn server → initialize → tools/list → registerTool` 全链路，
+//! rupi-mcp: MCP-Direct 桥（Pi core 无 MCP，能力走扩展）。
+//! `spawn server → initialize → tools/list → registerTool`，
 //! 外加 `resources/list → resources/read` 与 `prompts/list → prompts/get`
 //!（每 server 各一个 `{server}_read_resource` / `{server}_get_prompt` 原生工具）：
 //! stdio 上跑换行分隔的 JSON-RPC 2.0，30s 超时，`sanitize_params` 把 LLM 传回的

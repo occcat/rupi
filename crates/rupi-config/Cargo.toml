@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "Merge ~/.rupi/settings.json and project .rupi/settings.json"
 
 [dependencies]
 serde = { workspace = true }

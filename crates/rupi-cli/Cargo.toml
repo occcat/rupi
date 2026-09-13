@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
+description = "rupi binary: local TUI/CLI and rupi cloud thin client"
 
 [[bin]]
 name = "rupi"

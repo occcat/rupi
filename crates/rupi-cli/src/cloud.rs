@@ -1,5 +1,4 @@
-//! 本机 `rupi` 瘦客户端：只消费云控制面 AG-UI/HTTP。
-//! 不在本机执行 bash，不拉起 TUI。
+//! 本机 `rupi cloud`：对 `rupi-server` 发 AG-UI/HTTP。bash 在 Executor 上跑。
 
 use anyhow::Context;
 use clap::Subcommand;

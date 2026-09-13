@@ -9,9 +9,9 @@
 <body>
   <div id="login" class="login" hidden>
     <form id="login-form" class="login-card" autocomplete="off">
-      <p class="eyebrow">Rupi 控制面</p>
-      <h1>管理控制台</h1>
-      <p class="lede">用 <code>RUPI_ADMIN_TOKEN</code> 或 <code>rupi_admin_*</code> Key 登录。不做社交 / 订阅 OAuth。</p>
+      <p class="eyebrow">rupi-server</p>
+      <h1>管理面</h1>
+      <p class="lede">用 <code>RUPI_ADMIN_TOKEN</code> 或 <code>rupi_admin_*</code> Key 登录。</p>
       <label>管理凭证
         <input id="login-token" name="token" type="password" required placeholder="口令或 rupi_admin_…" spellcheck="false" autocomplete="off" data-1p-ignore data-lpignore="true">
       </label>
@@ -25,8 +25,8 @@
       <div class="brand">
         <span class="mark">R</span>
         <div>
-          <strong>Rupi</strong>
-          <small>运营控制台</small>
+          <strong>rupi-server</strong>
+          <small>/admin</small>
         </div>
       </div>
       <nav>
@@ -44,7 +44,7 @@
       <header class="top">
         <div>
           <h2 id="page-title">概览</h2>
-          <p id="page-sub" class="muted">云控制面运营，不是聊天 IDE。</p>
+          <p id="page-sub" class="muted">租户、会话、执行池与管理凭证。</p>
         </div>
         <div id="pills" class="pills"></div>
       </header>

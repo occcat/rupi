@@ -1,5 +1,5 @@
-//! rupi-llm: 统一 LLM API（对标 pi-ai）。
-//! Provider 无关：上层只依赖 [`LlmProvider`] trait；会话可混用多家消息，provider 只做尽力兼容。
+//! rupi-llm：[`LlmProvider`] trait 与各家 HTTP/SSE 实现（对标 pi-ai）。
+//! 上层只依赖 trait；会话可混用多家消息，provider 只做尽力兼容。
 
 use async_trait::async_trait;
 use rupi_core::{ContentBlock, Message, Role, ToolDefinition};
