@@ -25,6 +25,7 @@ pub fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
         .route("/v1/me", get(me))
         .route("/v1/settings", get(get_settings).patch(patch_settings))
         .route("/v1/models", get(models))
@@ -42,13 +43,37 @@ pub fn router(app: App) -> Router {
 
 async fn ready(State(app): State<App>) -> Json<Value> {
     let pg = app.pool.get().await.is_ok();
+    let nodes = app.executor.node_stats().await;
+    let exec_ok = !nodes.is_empty();
     Json(json!({
         "instanceId": app.instance_id,
         "region": app.region,
         "postgres": pg,
         "redis": app.cache.available().await,
-        "executors": app.executor.topology()
+        "executors": app.executor.topology(),
+        "nodes": nodes.iter().map(|n| json!({
+            "id": n.node_id,
+            "backend": n.backend,
+            "used": n.used,
+            "capacity": n.capacity,
+            "warm": n.warm,
+            "region": n.region,
+            "kind": n.kind
+        })).collect::<Vec<_>>(),
+        "ok": pg && exec_ok
     }))
+}
+
+async fn metrics(State(app): State<App>) -> impl IntoResponse {
+    let nodes = app.executor.node_stats().await;
+    let runs = app.metrics.runs.load(std::sync::atomic::Ordering::Relaxed);
+    let r429 = app.metrics.reject_429.load(std::sync::atomic::Ordering::Relaxed);
+    let used: u64 = nodes.iter().map(|n| n.used as u64).sum();
+    let cap: u64 = nodes.iter().map(|n| n.capacity as u64).sum();
+    let body = format!(
+        "# HELP rupi_runs_total admitted AG-UI runs\n# TYPE rupi_runs_total counter\nrupi_runs_total {runs}\n# HELP rupi_rejects_429_total quota/pool 429s\n# TYPE rupi_rejects_429_total counter\nrupi_rejects_429_total {r429}\n# HELP rupi_executor_used leased workspaces\n# TYPE rupi_executor_used gauge\nrupi_executor_used {used}\n# HELP rupi_executor_capacity pool capacity\n# TYPE rupi_executor_capacity gauge\nrupi_executor_capacity {cap}\n"
+    );
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 pub(crate) struct CancelOnDrop<S> {
@@ -140,14 +165,19 @@ async fn patch_settings(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
     let t = tenant_of(&app, &headers).await?;
-    let mut merged = t.settings;
-    if let (Some(dst), Some(src)) = (merged.as_object_mut(), body.as_object()) {
-        for (k, v) in src {
-            dst.insert(k.clone(), v.clone());
+    let allow_mock = std::env::var("RUPI_CLOUD_ALLOW_MOCK").ok().as_deref() == Some("1");
+    if !allow_mock {
+        if body.get("mock_script").is_some() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"mock_script is admin/test only"})),
+            )
+                .into_response());
         }
-    } else {
-        merged = body;
     }
+    let merged = crate::admin::merge_allowed_settings(t.settings, &body).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
+    })?;
     db::update_settings(&app.pool, &t.id, &merged)
         .await
         .map_err(|e| {
@@ -182,6 +212,10 @@ struct CreateSession {
     bootstrap: Option<String>,
     #[serde(default)]
     git_url: Option<String>,
+    #[serde(default)]
+    git_token: Option<String>,
+    #[serde(default)]
+    git_hosts: Option<Vec<String>>,
     #[serde(default)]
     region: Option<String>,
     #[serde(default)]
@@ -245,6 +279,27 @@ async fn create_session(
     let boot = match body.bootstrap.as_deref() {
         Some("git") => BootstrapKind::Git {
             url: body.git_url.unwrap_or_default(),
+            token: body
+                .git_token
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    t.settings
+                        .get("git_token")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                }),
+            hosts: body.git_hosts.unwrap_or_else(|| {
+                t.settings
+                    .get("git_hosts")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }),
         },
         _ => BootstrapKind::Empty,
     };
@@ -290,6 +345,7 @@ pub(crate) async fn teardown_session(app: &App, row: &db::SessionRow) {
             .destroy(&WorkspaceHandle {
                 id: h,
                 backend: b,
+                tenant_id: Some(row.tenant_id.clone()),
                 region: row.region.clone(),
                 kind: row.runtime_kind.clone(),
             })
@@ -488,7 +544,7 @@ async fn agent_run(
             Ok((st, Json(body)).into_response())
         }
         Preflight::Stream(rx, cancel) => {
-            let inner = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
+            let inner = tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
                 Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
             });
             let stream = CancelOnDrop {

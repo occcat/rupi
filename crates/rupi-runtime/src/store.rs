@@ -12,6 +12,7 @@ pub trait ObjectStore: Send + Sync {
 }
 
 /// 目录当对象桶。key 只允许 `[A-Za-z0-9/._-]`，禁止 `..`。
+/// 多副本要共享同一 `root`（NFS / 绑定盘）或改用 [`crate::s3::S3ObjectStore`]。
 #[derive(Clone, Debug)]
 pub struct LocalObjectStore {
     root: PathBuf,
@@ -24,6 +25,10 @@ impl LocalObjectStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn path_for_check(&self, key: &str) -> anyhow::Result<PathBuf> {
+        self.path_for(key)
     }
 
     fn path_for(&self, key: &str) -> anyhow::Result<PathBuf> {

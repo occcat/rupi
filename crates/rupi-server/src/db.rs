@@ -9,7 +9,41 @@ use uuid::Uuid;
 
 pub type PgPool = Pool;
 
+fn database_url_ok(database_url: &str) -> anyhow::Result<()> {
+    let insecure = std::env::var("RUPI_DB_INSECURE").ok().as_deref() == Some("1");
+    let lower = database_url.to_ascii_lowercase();
+    let host = lower
+        .split("://")
+        .nth(1)
+        .unwrap_or(&lower)
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "");
+    let wants_tls = lower.contains("sslmode=require")
+        || lower.contains("sslmode=verify-full")
+        || lower.contains("sslmode=verify-ca");
+    if !loopback && !wants_tls && !insecure {
+        anyhow::bail!(
+            "plaintext DATABASE_URL only allowed for loopback (got host {host}); use sslmode=require or RUPI_DB_INSECURE=1"
+        );
+    }
+    if wants_tls && !loopback {
+        tracing::warn!(
+            "DATABASE_URL requests TLS; this build still uses NoTls on the wire — put the control plane on a private network or terminate TLS at the proxy"
+        );
+    }
+    Ok(())
+}
+
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+    database_url_ok(database_url)?;
     let cfg: tokio_postgres::Config = database_url.parse()?;
     let mgr = Manager::from_config(
         cfg,
@@ -22,6 +56,7 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 }
 
 pub async fn connect_with_size(database_url: &str, max_size: usize) -> anyhow::Result<PgPool> {
+    database_url_ok(database_url)?;
     let cfg: tokio_postgres::Config = database_url.parse()?;
     let mgr = Manager::from_config(
         cfg,
@@ -168,7 +203,22 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
                key_prefix TEXT NOT NULL,
                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                revoked_at TIMESTAMPTZ
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS admin_audit (
+               id TEXT PRIMARY KEY,
+               actor TEXT NOT NULL,
+               action TEXT NOT NULL,
+               target_type TEXT,
+               target_id TEXT,
+               detail JSONB NOT NULL DEFAULT '{}',
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+               version INT PRIMARY KEY,
+               applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             INSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING;
+             INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;",
         )
         .await;
     Ok(())
@@ -956,6 +1006,89 @@ pub async fn insert_memory(
     Ok(id)
 }
 
+pub async fn replace_memory(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: Option<&str>,
+    content: &str,
+) -> anyhow::Result<u64> {
+    if rupi_memory::contains_secret(content) {
+        anyhow::bail!("refused: entry looks like a secret; store a reference instead");
+    }
+    let c = pool.get().await?;
+    if let Some(id) = id.filter(|s| !s.is_empty()) {
+        return Ok(c
+            .execute(
+                "UPDATE memories SET content = $3 WHERE tenant_id = $1 AND id = $2",
+                &[&tenant_id, &id, &content],
+            )
+            .await?);
+    }
+    Ok(c.execute(
+        "UPDATE memories SET content = $2
+         WHERE tenant_id = $1 AND id = (
+           SELECT id FROM memories WHERE tenant_id = $1
+           ORDER BY created_at DESC LIMIT 1
+         )",
+        &[&tenant_id, &content],
+    )
+    .await?)
+}
+
+pub async fn delete_memory(
+    pool: &PgPool,
+    tenant_id: &str,
+    id: Option<&str>,
+    entry: &str,
+) -> anyhow::Result<u64> {
+    let c = pool.get().await?;
+    if let Some(id) = id.filter(|s| !s.is_empty()) {
+        return Ok(c
+            .execute(
+                "DELETE FROM memories WHERE tenant_id = $1 AND id = $2",
+                &[&tenant_id, &id],
+            )
+            .await?);
+    }
+    Ok(c.execute(
+        "DELETE FROM memories WHERE tenant_id = $1 AND content = $2",
+        &[&tenant_id, &entry],
+    )
+    .await?)
+}
+
+pub async fn delete_tenant(pool: &PgPool, tenant_id: &str) -> anyhow::Result<u64> {
+    let c = pool.get().await?;
+    let _ = c
+        .execute(
+            "UPDATE api_keys SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL",
+            &[&tenant_id],
+        )
+        .await;
+    Ok(c.execute("DELETE FROM tenants WHERE id = $1", &[&tenant_id])
+        .await?)
+}
+
+pub async fn insert_admin_audit(
+    pool: &PgPool,
+    actor: &str,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    detail: &Value,
+) -> anyhow::Result<()> {
+    let id = Uuid::new_v4().to_string();
+    let c = pool.get().await?;
+    let _ = c
+        .execute(
+            "INSERT INTO admin_audit(id, actor, action, target_type, target_id, detail)
+             VALUES ($1,$2,$3,$4,$5,$6)",
+            &[&id, &actor, &action, &target_type, &target_id, detail],
+        )
+        .await;
+    Ok(())
+}
+
 pub async fn list_memories(
     pool: &PgPool,
     tenant_id: &str,
@@ -1177,7 +1310,7 @@ pub async fn today_quota(pool: &PgPool, tenant_id: &str) -> anyhow::Result<(i64,
 pub async fn reset_all(pool: &PgPool) -> anyhow::Result<()> {
     let c = pool.get().await?;
     c.batch_execute(
-        "TRUNCATE interrupts, memories, messages, sessions, api_keys, admin_keys, quota_ledger, workspace_snapshots, tenants CASCADE",
+        "TRUNCATE interrupts, memories, messages, sessions, api_keys, admin_keys, quota_ledger, workspace_snapshots, admin_audit, tenants CASCADE",
     )
     .await?;
     Ok(())
@@ -1633,4 +1766,25 @@ pub async fn list_tenant_regions(pool: &PgPool) -> anyhow::Result<Vec<String>> {
         )
         .await?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_url_plaintext_only_loopback_or_explicit() {
+        assert!(database_url_ok("postgres://rupi:rupi@127.0.0.1:5432/rupi").is_ok());
+        assert!(database_url_ok("postgresql://rupi:rupi@localhost:5432/rupi").is_ok());
+        assert!(
+            database_url_ok("postgres://rupi:rupi@db.example.com:5432/rupi?sslmode=require").is_ok()
+        );
+        if std::env::var("RUPI_DB_INSECURE").ok().as_deref() != Some("1") {
+            let err = database_url_ok("postgres://rupi:rupi@db.example.com:5432/rupi").unwrap_err();
+            assert!(
+                err.to_string().contains("loopback") || err.to_string().contains("sslmode"),
+                "{err:#}"
+            );
+        }
+    }
 }

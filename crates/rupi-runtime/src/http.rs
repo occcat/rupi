@@ -55,11 +55,13 @@ struct AllocBody<'a> {
 #[derive(Serialize)]
 struct HandleBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct ExecBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     command: &'a str,
     timeout_secs: Option<u64>,
 }
@@ -67,6 +69,7 @@ struct ExecBody<'a> {
 #[derive(Serialize)]
 struct FsReadBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     path: &'a str,
     offset: Option<u64>,
     limit: Option<u64>,
@@ -75,6 +78,7 @@ struct FsReadBody<'a> {
 #[derive(Serialize)]
 struct FsWriteBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     path: &'a str,
     content: &'a str,
 }
@@ -82,6 +86,7 @@ struct FsWriteBody<'a> {
 #[derive(Serialize)]
 struct FsEditBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     path: &'a str,
     arguments: &'a serde_json::Value,
 }
@@ -89,6 +94,7 @@ struct FsEditBody<'a> {
 #[derive(Serialize)]
 struct GlobBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     pattern: &'a str,
     path: Option<&'a str>,
 }
@@ -96,6 +102,7 @@ struct GlobBody<'a> {
 #[derive(Serialize)]
 struct GrepBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     pattern: &'a str,
     path: Option<&'a str>,
     include: Option<&'a str>,
@@ -105,6 +112,7 @@ struct GrepBody<'a> {
 #[derive(Serialize)]
 struct BootstrapBody<'a> {
     handle: &'a str,
+    tenant_id: Option<&'a str>,
     kind: &'a BootstrapKind,
 }
 
@@ -127,14 +135,26 @@ impl Executor for HttpExecutor {
 
     async fn release(&self, handle: &WorkspaceHandle) -> anyhow::Result<()> {
         let _: serde_json::Value = self
-            .post("/v1/release", &HandleBody { handle: &handle.id })
+            .post(
+                "/v1/release",
+                &HandleBody {
+                    handle: &handle.id,
+                    tenant_id: handle.tenant_id.as_deref(),
+                },
+            )
             .await?;
         Ok(())
     }
 
     async fn destroy(&self, handle: &WorkspaceHandle) -> anyhow::Result<()> {
         let _: serde_json::Value = self
-            .post("/v1/destroy", &HandleBody { handle: &handle.id })
+            .post(
+                "/v1/destroy",
+                &HandleBody {
+                    handle: &handle.id,
+                    tenant_id: handle.tenant_id.as_deref(),
+                },
+            )
             .await?;
         Ok(())
     }
@@ -144,11 +164,25 @@ impl Executor for HttpExecutor {
             "/v1/exec",
             &ExecBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 command: &req.command,
                 timeout_secs: req.timeout_secs,
             },
         )
         .await
+    }
+
+    async fn abort(&self, handle: &WorkspaceHandle) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                "/v1/abort",
+                &HandleBody {
+                    handle: &handle.id,
+                    tenant_id: handle.tenant_id.as_deref(),
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn fs_read(
@@ -160,6 +194,7 @@ impl Executor for HttpExecutor {
             "/v1/fs/read",
             &FsReadBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 path: &req.path,
                 offset: req.offset,
                 limit: req.limit,
@@ -177,6 +212,7 @@ impl Executor for HttpExecutor {
             "/v1/fs/write",
             &FsWriteBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 path: &req.path,
                 content: &req.content,
             },
@@ -193,6 +229,7 @@ impl Executor for HttpExecutor {
             "/v1/fs/edit",
             &FsEditBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 path: &req.path,
                 arguments: &req.arguments,
             },
@@ -205,6 +242,7 @@ impl Executor for HttpExecutor {
             "/v1/glob",
             &GlobBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 pattern: &req.pattern,
                 path: req.path.as_deref(),
             },
@@ -217,6 +255,7 @@ impl Executor for HttpExecutor {
             "/v1/grep",
             &GrepBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 pattern: &req.pattern,
                 path: req.path.as_deref(),
                 include: req.include.as_deref(),
@@ -235,6 +274,7 @@ impl Executor for HttpExecutor {
             "/v1/bootstrap",
             &BootstrapBody {
                 handle: &handle.id,
+                tenant_id: handle.tenant_id.as_deref(),
                 kind: &kind,
             },
         )
@@ -247,7 +287,13 @@ impl Executor for HttpExecutor {
             archive_b64: String,
         }
         let out: Out = self
-            .post("/v1/snapshot", &HandleBody { handle: &handle.id })
+            .post(
+                "/v1/snapshot",
+                &HandleBody {
+                    handle: &handle.id,
+                    tenant_id: handle.tenant_id.as_deref(),
+                },
+            )
             .await?;
         crate::store::b64_decode(&out.archive_b64)
     }
@@ -256,6 +302,7 @@ impl Executor for HttpExecutor {
         #[derive(Serialize)]
         struct In<'a> {
             handle: &'a str,
+            tenant_id: Option<&'a str>,
             archive_b64: String,
         }
         let _: serde_json::Value = self
@@ -263,6 +310,7 @@ impl Executor for HttpExecutor {
                 "/v1/restore",
                 &In {
                     handle: &handle.id,
+                    tenant_id: handle.tenant_id.as_deref(),
                     archive_b64: crate::store::b64_encode(blob),
                 },
             )

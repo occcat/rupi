@@ -90,6 +90,7 @@ impl Dual {
             token: "scale-tok".into(),
             max_workspaces,
             warm_pool: 0,
+            insecure: false,
         })
         .await
         .ok()?;
@@ -301,6 +302,7 @@ async fn idle_snapshot_releases_and_restores() {
     let handle = rupi_runtime::WorkspaceHandle {
         id: row.runtime_handle.clone().unwrap(),
         backend: row.runtime_backend.clone().unwrap(),
+        tenant_id: Some(row.tenant_id.clone()),
         region: row.region.clone(),
         kind: row.runtime_kind.clone(),
     };

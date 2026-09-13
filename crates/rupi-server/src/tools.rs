@@ -215,9 +215,18 @@ impl Tool for ExecFsTool {
     async fn execute_with_cancel(
         &self,
         arguments: serde_json::Value,
-        _cancel: &CancelFlag,
+        cancel: &CancelFlag,
     ) -> anyhow::Result<ToolOutput> {
-        self.execute(arguments).await
+        if cancel.is_cancelled() {
+            return Ok(ToolOutput::err("cancelled"));
+        }
+        tokio::select! {
+            r = self.execute(arguments) => r,
+            _ = cancel.cancelled() => {
+                let _ = self.exec.abort(&self.handle).await;
+                Ok(ToolOutput::err("cancelled"))
+            }
+        }
     }
 }
 
@@ -272,6 +281,23 @@ impl Tool for ExecBashTool {
             Ok(ToolOutput::err(s))
         } else {
             Ok(ToolOutput::ok(s))
+        }
+    }
+
+    async fn execute_with_cancel(
+        &self,
+        arguments: serde_json::Value,
+        cancel: &CancelFlag,
+    ) -> anyhow::Result<ToolOutput> {
+        if cancel.is_cancelled() {
+            return Ok(ToolOutput::err("cancelled"));
+        }
+        tokio::select! {
+            r = self.execute(arguments) => r,
+            _ = cancel.cancelled() => {
+                let _ = self.exec.abort(&self.handle).await;
+                Ok(ToolOutput::err("cancelled"))
+            }
         }
     }
 }

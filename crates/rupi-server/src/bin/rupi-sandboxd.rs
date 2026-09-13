@@ -18,6 +18,9 @@ struct Cli {
     warm_pool: u32,
     #[arg(long, env = "RUPI_REGION", default_value = "local")]
     region: String,
+    /// 空 token 仅回环监听允许；非回环必须带 --token。
+    #[arg(long, env = "RUPI_EXEC_INSECURE", default_value_t = false)]
+    insecure: bool,
 }
 
 #[tokio::main]
@@ -37,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         max_sandboxes: cli.max_sandboxes,
         warm_pool: cli.warm_pool,
         region: cli.region,
+        insecure: cli.insecure,
     })
     .await
 }

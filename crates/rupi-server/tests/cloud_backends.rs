@@ -84,6 +84,7 @@ impl Harness {
             token: "tok".into(),
             max_workspaces: 16,
             warm_pool: 0,
+            insecure: false,
         })
         .await
         .ok()?;
@@ -94,6 +95,7 @@ impl Harness {
             max_sandboxes: 16,
             warm_pool: 0,
             region: "local".into(),
+            insecure: false,
         })
         .await
         .ok()?;

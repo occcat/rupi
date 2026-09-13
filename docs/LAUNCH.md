@@ -1,0 +1,169 @@
+# 上线说明
+
+对着真实 CLI flag 写。没有的开关这里也不写。本机 CLI/TUI 打磨（find/ls、theme、`/copy` 等）不挡上线。
+
+对照：[`UPSTREAM.md`](UPSTREAM.md)。
+
+## 组件
+
+1. PostgreSQL：会话、记忆、配额、审计权威
+2. Redis：缓存。挂了必须能读库
+3. `rupi-execd` 和/或 `rupi-sandboxd`：用户 bash 只在这里
+4. `rupi-server`：无状态控制面，可多副本
+5. `/admin`：`RUPI_ADMIN_TOKEN` 或库内 `rupi_admin_*` Key
+
+控制面进程里不跑用户 `sh -c`。`sandboxd` 是句柄根 jail（bwrap / landlock / chroot 尽力），**不是**微 VM。
+
+## 真实开关
+
+### `rupi-server`
+
+| flag | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `--listen` | `RUPI_LISTEN` | `127.0.0.1:8080` | 控制面监听 |
+| `--database-url` | `DATABASE_URL` | （必填） | Postgres |
+| `--database-read-url` | `DATABASE_READ_URL` | 无 | 只读副本；hydrate / 写仍走主库 |
+| `--redis-url` | `REDIS_URL` | `redis://127.0.0.1:6379` | 缓存 |
+| `--executor-url` | `RUPI_EXECUTOR_URL` | 空 | 单个 execd |
+| `--executor-urls` | `RUPI_EXECUTOR_URLS` | 空 | 逗号分隔，可写 `region=url`；优先于单个 URL |
+| `--sandbox-urls` | `RUPI_SANDBOX_URLS` | 空 | sandboxd 节点，格式同上 |
+| `--executor-token` | `RUPI_EXEC_TOKEN` | 空 | 打执行节点的口令 |
+| `--region` | `RUPI_REGION` | `local` | 本副本区域标签 |
+| `--instance-id` | `RUPI_INSTANCE_ID` | 随机 UUID | 副本身份 |
+| `--snapshot-dir` | `RUPI_SNAPSHOT_DIR` | `/tmp/rupi-snapshots` | 本机对象盘（多副本不够） |
+| `--snapshot-uri` | `RUPI_SNAPSHOT_URI` | 无 | `s3://bucket/prefix` 或 `memory:`（测试）；优先于 snapshot-dir |
+| `--insecure-exec` | `RUPI_EXEC_INSECURE` | false | 允许控制面用明文 HTTP 打**非回环**执行节点 |
+| `--idle-secs` | `RUPI_IDLE_SECS` | 1800 | 闲置回收 |
+| `--admin-token` | `RUPI_ADMIN_TOKEN` | 空 | 管理面共享口令 |
+| `--bootstrap-tenant NAME` | — | 无 | 建租户、打印明文 Key 后**退出** |
+| `--bootstrap-admin` | — | false | 建管理 Key、打印后**退出** |
+
+没有 `--tls` / `--mode` / `--bind`。对外 443 把 TLS 终止放在前面，控制面仍是 `--listen`。
+
+### `rupi-execd`
+
+| flag | 环境变量 | 默认 |
+|---|---|---|
+| `--listen` | — | `127.0.0.1:8090` |
+| `--root` | — | `/tmp/rupi-execd` |
+| `--token` | `RUPI_EXEC_TOKEN` | 空 |
+| `--max-workspaces` | `RUPI_EXEC_MAX` | 64 |
+| `--warm-pool` | `RUPI_EXEC_WARM` | 2 |
+| `--insecure` | `RUPI_EXEC_INSECURE` | false |
+
+### `rupi-sandboxd`
+
+与 execd 相同的 `--listen` / `--root` / `--token` / `--warm-pool` / `--insecure`，另有：
+
+| flag | 环境变量 | 默认 |
+|---|---|---|
+| `--max-sandboxes` | `RUPI_SANDBOX_MAX` | 64 |
+| `--region` | `RUPI_REGION` | `local` |
+
+### 仅环境变量（无独立 clap）
+
+| 变量 | 作用 |
+|---|---|
+| `RUPI_DB_INSECURE=1` | 允许非回环明文 `DATABASE_URL` |
+| `RUPI_CLOUD_ALLOW_MOCK=1` | 租户 `PATCH /v1/settings` 可以写 `mock_script` |
+| `RUPI_CLOUD_MOCK` / `RUPI_MOCK_SCRIPT` | 控制面走 mock 剧本（本地/CI） |
+| `RUPI_S3_ENDPOINT` 或 `AWS_ENDPOINT_URL` | S3 兼容 endpoint（默认 `https://s3.amazonaws.com`） |
+| `RUPI_S3_REGION` 或 `AWS_REGION` | 默认 `us-east-1` |
+| `RUPI_S3_ACCESS_KEY` 或 `AWS_ACCESS_KEY_ID` | 必填（用 `s3://` 时） |
+| `RUPI_S3_SECRET_KEY` 或 `AWS_SECRET_ACCESS_KEY` | 必填（用 `s3://` 时） |
+
+## 必须守住的默认值
+
+- **空 token**：非回环监听直接拒启动。回环空 token 还必须带 `--insecure`（或 `RUPI_EXEC_INSECURE=1`）。`0.0.0.0` 即使 `--insecure` 也不能空 token。比较走恒定时间 `tokens_eq`。
+- **Postgres**：非回环明文 URL 拒启动，除非 `sslmode=require` / `verify-full` / `verify-ca`，或 `RUPI_DB_INSECURE=1`。**当前客户端仍是 `NoTls`**：`sslmode=require` 只过策略检查，不在本进程做 rustls。生产把库放在内网，或在前面终 TLS。
+- **执行面 URL**：控制面打 `http://` 非回环节点必须 `--insecure-exec`。回环 `http://127.0.0.1` 可以。生产用 HTTPS 或不要把 execd 暴露到公网。
+- `--bootstrap-tenant` / `--bootstrap-admin` 只用来种第一把 Key。正式进程不要带。
+- 租户 BYOK 按 provider 读 `anthropic_api_key` / `gemini_api_key` / `openai_api_key`（或 `api_key`）。不会把 OpenAI key 塞给 Anthropic。
+- `git` bootstrap 只接受 `https://` 或 `git@host:path`，host 默认白名单（github.com / gitlab.com / bitbucket.org / git.sr.ht / codeberg.org），可用 settings / 请求体 `git_hosts` 加。租户 token 只进这一次 clone。
+- 租户 `PATCH /v1/settings` 与管理面同一白名单；`***` 不覆盖密钥；`mock_script` 仅 `RUPI_CLOUD_ALLOW_MOCK=1` 或管理面。
+
+## 本机先跑通（回环）
+
+回环也要带执行口令。空 token 起 execd 必须再加 `--insecure`，生产不要这么干。
+
+```bash
+# Postgres / Redis 自备
+export RUPI_ADMIN_TOKEN=...
+export RUPI_EXEC_TOKEN=...
+export DATABASE_URL=postgres://rupi:rupi@127.0.0.1:5432/rupi
+
+# 种 Key（打印后退出）
+./target/release/rupi-server \
+  --database-url "$DATABASE_URL" \
+  --bootstrap-admin
+./target/release/rupi-server \
+  --database-url "$DATABASE_URL" \
+  --bootstrap-tenant demo
+# 上面打印的租户 Key 当作 RUPI_CLOUD_KEY
+
+./target/release/rupi-execd \
+  --listen 127.0.0.1:8090 \
+  --root /var/lib/rupi/execd \
+  --token "$RUPI_EXEC_TOKEN"
+
+# 可选第二种后端
+./target/release/rupi-sandboxd \
+  --listen 127.0.0.1:8190 \
+  --root /var/lib/rupi/sandboxd \
+  --token "$RUPI_EXEC_TOKEN"
+
+./target/release/rupi-server \
+  --listen 127.0.0.1:8080 \
+  --database-url "$DATABASE_URL" \
+  --redis-url redis://127.0.0.1:6379 \
+  --executor-urls http://127.0.0.1:8090 \
+  --sandbox-urls http://127.0.0.1:8190 \
+  --executor-token "$RUPI_EXEC_TOKEN" \
+  --admin-token "$RUPI_ADMIN_TOKEN"
+```
+
+验收：
+
+```bash
+curl -sS http://127.0.0.1:8080/health
+curl -sS http://127.0.0.1:8080/ready
+curl -sS http://127.0.0.1:8080/metrics
+curl -sS -H "Authorization: Bearer $RUPI_ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/me
+curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" http://127.0.0.1:8080/v1/me
+# POST /v1/agent 用租户 Key
+# 掐 SSE 后 AgentLoop 停、exec 停
+# 租户 A 的 bash 读不到租户 B 的卷
+```
+
+管理面：`http://127.0.0.1:8080/admin`。
+
+## 对外听
+
+`--listen 0.0.0.0:8080`（或前面反代的 443）。执行面不要对公网裸 HTTP。多副本共用同一 Postgres / Redis，以及共享对象存储：
+
+```bash
+export RUPI_SNAPSHOT_URI=s3://rupi-snapshots/prod
+export RUPI_S3_ENDPOINT=https://s3.example.com
+export RUPI_S3_REGION=us-east-1
+export RUPI_S3_ACCESS_KEY=...
+export RUPI_S3_SECRET_KEY=...
+```
+
+工作区在 Executor 上，不在 API 盘。`--snapshot-dir` 只够单机。
+
+非回环 Postgres 示例（策略层要求 TLS 字样；进程内仍是 NoTls）：
+
+```bash
+--database-url "postgres://rupi:rupi@db.internal:5432/rupi?sslmode=require"
+```
+
+非回环执行面明文必须同时：
+
+```bash
+rupi-server --insecure-exec --executor-urls http://10.0.0.8:8090 ...
+# 且 execd 必须有非空 --token
+```
+
+## 未在本机验证
+
+Windows `powershell` 本轮未做。CI 是 ubuntu / macos。

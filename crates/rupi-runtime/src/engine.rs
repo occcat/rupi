@@ -1,8 +1,11 @@
 //! 执行节点上的工作区引擎。`sh -c` / 文件工具只出现在这里，不进控制面。
+//! bash 箍在句柄根；句柄绑 `tenant_id`，对不上 403。
 
-use crate::{store, BootstrapKind, ExecResult, ToolText};
+use crate::jail::{self, Isolation};
+use crate::{store, tar, BootstrapKind, ExecResult, ToolText};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -11,6 +14,7 @@ use uuid::Uuid;
 pub enum EngineError {
     Exhausted,
     NotFound,
+    Forbidden,
     Other(String),
 }
 
@@ -19,6 +23,7 @@ impl std::fmt::Display for EngineError {
         match self {
             Self::Exhausted => f.write_str("pool_exhausted"),
             Self::NotFound => f.write_str("unknown handle"),
+            Self::Forbidden => f.write_str("tenant mismatch"),
             Self::Other(s) => f.write_str(s),
         }
     }
@@ -30,22 +35,27 @@ pub struct EngineConfig {
     pub root: PathBuf,
     pub max_workspaces: u32,
     pub warm_pool: u32,
+    pub isolation: Isolation,
 }
 
 struct Slot {
     dir: PathBuf,
+    tenant_id: String,
     last_used: Instant,
+    children: Vec<u32>,
 }
 
 pub struct Engine {
     cfg: EngineConfig,
     leased: Mutex<HashMap<String, Slot>>,
     warm: Mutex<Vec<PathBuf>>,
+    cancel_seq: AtomicU32,
 }
 
 pub struct Lease {
     pub id: String,
     pub dir: PathBuf,
+    pub tenant_id: String,
 }
 
 impl Engine {
@@ -54,11 +64,16 @@ impl Engine {
             cfg,
             leased: Mutex::new(HashMap::new()),
             warm: Mutex::new(Vec::new()),
+            cancel_seq: AtomicU32::new(1),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.cfg.root
+    }
+
+    pub fn isolation(&self) -> Isolation {
+        self.cfg.isolation
     }
 
     pub async fn refill_warm(&self) {
@@ -83,6 +98,9 @@ impl Engine {
     }
 
     pub async fn alloc(&self, tenant: &str, session: &str) -> Result<Lease, EngineError> {
+        if tenant.is_empty() || tenant.contains("..") || tenant.contains('/') {
+            return Err(EngineError::Other("invalid tenant".into()));
+        }
         let leased_n = self.leased.lock().await.len() as u32;
         if leased_n >= self.cfg.max_workspaces.max(1) {
             return Err(EngineError::Exhausted);
@@ -111,16 +129,36 @@ impl Engine {
             id.clone(),
             Slot {
                 dir: dest.clone(),
+                tenant_id: tenant.to_string(),
                 last_used: Instant::now(),
+                children: Vec::new(),
             },
         );
-        Ok(Lease { id, dir: dest })
+        Ok(Lease {
+            id,
+            dir: dest,
+            tenant_id: tenant.to_string(),
+        })
     }
 
+    /// 旧接口：不带 tenant。生产路径请用 [`dir_for`]。
     pub async fn dir(&self, handle: &str) -> Result<PathBuf, EngineError> {
+        self.dir_for(handle, None).await
+    }
+
+    pub async fn dir_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+    ) -> Result<PathBuf, EngineError> {
         let mut g = self.leased.lock().await;
         match g.get_mut(handle) {
             Some(s) => {
+                if let Some(t) = tenant {
+                    if s.tenant_id != t {
+                        return Err(EngineError::Forbidden);
+                    }
+                }
                 s.last_used = Instant::now();
                 Ok(s.dir.clone())
             }
@@ -128,7 +166,15 @@ impl Engine {
         }
     }
 
+    pub async fn require_tenant(&self, handle: &str, tenant: &str) -> Result<PathBuf, EngineError> {
+        if tenant.is_empty() {
+            return Err(EngineError::Forbidden);
+        }
+        self.dir_for(handle, Some(tenant)).await
+    }
+
     pub async fn release(&self, handle: &str) -> Result<(), EngineError> {
+        self.abort(handle).await;
         let slot = self.leased.lock().await.remove(handle);
         if let Some(slot) = slot {
             wipe_dir(&slot.dir).await;
@@ -143,10 +189,27 @@ impl Engine {
     }
 
     pub async fn destroy(&self, handle: &str) -> Result<(), EngineError> {
+        self.abort(handle).await;
         if let Some(slot) = self.leased.lock().await.remove(handle) {
             let _ = tokio::fs::remove_dir_all(slot.dir).await;
         }
         Ok(())
+    }
+
+    pub async fn abort(&self, handle: &str) {
+        let pids = {
+            let mut g = self.leased.lock().await;
+            g.get_mut(handle)
+                .map(|s| std::mem::take(&mut s.children))
+                .unwrap_or_default()
+        };
+        for pid in pids {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = pid;
+        }
     }
 
     pub async fn exec(
@@ -155,28 +218,41 @@ impl Engine {
         command: &str,
         timeout_secs: Option<u64>,
     ) -> Result<ExecResult, EngineError> {
-        let dir = self.dir(handle).await?;
+        self.exec_for(handle, None, command, timeout_secs).await
+    }
+
+    pub async fn exec_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+        command: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecResult, EngineError> {
+        let dir = match tenant {
+            Some(t) => self.require_tenant(handle, t).await?,
+            None => self.dir(handle).await?,
+        };
         let timeout = timeout_secs.unwrap_or(30).clamp(1, 300);
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(&dir)
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            cmd.as_std_mut().process_group(0);
-        }
+        let mut cmd = jail::command(&dir, command, self.cfg.isolation)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
         let child = cmd
             .spawn()
             .map_err(|e| EngineError::Other(e.to_string()))?;
+        if let Some(pid) = child.id() {
+            if let Some(s) = self.leased.lock().await.get_mut(handle) {
+                s.children.push(pid);
+            }
+        }
+        let handle_id = handle.to_string();
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(timeout),
             child.wait_with_output(),
         )
         .await;
+        if let Some(s) = self.leased.lock().await.get_mut(&handle_id) {
+            s.children.clear();
+        }
+        let _ = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
         Ok(match out {
             Ok(Ok(o)) => ExecResult {
                 stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -188,11 +264,14 @@ impl Engine {
                 stderr: e.to_string(),
                 exit_code: 1,
             },
-            Err(_) => ExecResult {
-                stdout: String::new(),
-                stderr: "timed out".into(),
-                exit_code: 124,
-            },
+            Err(_) => {
+                self.abort(handle).await;
+                ExecResult {
+                    stdout: String::new(),
+                    stderr: "timed out".into(),
+                    exit_code: 124,
+                }
+            }
         })
     }
 
@@ -200,9 +279,22 @@ impl Engine {
         &self,
         handle: &str,
         name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolText, EngineError> {
+        self.fs_tool_for(handle, None, name, args).await
+    }
+
+    pub async fn fs_tool_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+        name: &str,
         mut args: serde_json::Value,
     ) -> Result<ToolText, EngineError> {
-        let dir = self.dir(handle).await?;
+        let dir = match tenant {
+            Some(t) => self.require_tenant(handle, t).await?,
+            None => self.dir(handle).await?,
+        };
         let tools = rupi_tools::ToolRegistry::with_sandboxed_builtins(&dir);
         if let Some(obj) = args.as_object_mut() {
             if name != "bash" {
@@ -231,27 +323,43 @@ impl Engine {
         handle: &str,
         kind: &BootstrapKind,
     ) -> Result<ToolText, EngineError> {
-        let dir = self.dir(handle).await?;
+        self.bootstrap_for(handle, None, kind).await
+    }
+
+    pub async fn bootstrap_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+        kind: &BootstrapKind,
+    ) -> Result<ToolText, EngineError> {
+        let dir = match tenant {
+            Some(t) => self.require_tenant(handle, t).await?,
+            None => self.dir(handle).await?,
+        };
         match kind {
             BootstrapKind::Empty => Ok(ToolText::ok("empty workspace")),
-            BootstrapKind::Git { url } => {
-                let st = tokio::process::Command::new("git")
-                    .args(["clone", "--depth", "1", url, "."])
-                    .current_dir(&dir)
-                    .output()
+            BootstrapKind::Git { url, token, hosts } => {
+                let spec = crate::git::parse_git_url(url).map_err(EngineError::Other)?;
+                crate::git::clone_into(&dir, &spec, token.as_deref(), hosts)
                     .await
-                    .map_err(|e| EngineError::Other(e.to_string()))?;
-                if st.status.success() {
-                    Ok(ToolText::ok(format!("cloned {url}")))
-                } else {
-                    Ok(ToolText::err(String::from_utf8_lossy(&st.stderr)))
-                }
+                    .map_err(EngineError::Other)
             }
         }
     }
 
     pub async fn snapshot(&self, handle: &str) -> Result<Vec<u8>, EngineError> {
-        let dir = self.dir(handle).await?;
+        self.snapshot_for(handle, None).await
+    }
+
+    pub async fn snapshot_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+    ) -> Result<Vec<u8>, EngineError> {
+        let dir = match tenant {
+            Some(t) => self.require_tenant(handle, t).await?,
+            None => self.dir(handle).await?,
+        };
         let tmp = self
             .cfg
             .root
@@ -284,7 +392,19 @@ impl Engine {
     }
 
     pub async fn restore(&self, handle: &str, blob: &[u8]) -> Result<(), EngineError> {
-        let dir = self.dir(handle).await?;
+        self.restore_for(handle, None, blob).await
+    }
+
+    pub async fn restore_for(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+        blob: &[u8],
+    ) -> Result<(), EngineError> {
+        let dir = match tenant {
+            Some(t) => self.require_tenant(handle, t).await?,
+            None => self.dir(handle).await?,
+        };
         wipe_dir(&dir).await;
         let tmp = self
             .cfg
@@ -299,19 +419,11 @@ impl Engine {
         tokio::fs::write(&tmp, blob)
             .await
             .map_err(|e| EngineError::Other(e.to_string()))?;
-        let st = tokio::process::Command::new("tar")
-            .args([
-                "-C",
-                &dir.display().to_string(),
-                "-xzf",
-                &tmp.display().to_string(),
-            ])
-            .status()
-            .await
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let extracted = tar::extract_checked(&tmp, &dir).await;
         let _ = tokio::fs::remove_file(&tmp).await;
-        if !st.success() {
-            return Err(EngineError::Other("tar restore failed".into()));
+        if let Err(e) = extracted {
+            wipe_dir(&dir).await;
+            return Err(EngineError::Other(e));
         }
         Ok(())
     }
@@ -336,4 +448,92 @@ pub fn b64_archive(bytes: &[u8]) -> String {
 
 pub fn b64_decode(s: &str) -> Result<Vec<u8>, EngineError> {
     store::b64_decode(s).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(root: PathBuf) -> EngineConfig {
+        EngineConfig {
+            root,
+            max_workspaces: 8,
+            warm_pool: 0,
+            isolation: Isolation::Jail,
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_mismatch_is_forbidden() {
+        let root = std::env::temp_dir().join(format!("rupi-eng-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = Engine::new(cfg(root.clone()));
+        let a = eng.alloc("ten-a", "s1").await.unwrap();
+        let err = eng.require_tenant(&a.id, "ten-b").await.unwrap_err();
+        assert!(matches!(err, EngineError::Forbidden), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn bash_cannot_read_neighbor_volume() {
+        let root = std::env::temp_dir().join(format!("rupi-jail-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = Engine::new(cfg(root.clone()));
+        let a = eng.alloc("ten-a", "s1").await.unwrap();
+        let b = eng.alloc("ten-b", "s1").await.unwrap();
+        std::fs::write(a.dir.join("secret.txt"), "NEIGHBOR-SECRET").unwrap();
+        let inside = eng
+            .exec_for(&b.id, Some("ten-b"), "echo IN-VOLUME", Some(10))
+            .await
+            .expect("in-volume bash must start");
+        assert!(
+            inside.stdout.contains("IN-VOLUME"),
+            "in-volume bash failed: exit={} stdout={:?} stderr={:?}",
+            inside.exit_code,
+            inside.stdout,
+            inside.stderr
+        );
+        let escaped = format!(
+            "cat {} 2>/dev/null || cat ../{}/s1/{}/secret.txt 2>/dev/null || cat ../../ten-a/s1/{}/secret.txt 2>/dev/null; echo DONE",
+            a.dir.join("secret.txt").display(),
+            "ten-a",
+            a.id,
+            a.id
+        );
+        let out = eng
+            .exec_for(&b.id, Some("ten-b"), &escaped, Some(10))
+            .await
+            .expect("jailed bash must start");
+        assert!(
+            out.stdout.contains("DONE"),
+            "jailed bash did not finish: exit={} stdout={:?} stderr={:?}",
+            out.exit_code,
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            !out.stdout.contains("NEIGHBOR-SECRET"),
+            "jail leaked neighbor: {}",
+            out.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn poison_tar_restore_fails_and_wipes() {
+        let root = std::env::temp_dir().join(format!("rupi-restore-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = Engine::new(cfg(root.clone()));
+        let h = eng.alloc("ten", "s").await.unwrap();
+        let Ok(blob) = tar::poison_tarball() else {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        };
+        let err = eng.restore(&h.id, &blob).await.unwrap_err();
+        assert!(format!("{err}").contains("unsafe") || format!("{err}").contains("tar"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

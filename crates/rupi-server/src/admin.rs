@@ -42,6 +42,8 @@ pub const ALLOWED_SETTING_KEYS: &[&str] = &[
     "gemini_api_key",
     "base_url",
     "mock_script",
+    "git_token",
+    "git_hosts",
 ];
 
 pub const SECRET_SETTING_KEYS: &[&str] = &[
@@ -49,6 +51,7 @@ pub const SECRET_SETTING_KEYS: &[&str] = &[
     "api_key",
     "anthropic_api_key",
     "gemini_api_key",
+    "git_token",
 ];
 
 pub fn router() -> Router<App> {
@@ -62,7 +65,7 @@ pub fn router() -> Router<App> {
         .route("/admin/api/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/admin/api/tenants/{id}",
-            get(get_tenant).patch(patch_tenant),
+            get(get_tenant).patch(patch_tenant).delete(delete_tenant),
         )
         .route(
             "/admin/api/tenants/{id}/keys",
@@ -491,6 +494,38 @@ async fn patch_tenant(
     Ok(Json(tenant_json(&t)))
 }
 
+async fn delete_tenant(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Response> {
+    require_admin(&app, &headers).await?;
+    let t = db::load_tenant(&app.pool, &id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(not_found)?;
+    let sessions = db::list_sessions(&app.pool, &t.id).await.map_err(internal)?;
+    for row in sessions {
+        teardown_session(&app, &row).await;
+    }
+    let n = db::delete_tenant(&app.pool, &t.id)
+        .await
+        .map_err(internal)?;
+    if n == 0 {
+        return Err(not_found());
+    }
+    let _ = db::insert_admin_audit(
+        &app.pool,
+        "admin",
+        "delete_tenant",
+        "tenant",
+        &t.id,
+        &json!({"name": t.name}),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_keys(
     State(app): State<App>,
     headers: HeaderMap,
@@ -765,6 +800,15 @@ async fn debug_run(
     Json(body): Json<DebugBody>,
 ) -> Result<Response, Response> {
     require_admin(&app, &headers).await?;
+    let _ = db::insert_admin_audit(
+        &app.pool,
+        "admin",
+        "debug_run",
+        "session",
+        &id,
+        &json!({"promptChars": body.prompt.len()}),
+    )
+    .await;
     let prompt = body.prompt.trim();
     if prompt.is_empty() {
         return Err(bad("prompt required"));
@@ -799,7 +843,7 @@ async fn debug_run(
             Ok((st, Json(body)).into_response())
         }
         Preflight::Stream(rx, cancel) => {
-            let inner = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
+            let inner = tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
                 Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
             });
             let stream = http::CancelOnDrop { inner, cancel };

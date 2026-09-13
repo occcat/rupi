@@ -9,15 +9,23 @@ use serde::{Deserialize, Serialize};
 
 pub mod engine;
 pub mod execd;
+pub mod git;
 pub mod http;
+pub mod jail;
 pub mod pool;
+pub mod s3;
 pub mod sandbox;
 pub mod sandbox_http;
 pub mod store;
+pub mod tar;
+pub mod token;
 
+pub use jail::Isolation;
 pub use pool::{is_pool_exhausted, parse_endpoint_list, PoolExhausted, PoolNode, PoolScheduler};
+pub use s3::{MemoryObjectStore, S3Config, S3ObjectStore};
 pub use sandbox_http::SandboxExecutor;
 pub use store::{LocalObjectStore, ObjectStore};
+pub use token::{is_loopback_bind, is_loopback_url, tokens_eq, validate_executor_url, validate_listen_token};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -80,6 +88,8 @@ pub struct WorkspaceHandle {
     pub id: String,
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -90,9 +100,15 @@ impl WorkspaceHandle {
         Self {
             id: id.into(),
             backend: backend.into(),
+            tenant_id: None,
             region: None,
             kind: None,
         }
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant.into());
+        self
     }
 }
 
@@ -153,7 +169,13 @@ pub struct GrepRequest {
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapKind {
     Empty,
-    Git { url: String },
+    Git {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hosts: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +242,11 @@ pub trait Executor: Send + Sync {
     async fn release(&self, handle: &WorkspaceHandle) -> anyhow::Result<()>;
     async fn destroy(&self, handle: &WorkspaceHandle) -> anyhow::Result<()>;
     async fn exec(&self, handle: &WorkspaceHandle, req: ExecRequest) -> anyhow::Result<ExecResult>;
+
+    /// 停掉该句柄上进行中的命令。默认空实现。
+    async fn abort(&self, _handle: &WorkspaceHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn fs_read(
         &self,
         handle: &WorkspaceHandle,
@@ -283,6 +310,7 @@ mod tests {
         let h = WorkspaceHandle {
             id: "abc".into(),
             backend: "remote-http".into(),
+            tenant_id: Some("ten".into()),
             region: Some("us-east".into()),
             kind: Some("remote-http".into()),
         };
