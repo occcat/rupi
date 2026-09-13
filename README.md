@@ -79,13 +79,16 @@ export RUPI_GEMINI_KEY=...      # 或 GEMINI_API_KEY / GOOGLE_API_KEY
 
 **3.1 起执行节点**
 
+回环也要带 `--token`。空 token 仅 `127.0.0.1` 且必须 `--insecure`。`0.0.0.0` 禁止空 token。生产步骤见 [`docs/LAUNCH.md`](docs/LAUNCH.md)。
+
 ```bash
-./target/debug/rupi-execd --listen 127.0.0.1:8090 --root /tmp/rupi-execd
+export RUPI_EXEC_TOKEN=...
+./target/debug/rupi-execd --listen 127.0.0.1:8090 --root /tmp/rupi-execd --token "$RUPI_EXEC_TOKEN"
 # 或
-./target/debug/rupi-sandboxd --listen 127.0.0.1:8190 --root /tmp/rupi-sandboxd
+./target/debug/rupi-sandboxd --listen 127.0.0.1:8190 --root /tmp/rupi-sandboxd --token "$RUPI_EXEC_TOKEN"
 ```
 
-URL 可写 `region=url`。两种后端可以并存。
+URL 可写 `region=url`。两种后端可以并存。`sandboxd` 是句柄根 jail，不是微 VM。
 
 **3.2 起控制面**
 
@@ -98,6 +101,7 @@ URL 可写 `region=url`。两种后端可以并存。
   --redis-url redis://127.0.0.1:6379 \
   --executor-urls http://127.0.0.1:8090 \
   --sandbox-urls http://127.0.0.1:8190 \
+  --executor-token "$RUPI_EXEC_TOKEN" \
   --admin-token "$RUPI_ADMIN_TOKEN"
 ```
 
@@ -162,6 +166,7 @@ curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" http://127.0.0.1:8080/v1/me
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/LAUNCH.md`](docs/LAUNCH.md) | 云上线：真实 flag、默认安全值、回环与对外听 |
 | [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | 上游对照、有意偏离、未移植 |
 | [`BRANCH_COMPARISON.md`](BRANCH_COMPARISON.md) | 三分支历史评审 |
 | [`crates/*/README.md`](crates/) | 各 crate 职责与命令 |

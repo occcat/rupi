@@ -91,6 +91,7 @@ impl Regions {
             token: "tok".into(),
             max_workspaces: 16,
             warm_pool: 0,
+            insecure: false,
         })
         .await
         .ok()?;
@@ -101,6 +102,7 @@ impl Regions {
             max_sandboxes: 16,
             warm_pool: 0,
             region: "eu-west".into(),
+            insecure: false,
         })
         .await
         .ok()?;

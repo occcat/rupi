@@ -90,6 +90,7 @@ impl Load {
             token: "load".into(),
             max_workspaces: 2000,
             warm_pool: 0,
+            insecure: false,
         })
         .await
         .ok()?;

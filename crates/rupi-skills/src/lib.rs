@@ -222,6 +222,46 @@ impl SkillRegistry {
         n
     }
 
+    /// 云路径：把 Executor 读到的 `SKILL.md` 落临时目录再 ingest。
+    pub fn ingest_markdown(&self, hint: &str, body: &str) -> anyhow::Result<usize> {
+        let stem = hint
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != "SKILL.md")
+            .next_back()
+            .unwrap_or("remote");
+        let name: String = stem
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let name = if name.is_empty() {
+            "remote".to_string()
+        } else {
+            name
+        };
+        let dir = std::env::temp_dir().join("rupi-remote-skills").join(format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )).join(&name);
+        std::fs::create_dir_all(&dir)?;
+        let raw = if body.trim_start().starts_with("---") {
+            body.to_string()
+        } else {
+            format!("---\nname: {name}\ndescription: workspace skill {name}\n---\n{body}")
+        };
+        std::fs::write(dir.join("SKILL.md"), raw)?;
+        Ok(self.ingest_paths(&[dir]))
+    }
+
     /// `--skill` 显式路径：文件走 `load_file`，目录走 `SKILL.md`。同名保留先发现者。
     /// 与 `--no-skills` 组合时只收这些路径（对标 Pi：`--no-*` + 显式仍生效）。
     pub fn ingest_paths(&self, paths: &[PathBuf]) -> usize {

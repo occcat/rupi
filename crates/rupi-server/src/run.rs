@@ -17,18 +17,20 @@ use rupi_agent::{
 use rupi_core::{CancelFlag, ContentBlock, Message, Role, SessionTree};
 use rupi_llm::{LlmProvider, MockProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager, MemoryStore};
-use rupi_runtime::WorkspaceHandle;
+use rupi_runtime::{Executor, FsReadRequest, GlobRequest, WorkspaceHandle};
 use rupi_skills::SkillRegistry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub enum Preflight {
-    Stream(mpsc::UnboundedReceiver<AguiEvent>, rupi_core::CancelFlag),
+    Stream(mpsc::Receiver<AguiEvent>, rupi_core::CancelFlag),
     Status { code: u16, body: serde_json::Value },
 }
 
-fn emit(tx: &mpsc::UnboundedSender<AguiEvent>, ev: AguiEvent) {
-    let _ = tx.send(ev);
+fn emit(tx: &mpsc::Sender<AguiEvent>, ev: AguiEvent) {
+    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(ev) {
+        tracing::warn!("ag-ui sse backlog full; dropping event");
+    }
 }
 
 pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Preflight {
@@ -103,6 +105,7 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
 
     match quota::admit_run(&app.cache, &app.pool, &tenant).await {
         crate::quota::Admit::TooMany => {
+            app.metrics.reject_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Preflight::Status {
                 code: 429,
                 body: serde_json::json!({"error": "quota"}),
@@ -110,6 +113,7 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         }
         crate::quota::Admit::Ok => {}
     }
+    app.metrics.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if !quota::acquire_lease(
         &app.cache,
@@ -128,9 +132,11 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         };
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<AguiEvent>();
+    let (tx, rx) = mpsc::channel::<AguiEvent>(256);
     let cancel = CancelFlag::new();
     let cancel_drive = cancel.clone();
+    let err_thread = input.thread_id.clone();
+    let err_run = input.run_id.clone();
     tokio::spawn(async move {
         if let Err(e) = drive(
             app.clone(),
@@ -142,7 +148,10 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         )
         .await
         {
-            emit(&tx, agui::run_error(&e.to_string(), None));
+            emit(
+                &tx,
+                agui::run_error(&e.to_string(), None, Some(&err_thread), Some(&err_run)),
+            );
         }
     });
     Preflight::Stream(rx, cancel)
@@ -153,7 +162,7 @@ async fn drive(
     tenant: Tenant,
     sess: db::SessionRow,
     input: RunAgentInput,
-    tx: mpsc::UnboundedSender<AguiEvent>,
+    tx: mpsc::Sender<AguiEvent>,
     cancel: CancelFlag,
 ) -> anyhow::Result<()> {
     emit(
@@ -200,6 +209,13 @@ async fn drive(
         }
     };
     let handle = reclaim::ensure_hot(&app, &tenant.id, &sess).await?;
+    let abort_exec = app.executor.clone();
+    let abort_handle = handle.clone();
+    let abort_cancel = cancel.clone();
+    tokio::spawn(async move {
+        abort_cancel.cancelled().await;
+        let _ = abort_exec.abort(&abort_handle).await;
+    });
     let _ = db::touch_session(&app.pool, &tenant.id, &input.thread_id).await;
 
     let hb_app = app.clone();
@@ -268,8 +284,8 @@ async fn drive(
 
     let tools = cloud_tools(app.executor.clone(), handle.clone());
     let skills = SkillRegistry::default();
+    load_remote_guidance(app.executor.as_ref(), &handle, &mut tree, &skills).await;
     let provider = app.provider_for(&tenant);
-    let cancel = CancelFlag::new();
 
     let pending = db::pending_interrupts(&app.pool, &tenant.id, &input.thread_id).await?;
     let pending_ids: Vec<String> = pending.iter().map(|p| p.id.clone()).collect();
@@ -294,8 +310,21 @@ async fn drive(
     let mut mapper = EventMapper::new(input.thread_id.clone(), input.run_id.clone());
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<rupi_core::AgentEvent>();
     let map_tx = tx.clone();
+    let bump_pool = app.pool.clone();
+    let bump_tenant = tenant.id.clone();
     let map_task = tokio::spawn(async move {
         while let Some(ev) = ev_rx.recv().await {
+            if let rupi_core::AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } = &ev
+            {
+                let n = (*input_tokens as i64).saturating_add(*output_tokens as i64);
+                if n > 0 {
+                    let _ = db::bump_quota_tokens(&bump_pool, &bump_tenant, n).await;
+                }
+            }
             for a in mapper.map(&ev) {
                 emit(&map_tx, a);
             }
@@ -343,6 +372,7 @@ async fn drive(
         .await
     } else {
         let user = last_user_from_input(&input)
+            .await
             .ok_or_else(|| anyhow::anyhow!("RunAgentInput.messages must end with a user turn"))?;
         for ctx in &input.context {
             if !ctx.value.is_empty() {
@@ -374,7 +404,10 @@ async fn drive(
     match result {
         Ok(_) => {}
         Err(e) => {
-            emit(&tx, agui::run_error(&e.to_string(), None));
+            emit(
+                &tx,
+                agui::run_error(&e.to_string(), None, Some(&input.thread_id), Some(&input.run_id)),
+            );
             finish(&app, &tenant, &input.thread_id, &input.run_id, &tree).await;
             hb.abort();
             return Ok(());
@@ -670,7 +703,25 @@ async fn apply_state(pool: &PgPool, tenant_id: &str, input: &RunAgentInput) -> a
 
 async fn finish(app: &App, tenant: &Tenant, thread: &str, run_id: &str, tree: &SessionTree) {
     let _ = db::persist_tree(&app.pool, &tenant.id, thread, tree).await;
-    app.cache.invalidate_session(&tenant.id, thread).await;
+    if let Ok(raw) = serde_json::to_string(tree) {
+        let _ = app
+            .cache
+            .set_ex(&Cache::sess_tree_key(&tenant.id, thread), &raw, 300)
+            .await;
+    }
+    let meta = serde_json::json!({
+        "sessionId": thread,
+        "nodes": tree.nodes.len(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = app
+        .cache
+        .set_ex(
+            &Cache::sess_meta_key(&tenant.id, thread),
+            &meta.to_string(),
+            300,
+        )
+        .await;
     app.cache.invalidate_memory(&tenant.id).await;
     quota::release_lease(
         &app.cache,
@@ -716,29 +767,188 @@ pub fn cached_mock(tenant: &Tenant) -> Option<Arc<MockProvider>> {
     None
 }
 
-/// 测试可注入剧本；默认 Mock（无 BYOK）或租户 settings 里的模型。
-pub fn default_provider(tenant: &Tenant) -> Arc<dyn LlmProvider> {
-    if let Some(p) = cached_mock(tenant) {
-        return p;
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Byok {
+    pub model: String,
+    pub provider: String,
+    pub api_key: Option<String>,
+}
+
+/// 按模型/provider 选对应 settings 键；禁止把 OpenAI key 塞给 Anthropic/Gemini。
+pub fn resolve_byok(tenant: &Tenant) -> Byok {
     let model = tenant
         .settings
         .get("model")
         .and_then(|v| v.as_str())
         .or(tenant.default_model.as_deref())
-        .unwrap_or("gpt-4o-mini");
-    let key = tenant
+        .unwrap_or("gpt-4o-mini")
+        .to_string();
+    let forced = tenant
         .settings
-        .get("openai_api_key")
-        .or_else(|| tenant.settings.get("api_key"))
+        .get("provider")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("RUPI_API_KEY").ok());
-    let opts = rupi_llm::ProviderOptions {
-        api_key: key,
-        ..Default::default()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "mock")
+        .map(|s| s.to_ascii_lowercase());
+    let spec = rupi_llm::parse_model_spec(&model);
+    let provider = forced
+        .or(spec.provider.clone())
+        .unwrap_or_else(|| {
+            if model.starts_with("claude-") {
+                "anthropic".into()
+            } else if model.starts_with("gemini-") {
+                "gemini".into()
+            } else {
+                "openai".into()
+            }
+        });
+    let key = match provider.as_str() {
+        "anthropic" => tenant
+            .settings
+            .get("anthropic_api_key")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("RUPI_ANTHROPIC_KEY").ok())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+        "gemini" => tenant
+            .settings
+            .get("gemini_api_key")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("RUPI_GEMINI_KEY").ok())
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+        _ => tenant
+            .settings
+            .get("openai_api_key")
+            .or_else(|| tenant.settings.get("api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("RUPI_API_KEY").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
     };
-    rupi_llm::provider_or_mock(model, &opts).into()
+    Byok {
+        model,
+        provider,
+        api_key: key,
+    }
+}
+
+/// 测试可注入剧本；默认 Mock（无 BYOK）或租户 settings 里的模型。
+pub fn default_provider(tenant: &Tenant) -> Arc<dyn LlmProvider> {
+    if let Some(p) = cached_mock(tenant) {
+        return p;
+    }
+    let byok = resolve_byok(tenant);
+    let opts = rupi_llm::ProviderOptions {
+        api_key: byok.api_key,
+        provider: Some(byok.provider),
+    };
+    rupi_llm::provider_or_mock(&byok.model, &opts).into()
+}
+
+async fn load_remote_guidance(
+    exec: &dyn Executor,
+    handle: &WorkspaceHandle,
+    tree: &mut SessionTree,
+    skills: &SkillRegistry,
+) {
+    for name in ["AGENTS.md", "agents.md", "CLAUDE.md"] {
+        let got = exec
+            .fs_read(
+                handle,
+                FsReadRequest {
+                    path: name.into(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await;
+        if let Ok(t) = got {
+            if !t.is_error && !t.content.trim().is_empty() {
+                tree.push(Message::text(
+                    Role::System,
+                    format!("[workspace {name}]\n{}", t.content),
+                ));
+            }
+        }
+    }
+    if let Ok(g) = exec
+        .glob(
+            handle,
+            GlobRequest {
+                pattern: "**/SKILL.md".into(),
+                path: None,
+            },
+        )
+        .await
+    {
+        if !g.is_error {
+            for line in g.content.lines().take(32) {
+                let path = line.trim();
+                if path.is_empty() || path.contains("..") {
+                    continue;
+                }
+                if let Ok(md) = exec
+                    .fs_read(
+                        handle,
+                        FsReadRequest {
+                            path: path.into(),
+                            offset: None,
+                            limit: None,
+                        },
+                    )
+                    .await
+                {
+                    if !md.is_error && !md.content.trim().is_empty() {
+                        let _ = skills.ingest_markdown(path, &md.content);
+                    }
+                }
+            }
+        }
+    }
+    for pat in ["commands/*.md", ".rupi/commands/*.md"] {
+        if let Ok(g) = exec
+            .glob(
+                handle,
+                GlobRequest {
+                    pattern: pat.into(),
+                    path: None,
+                },
+            )
+            .await
+        {
+            if g.is_error {
+                continue;
+            }
+            for line in g.content.lines().take(16) {
+                let path = line.trim();
+                if path.is_empty() {
+                    continue;
+                }
+                if let Ok(md) = exec
+                    .fs_read(
+                        handle,
+                        FsReadRequest {
+                            path: path.into(),
+                            offset: None,
+                            limit: None,
+                        },
+                    )
+                    .await
+                {
+                    if !md.is_error && !md.content.trim().is_empty() {
+                        tree.push(Message::text(
+                            Role::System,
+                            format!("[command {path}]\n{}", md.content),
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn script_item_to_response(v: serde_json::Value) -> rupi_llm::ChatResponse {
@@ -774,4 +984,70 @@ fn script_item_to_response(v: serde_json::Value) -> rupi_llm::ChatResponse {
         .and_then(|t| t.as_str())
         .unwrap_or("ok");
     MockProvider::text_response(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tenant_with(settings: serde_json::Value, model: Option<&str>) -> Tenant {
+        Tenant {
+            id: "t".into(),
+            name: "t".into(),
+            settings,
+            default_model: model.map(str::to_owned),
+            max_concurrent_runs: 2,
+            max_handles: 8,
+            max_runs_per_day: 100,
+            max_tokens_per_day: 1000,
+            default_region: None,
+            max_qps: 8,
+        }
+    }
+
+    #[test]
+    fn byok_uses_anthropic_key_for_claude() {
+        let t = tenant_with(
+            json!({
+                "model": "claude-sonnet-4-0",
+                "openai_api_key": "sk-openai",
+                "anthropic_api_key": "sk-ant"
+            }),
+            None,
+        );
+        let b = resolve_byok(&t);
+        assert_eq!(b.provider, "anthropic");
+        assert_eq!(b.api_key.as_deref(), Some("sk-ant"));
+    }
+
+    #[test]
+    fn byok_uses_gemini_key() {
+        let t = tenant_with(
+            json!({
+                "provider": "gemini",
+                "model": "gemini-2.0-flash",
+                "openai_api_key": "sk-openai",
+                "gemini_api_key": "gem-k"
+            }),
+            None,
+        );
+        let b = resolve_byok(&t);
+        assert_eq!(b.provider, "gemini");
+        assert_eq!(b.api_key.as_deref(), Some("gem-k"));
+    }
+
+    #[test]
+    fn byok_does_not_reuse_openai_key_for_claude() {
+        let t = tenant_with(
+            json!({
+                "model": "claude-3-5-haiku-latest",
+                "openai_api_key": "sk-openai"
+            }),
+            None,
+        );
+        let b = resolve_byok(&t);
+        assert_eq!(b.provider, "anthropic");
+        assert!(b.api_key.is_none());
+    }
 }

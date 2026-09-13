@@ -15,7 +15,8 @@ rupi-server \
   --database-url postgres://rupi:rupi@127.0.0.1:5432/rupi \
   --redis-url redis://127.0.0.1:6379 \
   --executor-urls http://127.0.0.1:8090 \
+  --executor-token "$RUPI_EXEC_TOKEN" \
   --admin-token "$RUPI_ADMIN_TOKEN"
 ```
 
-`--bootstrap-tenant NAME` / `--bootstrap-admin` 建一把明文 Key 后退出，给本地和 CI。没有订阅登录。
+`--bootstrap-tenant NAME` / `--bootstrap-admin` 建一把明文 Key 后退出，给本地和 CI。没有订阅登录。上线步骤和全部真实 flag 见 [`docs/LAUNCH.md`](../../docs/LAUNCH.md)。

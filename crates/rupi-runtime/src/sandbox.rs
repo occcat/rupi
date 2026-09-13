@@ -1,8 +1,10 @@
-//! `rupi-sandboxd`：外部 sandbox 集群 API（与 `rupi-execd` 协议并列、可插拔）。
+//! `rupi-sandboxd`：Linux jail 工作区后端（landlock + 尽量断网），不是微 VM / 容器集群。
 //!
-//! 控制面只认 HTTP；本进程才碰工作区与命令。不是本机 Docker 默认执行面。
+//! 与 `rupi-execd` 协议并列、可插拔。控制面只认 HTTP；本进程才碰工作区与命令。
 
 use crate::engine::{Engine, EngineConfig, EngineError};
+use crate::jail::Isolation;
+use crate::token::{tokens_eq, validate_listen_token};
 use crate::{store, BootstrapKind, ExecResult, ExecutorStats, ToolText};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -21,6 +23,7 @@ pub struct SandboxdConfig {
     pub max_sandboxes: u32,
     pub warm_pool: u32,
     pub region: String,
+    pub insecure: bool,
 }
 
 impl Default for SandboxdConfig {
@@ -32,6 +35,7 @@ impl Default for SandboxdConfig {
             max_sandboxes: 64,
             warm_pool: 2,
             region: "local".into(),
+            insecure: false,
         }
     }
 }
@@ -47,6 +51,7 @@ struct SandboxCreated {
     backend: String,
     kind: String,
     region: String,
+    tenant_id: String,
 }
 
 pub async fn serve(cfg: SandboxdConfig) -> anyhow::Result<()> {
@@ -58,6 +63,7 @@ pub async fn serve(cfg: SandboxdConfig) -> anyhow::Result<()> {
 pub async fn spawn(
     cfg: SandboxdConfig,
 ) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+    validate_listen_token(&cfg.bind, &cfg.token, cfg.insecure).map_err(|e| anyhow::anyhow!(e))?;
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!("rupi-sandboxd listen {addr} region={}", cfg.region);
@@ -75,6 +81,7 @@ pub fn router(cfg: SandboxdConfig) -> Router {
         root: cfg.root.clone(),
         max_workspaces: cfg.max_sandboxes,
         warm_pool: cfg.warm_pool,
+        isolation: Isolation::Sandbox,
     });
     let state = Arc::new(Inner { cfg, engine });
     let warm_state = state.clone();
@@ -88,6 +95,7 @@ pub fn router(cfg: SandboxdConfig) -> Router {
         .route("/v1/sandboxes/{id}", delete(destroy))
         .route("/v1/sandboxes/{id}/release", post(release))
         .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route("/v1/sandboxes/{id}/abort", post(abort))
         .route("/v1/sandboxes/{id}/fs/read", post(fs_read))
         .route("/v1/sandboxes/{id}/fs/write", post(fs_write))
         .route("/v1/sandboxes/{id}/fs/edit", post(fs_edit))
@@ -102,13 +110,13 @@ pub fn router(cfg: SandboxdConfig) -> Router {
 
 fn auth_ok(state: &Inner, headers: &HeaderMap) -> bool {
     if state.cfg.token.is_empty() {
-        return true;
+        return state.cfg.insecure && crate::token::is_loopback_bind(&state.cfg.bind);
     }
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == state.cfg.token)
+        .is_some_and(|t| tokens_eq(t, &state.cfg.token))
 }
 
 fn deny() -> (StatusCode, String) {
@@ -119,7 +127,15 @@ fn map_err(e: EngineError) -> (StatusCode, String) {
     match e {
         EngineError::Exhausted => (StatusCode::TOO_MANY_REQUESTS, "pool_exhausted".into()),
         EngineError::NotFound => (StatusCode::NOT_FOUND, "unknown sandbox".into()),
+        EngineError::Forbidden => (StatusCode::FORBIDDEN, "tenant mismatch".into()),
         EngineError::Other(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+    }
+}
+
+fn tenant_of(body_tenant: Option<&str>) -> Result<&str, (StatusCode, String)> {
+    match body_tenant.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => Ok(t),
+        None => Err((StatusCode::FORBIDDEN, "tenant_id required".into())),
     }
 }
 
@@ -158,7 +174,12 @@ async fn create(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let _ = body.image;
+    if body.image.as_deref().is_some_and(|s| !s.is_empty() && s != "default") {
+        tracing::info!(
+            "sandbox image={} ignored (jail backend, not a micro-VM)",
+            body.image.as_deref().unwrap_or("")
+        );
+    }
     let lease = state
         .engine
         .alloc(&body.tenant_id, &body.session_id)
@@ -173,17 +194,31 @@ async fn create(
         backend: "sandbox".into(),
         kind: "sandbox".into(),
         region: state.cfg.region.clone(),
+        tenant_id: body.tenant_id,
     }))
+}
+
+#[derive(Deserialize)]
+struct TenantIn {
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn destroy(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Json(body): Json<TenantIn>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    state
+        .engine
+        .require_tenant(&id, t)
+        .await
+        .map_err(map_err)?;
     state.engine.destroy(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -192,10 +227,17 @@ async fn release(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Json(body): Json<TenantIn>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    state
+        .engine
+        .require_tenant(&id, t)
+        .await
+        .map_err(map_err)?;
     state.engine.release(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -204,6 +246,8 @@ async fn release(
 struct ExecIn {
     command: String,
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn exec(
@@ -215,13 +259,33 @@ async fn exec(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
     Ok(Json(
         state
             .engine
-            .exec(&id, &body.command, body.timeout_secs)
+            .exec_for(&id, Some(t), &body.command, body.timeout_secs)
             .await
             .map_err(map_err)?,
     ))
+}
+
+async fn abort(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<TenantIn>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !auth_ok(&state, &headers) {
+        return Err(deny());
+    }
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    state
+        .engine
+        .require_tenant(&id, t)
+        .await
+        .map_err(map_err)?;
+    state.engine.abort(&id).await;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 #[derive(Deserialize)]
@@ -229,6 +293,8 @@ struct FsReadIn {
     path: String,
     offset: Option<u64>,
     limit: Option<u64>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn fs_read(
@@ -247,10 +313,11 @@ async fn fs_read(
     if let Some(l) = body.limit {
         args["limit"] = l.into();
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
     Ok(Json(
         state
             .engine
-            .fs_tool(&id, "read", args)
+            .fs_tool_for(&id, Some(t), "read", args)
             .await
             .map_err(map_err)?,
     ))
@@ -260,6 +327,8 @@ async fn fs_read(
 struct FsWriteIn {
     path: String,
     content: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn fs_write(
@@ -271,11 +340,13 @@ async fn fs_write(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
     Ok(Json(
         state
             .engine
-            .fs_tool(
+            .fs_tool_for(
                 &id,
+                Some(t),
                 "write",
                 serde_json::json!({"path": body.path, "content": body.content}),
             )
@@ -288,6 +359,8 @@ async fn fs_write(
 struct FsEditIn {
     path: String,
     arguments: serde_json::Value,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn fs_edit(
@@ -303,10 +376,11 @@ async fn fs_edit(
     if args.get("path").is_none() {
         args["path"] = serde_json::Value::String(body.path);
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
     Ok(Json(
         state
             .engine
-            .fs_tool(&id, "edit", args)
+            .fs_tool_for(&id, Some(t), "edit", args)
             .await
             .map_err(map_err)?,
     ))
@@ -316,6 +390,8 @@ async fn fs_edit(
 struct GlobIn {
     pattern: String,
     path: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn glob(
@@ -327,13 +403,14 @@ async fn glob(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let dir = state.engine.dir(&id).await.map_err(map_err)?;
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    let dir = state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
     args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     Ok(Json(
         state
             .engine
-            .fs_tool(&id, "glob", args)
+            .fs_tool_for(&id, Some(t), "glob", args)
             .await
             .map_err(map_err)?,
     ))
@@ -345,6 +422,8 @@ struct GrepIn {
     path: Option<String>,
     include: Option<String>,
     max_results: Option<u64>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn grep(
@@ -356,7 +435,8 @@ async fn grep(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let dir = state.engine.dir(&id).await.map_err(map_err)?;
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    let dir = state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
     args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     if let Some(inc) = body.include {
@@ -368,7 +448,7 @@ async fn grep(
     Ok(Json(
         state
             .engine
-            .fs_tool(&id, "grep", args)
+            .fs_tool_for(&id, Some(t), "grep", args)
             .await
             .map_err(map_err)?,
     ))
@@ -377,6 +457,8 @@ async fn grep(
 #[derive(Deserialize)]
 struct BootstrapIn {
     kind: BootstrapKind,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn bootstrap(
@@ -388,24 +470,37 @@ async fn bootstrap(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
+    let t = tenant_of(body.tenant_id.as_deref())?;
     Ok(Json(
         state
             .engine
-            .bootstrap(&id, &body.kind)
+            .bootstrap_for(&id, Some(t), &body.kind)
             .await
             .map_err(map_err)?,
     ))
+}
+
+#[derive(Deserialize)]
+struct SnapshotIn {
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn snapshot(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Json(body): Json<SnapshotIn>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    let bytes = state.engine.snapshot(&id).await.map_err(map_err)?;
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    let bytes = state
+        .engine
+        .snapshot_for(&id, Some(t))
+        .await
+        .map_err(map_err)?;
     Ok(Json(serde_json::json!({
         "bytes": bytes.len(),
         "archive_b64": store::b64_encode(&bytes),
@@ -415,6 +510,8 @@ async fn snapshot(
 #[derive(Deserialize)]
 struct RestoreIn {
     archive_b64: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 async fn restore(
@@ -428,7 +525,12 @@ async fn restore(
     }
     let bytes = store::b64_decode(&body.archive_b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    state.engine.restore(&id, &bytes).await.map_err(map_err)?;
+    let t = tenant_of(body.tenant_id.as_deref())?;
+    state
+        .engine
+        .restore_for(&id, Some(t), &bytes)
+        .await
+        .map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true, "bytes": bytes.len()})))
 }
 
@@ -450,6 +552,7 @@ mod tests {
             max_sandboxes: 2,
             warm_pool: 0,
             region: "eu-west".into(),
+            insecure: false,
         })
         .await
         .unwrap();

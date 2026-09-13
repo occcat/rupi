@@ -67,6 +67,7 @@ pub async fn snapshot_and_release(app: &App, sess: &SessionRow) -> anyhow::Resul
     let handle = WorkspaceHandle {
         id: hid.clone(),
         backend: backend.clone(),
+        tenant_id: Some(sess.tenant_id.clone()),
         region: sess.region.clone(),
         kind: sess.runtime_kind.clone(),
     };
@@ -101,6 +102,7 @@ pub async fn ensure_hot(
             return Ok(WorkspaceHandle {
                 id: h.clone(),
                 backend: b.clone(),
+                tenant_id: Some(sess.tenant_id.clone()),
                 region: sess.region.clone(),
                 kind: sess.runtime_kind.clone(),
             });

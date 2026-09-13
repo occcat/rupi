@@ -108,10 +108,21 @@ pub fn run_finished_interrupt(
     )
 }
 
-pub fn run_error(message: &str, code: Option<&str>) -> AguiEvent {
+pub fn run_error(
+    message: &str,
+    code: Option<&str>,
+    thread: Option<&str>,
+    run: Option<&str>,
+) -> AguiEvent {
     let mut f = json!({"message": message});
     if let Some(c) = code {
         f["code"] = json!(c);
+    }
+    if let Some(t) = thread {
+        f["threadId"] = json!(t);
+    }
+    if let Some(r) = run {
+        f["runId"] = json!(r);
     }
     AguiEvent::new("RUN_ERROR", f)
 }
@@ -189,13 +200,16 @@ impl EventMapper {
                         "toolCallName": name
                     }),
                 ));
-                out.push(AguiEvent::new(
-                    "TOOL_CALL_ARGS",
-                    json!({
-                        "toolCallId": tool_call_id,
-                        "delta": arguments.to_string()
-                    }),
-                ));
+                let raw = arguments.to_string();
+                for chunk in raw.as_bytes().chunks(32) {
+                    out.push(AguiEvent::new(
+                        "TOOL_CALL_ARGS",
+                        json!({
+                            "toolCallId": tool_call_id,
+                            "delta": String::from_utf8_lossy(chunk)
+                        }),
+                    ));
+                }
                 out.push(AguiEvent::new(
                     "TOOL_CALL_END",
                     json!({"toolCallId": tool_call_id}),
@@ -226,10 +240,12 @@ impl EventMapper {
                     "REASONING_START",
                     json!({"messageId": id}),
                 ));
-                out.push(AguiEvent::new(
-                    "REASONING_MESSAGE_CONTENT",
-                    json!({"messageId": id, "delta": text}),
-                ));
+                for chunk in text.as_bytes().chunks(24) {
+                    out.push(AguiEvent::new(
+                        "REASONING_MESSAGE_CONTENT",
+                        json!({"messageId": id, "delta": String::from_utf8_lossy(chunk)}),
+                    ));
+                }
                 out.push(AguiEvent::new("REASONING_END", json!({"messageId": id})));
             }
             AgentEvent::TurnStart { turn } => {
@@ -273,7 +289,12 @@ impl EventMapper {
             }
             AgentEvent::Error { message } => {
                 self.close_text(&mut out);
-                out.push(run_error(message, None));
+                out.push(run_error(
+                    message,
+                    None,
+                    Some(&self.thread_id),
+                    Some(&self.run_id),
+                ));
             }
             // UiPrompt / MemoryRecall / UiHint / Steering / ModelChange / RunEnd：
             // 不出网或由宿主另发官方生命周期。禁止 RAW/CUSTOM。
@@ -291,12 +312,77 @@ impl EventMapper {
     }
 }
 
-pub fn last_user_from_input(input: &RunAgentInput) -> Option<Message> {
+pub async fn last_user_from_input(input: &RunAgentInput) -> Option<Message> {
     let last = input.messages.iter().rev().find(|m| m.role == "user")?;
-    Some(agui_user_to_message(last))
+    Some(agui_user_to_message_async(last).await)
 }
 
 pub fn agui_user_to_message(m: &AguiMessage) -> Message {
+    blocks_to_user_message(m, Vec::new())
+}
+
+pub async fn agui_user_to_message_async(m: &AguiMessage) -> Message {
+    let mut extra = Vec::new();
+    if let Some(Value::Array(arr)) = &m.content {
+        for part in arr {
+            if part.get("type").and_then(|t| t.as_str()) != Some("image") {
+                continue;
+            }
+            let Some(src) = part.get("source") else {
+                continue;
+            };
+            if src.get("type").and_then(|t| t.as_str()) != Some("url") {
+                continue;
+            }
+            let Some(url) = src.get("value").or_else(|| src.get("url")).and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            match fetch_image_url(url).await {
+                Ok((media, data)) => extra.push(ContentBlock::Image {
+                    media_type: media,
+                    data,
+                }),
+                Err(e) => extra.push(ContentBlock::Text {
+                    text: format!("[image url rejected: {e}]"),
+                }),
+            }
+        }
+    }
+    blocks_to_user_message(m, extra)
+}
+
+async fn fetch_image_url(url: &str) -> anyhow::Result<(String, String)> {
+    if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") {
+        anyhow::bail!("only https image URLs (or loopback http) are accepted");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("http {}", resp.status());
+    }
+    let media = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .split(';')
+        .next()
+        .unwrap_or("image/png")
+        .to_string();
+    if !media.starts_with("image/") {
+        anyhow::bail!("not an image");
+    }
+    let bytes = resp.bytes().await?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        anyhow::bail!("image too large");
+    }
+    Ok((media, rupi_runtime::store::b64_encode(&bytes)))
+}
+
+fn blocks_to_user_message(m: &AguiMessage, extra: Vec<ContentBlock>) -> Message {
     let id = m
         .id
         .clone()
@@ -333,6 +419,7 @@ pub fn agui_user_to_message(m: &AguiMessage) -> Message {
         }
         _ => {}
     }
+    blocks.extend(extra);
     if blocks.is_empty() {
         blocks.push(ContentBlock::Text {
             text: String::new(),
@@ -361,15 +448,28 @@ fn message_to_agui(m: &Message) -> Value {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     };
-    let text = m
-        .blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut parts: Vec<Value> = Vec::new();
+    for b in &m.blocks {
+        match b {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(json!({"type": "text", "text": text}));
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "data",
+                        "mimeType": media_type,
+                        "value": data
+                    }
+                }));
+            }
+            ContentBlock::Thinking { text, .. } if !text.is_empty() => {
+                parts.push(json!({"type": "reasoning", "text": text}));
+            }
+            _ => {}
+        }
+    }
     let tool_calls: Vec<Value> = m
         .blocks
         .iter()
@@ -386,7 +486,16 @@ fn message_to_agui(m: &Message) -> Value {
             _ => None,
         })
         .collect();
-    let mut v = json!({"id": m.id, "role": role, "content": text});
+    let content = if parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text")) {
+        json!(parts)
+    } else {
+        json!(parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    };
+    let mut v = json!({"id": m.id, "role": role, "content": content});
     if !tool_calls.is_empty() {
         v["toolCalls"] = json!(tool_calls);
     }
@@ -451,9 +560,52 @@ mod tests {
             name: "write".into(),
             arguments: json!({"path": "a"}),
         });
-        assert_eq!(
-            evs.iter().map(|e| e.typ.as_str()).collect::<Vec<_>>(),
-            ["TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END"]
+        let types: Vec<_> = evs.iter().map(|e| e.typ.as_str()).collect();
+        assert_eq!(types.first().copied(), Some("TOOL_CALL_START"));
+        assert!(types.iter().any(|t| *t == "TOOL_CALL_ARGS"));
+        assert_eq!(types.last().copied(), Some("TOOL_CALL_END"));
+    }
+
+    #[test]
+    fn snapshot_keeps_images() {
+        let mut tree = SessionTree::new();
+        tree.push(Message::from_blocks(
+            Role::User,
+            vec![
+                ContentBlock::Text {
+                    text: "see".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "aaa".into(),
+                },
+            ],
+        ));
+        let msgs = tree_to_agui_messages(&tree);
+        let c = &msgs[0]["content"];
+        assert!(c.is_array(), "{c}");
+        assert!(c.as_array().unwrap().iter().any(|p| p["type"] == "image"));
+        let err = run_error("boom", Some("x"), Some("th"), Some("rn"));
+        assert_eq!(err.fields["threadId"], "th");
+        assert_eq!(err.fields["runId"], "rn");
+    }
+
+    #[tokio::test]
+    async fn image_url_http_non_loopback_rejected() {
+        let m = AguiMessage {
+            id: Some("u".into()),
+            role: "user".into(),
+            content: Some(json!([{
+                "type": "image",
+                "source": {"type": "url", "value": "http://example.com/x.png"}
+            }])),
+            tool_calls: None,
+        };
+        let msg = agui_user_to_message_async(&m).await;
+        let text = msg.full_text();
+        assert!(
+            text.contains("rejected") || text.contains("https"),
+            "{text}"
         );
     }
 }

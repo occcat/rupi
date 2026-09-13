@@ -19,15 +19,23 @@ pub use cache::Cache;
 use crate::db::{PgPool, Tenant};
 use rupi_llm::{LlmProvider, MockProvider};
 use rupi_runtime::{
-    parse_endpoint_list, BackendKind, Executor, LocalObjectStore, ObjectStore, PoolNode,
-    PoolScheduler, SandboxExecutor,
+    parse_endpoint_list, validate_executor_url, BackendKind, Executor, LocalObjectStore,
+    MemoryObjectStore, ObjectStore, PoolNode, PoolScheduler, S3Config, S3ObjectStore,
+    SandboxExecutor,
 };
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
 pub type ProviderFactory = Arc<dyn Fn(&Tenant) -> Arc<dyn LlmProvider> + Send + Sync>;
+
+#[derive(Default)]
+pub struct Metrics {
+    pub runs: AtomicU64,
+    pub reject_429: AtomicU64,
+}
 
 #[derive(Clone)]
 pub struct IdleConfig {
@@ -61,6 +69,7 @@ pub struct App {
     pub admin_token: Option<String>,
     /// 租户级 mock 剧本必须跨 run 复用，否则每轮都从第一条重新开始。
     mock_providers: Arc<Mutex<HashMap<String, Arc<MockProvider>>>>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl App {
@@ -84,6 +93,7 @@ impl App {
             idle: IdleConfig::default(),
             admin_token: None,
             mock_providers: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -157,8 +167,10 @@ pub struct CloudConfig {
     pub instance_id: String,
     pub region: String,
     pub snapshot_dir: String,
+    pub snapshot_uri: Option<String>,
     pub idle_secs: u64,
     pub admin_token: String,
+    pub insecure_exec: bool,
 }
 
 pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
@@ -169,8 +181,9 @@ pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
         _ => None,
     };
     let cache = Cache::connect(&cfg.redis_url).await;
+    validate_executor_endpoints(cfg)?;
     let executor = build_executor(cfg);
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(&cfg.snapshot_dir));
+    let store = build_object_store(cfg)?;
     let mut app = App::new(
         pool,
         cache,
@@ -190,6 +203,30 @@ pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
         app = app.with_read_pool(r);
     }
     Ok(app)
+}
+
+fn validate_executor_endpoints(cfg: &CloudConfig) -> anyhow::Result<()> {
+    let mut urls = cfg.executor_urls.clone();
+    if urls.is_empty() && !cfg.executor_url.is_empty() {
+        urls.push(cfg.executor_url.clone());
+    }
+    urls.extend(cfg.sandbox_urls.iter().cloned());
+    for raw in urls {
+        let url = raw.split_once('=').map(|(_, u)| u).unwrap_or(&raw);
+        validate_executor_url(url, cfg.insecure_exec).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
+}
+
+fn build_object_store(cfg: &CloudConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    if let Some(uri) = cfg.snapshot_uri.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if uri == "memory:" || uri == "memory" {
+            return Ok(Arc::new(MemoryObjectStore::new()));
+        }
+        let s3 = S3Config::from_uri(uri)?;
+        return Ok(Arc::new(S3ObjectStore::new(s3)));
+    }
+    Ok(Arc::new(LocalObjectStore::new(&cfg.snapshot_dir)))
 }
 
 fn node_id(kind: &str, region: &str, index: usize, total: usize) -> String {

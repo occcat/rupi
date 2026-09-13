@@ -16,6 +16,9 @@ struct Cli {
     max_workspaces: u32,
     #[arg(long, env = "RUPI_EXEC_WARM", default_value_t = 2)]
     warm_pool: u32,
+    /// 空 token 仅回环监听允许；非回环必须带 --token。
+    #[arg(long, env = "RUPI_EXEC_INSECURE", default_value_t = false)]
+    insecure: bool,
 }
 
 #[tokio::main]
@@ -34,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         token: cli.token,
         max_workspaces: cli.max_workspaces,
         warm_pool: cli.warm_pool,
+        insecure: cli.insecure,
     })
     .await
 }

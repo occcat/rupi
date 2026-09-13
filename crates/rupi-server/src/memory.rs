@@ -89,6 +89,7 @@ impl MemoryProvider for PostgresMemory {
                     "properties": {
                         "op": {"type": "string", "enum": ["add", "replace", "remove"]},
                         "entry": {"type": "string"},
+                        "id": {"type": "string"},
                         "scope": {"type": "string", "enum": ["global", "project", "tenant"], "default": "tenant"}
                     },
                     "required": ["op", "entry"]
@@ -133,17 +134,21 @@ impl MemoryProvider for PostgresMemory {
                         .invalidate_session(&self.tenant_id, &self.session_id)
                         .await;
                 }
-                "replace" | "remove" => {
-                    // 第一刀：追加一条说明性写入，权威仍在库。
-                    db::insert_memory(
-                        &self.pool,
-                        &self.tenant_id,
-                        Some(&self.session_id),
-                        "tenant",
-                        &format!("[{op}] {entry}"),
-                    )
-                    .await?;
+                "replace" => {
+                    let id = args.get("id").and_then(|v| v.as_str());
+                    db::replace_memory(&self.pool, &self.tenant_id, id, entry).await?;
                     self.cache.invalidate_memory(&self.tenant_id).await;
+                    self.cache
+                        .invalidate_session(&self.tenant_id, &self.session_id)
+                        .await;
+                }
+                "remove" => {
+                    let id = args.get("id").and_then(|v| v.as_str());
+                    db::delete_memory(&self.pool, &self.tenant_id, id, entry).await?;
+                    self.cache.invalidate_memory(&self.tenant_id).await;
+                    self.cache
+                        .invalidate_session(&self.tenant_id, &self.session_id)
+                        .await;
                 }
                 _ => anyhow::bail!("unknown memory op: {op}"),
             }

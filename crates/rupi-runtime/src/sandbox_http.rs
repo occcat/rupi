@@ -88,6 +88,9 @@ impl Executor for SandboxExecutor {
         if h.backend.is_empty() {
             h.backend = "sandbox".into();
         }
+        if h.tenant_id.is_none() {
+            h.tenant_id = Some(tenant.to_string());
+        }
         Ok(h)
     }
 
@@ -95,7 +98,7 @@ impl Executor for SandboxExecutor {
         let _: serde_json::Value = self
             .post(
                 &format!("/v1/sandboxes/{}/release", handle.id),
-                &serde_json::json!({}),
+                &serde_json::json!({"tenant_id": handle.tenant_id}),
             )
             .await?;
         Ok(())
@@ -103,10 +106,10 @@ impl Executor for SandboxExecutor {
 
     async fn destroy(&self, handle: &WorkspaceHandle) -> anyhow::Result<()> {
         let _: serde_json::Value = self
-            .send::<serde_json::Value, _>(
+            .send(
                 reqwest::Method::DELETE,
                 &format!("/v1/sandboxes/{}", handle.id),
-                None,
+                Some(&serde_json::json!({"tenant_id": handle.tenant_id})),
             )
             .await?;
         Ok(())
@@ -117,15 +120,27 @@ impl Executor for SandboxExecutor {
         struct In<'a> {
             command: &'a str,
             timeout_secs: Option<u64>,
+            tenant_id: Option<&'a str>,
         }
         self.post(
             &format!("/v1/sandboxes/{}/exec", handle.id),
             &In {
                 command: &req.command,
                 timeout_secs: req.timeout_secs,
+                tenant_id: handle.tenant_id.as_deref(),
             },
         )
         .await
+    }
+
+    async fn abort(&self, handle: &WorkspaceHandle) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                &format!("/v1/sandboxes/{}/abort", handle.id),
+                &serde_json::json!({"tenant_id": handle.tenant_id}),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn fs_read(
@@ -138,7 +153,8 @@ impl Executor for SandboxExecutor {
             &serde_json::json!({
                 "path": req.path,
                 "offset": req.offset,
-                "limit": req.limit
+                "limit": req.limit,
+                "tenant_id": handle.tenant_id
             }),
         )
         .await
@@ -151,7 +167,7 @@ impl Executor for SandboxExecutor {
     ) -> anyhow::Result<ToolText> {
         self.post(
             &format!("/v1/sandboxes/{}/fs/write", handle.id),
-            &serde_json::json!({"path": req.path, "content": req.content}),
+            &serde_json::json!({"path": req.path, "content": req.content, "tenant_id": handle.tenant_id}),
         )
         .await
     }
@@ -163,7 +179,7 @@ impl Executor for SandboxExecutor {
     ) -> anyhow::Result<ToolText> {
         self.post(
             &format!("/v1/sandboxes/{}/fs/edit", handle.id),
-            &serde_json::json!({"path": req.path, "arguments": req.arguments}),
+            &serde_json::json!({"path": req.path, "arguments": req.arguments, "tenant_id": handle.tenant_id}),
         )
         .await
     }
@@ -171,7 +187,7 @@ impl Executor for SandboxExecutor {
     async fn glob(&self, handle: &WorkspaceHandle, req: GlobRequest) -> anyhow::Result<ToolText> {
         self.post(
             &format!("/v1/sandboxes/{}/glob", handle.id),
-            &serde_json::json!({"pattern": req.pattern, "path": req.path}),
+            &serde_json::json!({"pattern": req.pattern, "path": req.path, "tenant_id": handle.tenant_id}),
         )
         .await
     }
@@ -183,7 +199,8 @@ impl Executor for SandboxExecutor {
                 "pattern": req.pattern,
                 "path": req.path,
                 "include": req.include,
-                "max_results": req.max_results
+                "max_results": req.max_results,
+                "tenant_id": handle.tenant_id
             }),
         )
         .await
@@ -196,7 +213,7 @@ impl Executor for SandboxExecutor {
     ) -> anyhow::Result<ToolText> {
         self.post(
             &format!("/v1/sandboxes/{}/bootstrap", handle.id),
-            &serde_json::json!({"kind": kind}),
+            &serde_json::json!({"kind": kind, "tenant_id": handle.tenant_id}),
         )
         .await
     }
@@ -209,7 +226,7 @@ impl Executor for SandboxExecutor {
         let out: Out = self
             .post(
                 &format!("/v1/sandboxes/{}/snapshot", handle.id),
-                &serde_json::json!({}),
+                &serde_json::json!({"tenant_id": handle.tenant_id}),
             )
             .await?;
         crate::store::b64_decode(&out.archive_b64)
@@ -219,7 +236,7 @@ impl Executor for SandboxExecutor {
         let _: serde_json::Value = self
             .post(
                 &format!("/v1/sandboxes/{}/restore", handle.id),
-                &serde_json::json!({"archive_b64": crate::store::b64_encode(blob)}),
+                &serde_json::json!({"archive_b64": crate::store::b64_encode(blob), "tenant_id": handle.tenant_id}),
             )
             .await?;
         Ok(())

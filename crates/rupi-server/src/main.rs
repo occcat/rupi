@@ -32,6 +32,12 @@ struct Cli {
     instance_id: Option<String>,
     #[arg(long, env = "RUPI_SNAPSHOT_DIR", default_value = "/tmp/rupi-snapshots")]
     snapshot_dir: String,
+    /// 共享对象存储：`s3://bucket/prefix` 或 `memory:`（测试）。优先于 snapshot-dir。
+    #[arg(long, env = "RUPI_SNAPSHOT_URI")]
+    snapshot_uri: Option<String>,
+    /// 允许控制面用明文 HTTP 打非回环执行节点。
+    #[arg(long, env = "RUPI_EXEC_INSECURE", default_value_t = false)]
+    insecure_exec: bool,
     #[arg(long, env = "RUPI_IDLE_SECS", default_value_t = 1800)]
     idle_secs: u64,
     /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
@@ -82,8 +88,10 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         region: cli.region,
         snapshot_dir: cli.snapshot_dir,
+        snapshot_uri: cli.snapshot_uri,
         idle_secs: cli.idle_secs,
         admin_token: cli.admin_token,
+        insecure_exec: cli.insecure_exec,
     };
     if cli.bootstrap_admin || cli.bootstrap_tenant.is_some() {
         let pool = db::connect(&cfg.database_url).await?;
