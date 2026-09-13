@@ -24,6 +24,7 @@ use rupi_runtime::{
     SandboxExecutor,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -283,6 +284,14 @@ fn build_executor(cfg: &CloudConfig) -> Arc<dyn Executor> {
     Arc::new(PoolScheduler::new(nodes))
 }
 
+/// 未指定 `--snapshot-dir` / `RUPI_SNAPSHOT_DIR` 时的本机对象盘。不用 `/tmp/rupi-snapshots`。
+pub fn default_snapshot_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("rupi-data")
+        .join("snapshots")
+}
+
 pub async fn serve(cfg: CloudConfig) -> anyhow::Result<()> {
     let app = connect_app(&cfg).await?;
     let (_addr, h) = spawn(app, &cfg.bind).await?;
@@ -311,4 +320,19 @@ pub async fn spawn(
             .map_err(|e| anyhow::anyhow!(e))
     });
     Ok((addr, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_snapshot_dir;
+
+    #[test]
+    fn default_snapshot_dir_is_not_tmp_rupi_snapshots() {
+        let s = default_snapshot_dir().display().to_string();
+        assert!(
+            !s.ends_with("/tmp/rupi-snapshots") && s != "/tmp/rupi-snapshots",
+            "{s}"
+        );
+        assert!(s.contains("rupi-data/snapshots"), "{s}");
+    }
 }

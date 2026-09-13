@@ -30,7 +30,7 @@
 | `--executor-token` | `RUPI_EXEC_TOKEN` | 空 | 打执行节点的口令 |
 | `--region` | `RUPI_REGION` | `local` | 本副本区域标签 |
 | `--instance-id` | `RUPI_INSTANCE_ID` | 随机 UUID | 副本身份 |
-| `--snapshot-dir` | `RUPI_SNAPSHOT_DIR` | `/tmp/rupi-snapshots` | 本机对象盘（多副本不够） |
+| `--snapshot-dir` | `RUPI_SNAPSHOT_DIR` | `./rupi-data/snapshots` | 本机对象盘（相对 cwd；多副本不够） |
 | `--snapshot-uri` | `RUPI_SNAPSHOT_URI` | 无 | `s3://bucket/prefix` 或 `memory:`（测试）；优先于 snapshot-dir |
 | `--insecure-exec` | `RUPI_EXEC_INSECURE` | false | 允许控制面用明文 HTTP 打**非回环**执行节点 |
 | `--idle-secs` | `RUPI_IDLE_SECS` | 1800 | 闲置回收 |
@@ -64,7 +64,8 @@
 
 | 变量 | 作用 |
 |---|---|
-| `RUPI_DB_INSECURE=1` | 允许非回环明文 `DATABASE_URL` |
+| `RUPI_DB_INSECURE=1` | 允许非回环明文 `DATABASE_URL`（跳过 rustls） |
+| `RUPI_GIT_ALLOW_ANON=1` | 允许无 token 的公开 https git clone（默认关） |
 | `RUPI_CLOUD_ALLOW_MOCK=1` | 租户 `PATCH /v1/settings` 可以写 `mock_script` |
 | `RUPI_CLOUD_MOCK` / `RUPI_MOCK_SCRIPT` | 控制面走 mock 剧本（本地/CI） |
 | `RUPI_S3_ENDPOINT` 或 `AWS_ENDPOINT_URL` | S3 兼容 endpoint（默认 `https://s3.amazonaws.com`） |
@@ -75,11 +76,11 @@
 ## 必须守住的默认值
 
 - **空 token**：非回环监听直接拒启动。回环空 token 还必须带 `--insecure`（或 `RUPI_EXEC_INSECURE=1`）。`0.0.0.0` 即使 `--insecure` 也不能空 token。比较走恒定时间 `tokens_eq`。
-- **Postgres**：非回环明文 URL 拒启动，除非 `sslmode=require` / `verify-full` / `verify-ca`，或 `RUPI_DB_INSECURE=1`。**当前客户端仍是 `NoTls`**：`sslmode=require` 只过策略检查，不在本进程做 rustls。生产把库放在内网，或在前面终 TLS。
+- **Postgres**：回环可用明文。非回环默认走进程内 **rustls**（强制 `sslmode=require`）。`sslmode=` 字面量不能当 TLS。非回环明文必须 `RUPI_DB_INSECURE=1`。
 - **执行面 URL**：控制面打 `http://` 非回环节点必须 `--insecure-exec`。回环 `http://127.0.0.1` 可以。生产用 HTTPS 或不要把 execd 暴露到公网。
 - `--bootstrap-tenant` / `--bootstrap-admin` 只用来种第一把 Key。正式进程不要带。
 - 租户 BYOK 按 provider 读 `anthropic_api_key` / `gemini_api_key` / `openai_api_key`（或 `api_key`）。不会把 OpenAI key 塞给 Anthropic。
-- `git` bootstrap 只接受 `https://` 或 `git@host:path`，host 默认白名单（github.com / gitlab.com / bitbucket.org / git.sr.ht / codeberg.org），可用 settings / 请求体 `git_hosts` 加。租户 token 只进这一次 clone。
+- `git` bootstrap 只接受 `https://` 或 `git@host:path`（`file://` 一律拒）。host 默认白名单（github.com / gitlab.com / bitbucket.org / git.sr.ht / codeberg.org），可用 settings / 请求体 `git_hosts` 加。无 token 的 `git@` / https 默认拒；公开只读 https 需 `RUPI_GIT_ALLOW_ANON=1`。租户 token 只进这一次 clone。
 - 租户 `PATCH /v1/settings` 与管理面同一白名单；`***` 不覆盖密钥；`mock_script` 仅 `RUPI_CLOUD_ALLOW_MOCK=1` 或管理面。
 
 ## 本机先跑通（回环）
@@ -149,12 +150,12 @@ export RUPI_S3_ACCESS_KEY=...
 export RUPI_S3_SECRET_KEY=...
 ```
 
-工作区在 Executor 上，不在 API 盘。`--snapshot-dir` 只够单机。
+工作区在 Executor 上，不在 API 盘。`--snapshot-dir` 只够单机；未指定时写到 `./rupi-data/snapshots`。多副本用 `--snapshot-uri` / `RUPI_SNAPSHOT_URI`。
 
-非回环 Postgres 示例（策略层要求 TLS 字样；进程内仍是 NoTls）：
+非回环 Postgres 走 rustls：
 
 ```bash
---database-url "postgres://rupi:rupi@db.internal:5432/rupi?sslmode=require"
+--database-url "postgres://rupi:rupi@db.internal:5432/rupi"
 ```
 
 非回环执行面明文必须同时：

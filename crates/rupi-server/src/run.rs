@@ -284,7 +284,7 @@ async fn drive(
 
     let tools = cloud_tools(app.executor.clone(), handle.clone());
     let skills = SkillRegistry::default();
-    load_remote_guidance(app.executor.as_ref(), &handle, &mut tree, &skills).await;
+    let guidance = load_remote_guidance(app.executor.as_ref(), &handle, &mut tree, &skills).await;
     let provider = app.provider_for(&tenant);
 
     let pending = db::pending_interrupts(&app.pool, &tenant.id, &input.thread_id).await?;
@@ -345,6 +345,12 @@ async fn drive(
         }))
         .with_on_ask(|_, _, _| AskAction::Interrupt)
         .with_compaction_enabled(sess.auto_compaction);
+    if !guidance.is_empty() {
+        if !agent.builder.append.is_empty() {
+            agent.builder.append.push('\n');
+        }
+        agent.builder.append.push_str(&guidance);
+    }
     if let Some(t) = sess
         .thinking_level
         .as_deref()
@@ -854,7 +860,8 @@ async fn load_remote_guidance(
     handle: &WorkspaceHandle,
     tree: &mut SessionTree,
     skills: &SkillRegistry,
-) {
+) -> String {
+    let mut guidance = String::new();
     for name in ["AGENTS.md", "agents.md", "CLAUDE.md"] {
         let got = exec
             .fs_read(
@@ -868,10 +875,12 @@ async fn load_remote_guidance(
             .await;
         if let Ok(t) = got {
             if !t.is_error && !t.content.trim().is_empty() {
-                tree.push(Message::text(
-                    Role::System,
-                    format!("[workspace {name}]\n{}", t.content),
-                ));
+                let block = format!("[workspace {name}]\n{}", t.content);
+                tree.push(Message::text(Role::System, block.clone()));
+                if !guidance.is_empty() {
+                    guidance.push('\n');
+                }
+                guidance.push_str(&block);
             }
         }
     }
@@ -949,6 +958,7 @@ async fn load_remote_guidance(
             }
         }
     }
+    guidance
 }
 
 fn script_item_to_response(v: serde_json::Value) -> rupi_llm::ChatResponse {

@@ -105,6 +105,8 @@ URL 可写 `region=url`。两种后端可以并存。`sandboxd` 是句柄根 jai
   --admin-token "$RUPI_ADMIN_TOKEN"
 ```
 
+未指定 `--snapshot-dir` 时写到 `./rupi-data/snapshots`，不要依赖 `/tmp/rupi-snapshots`。多副本用 `RUPI_SNAPSHOT_URI`。
+
 **3.3 发第一轮**
 
 ```bash
