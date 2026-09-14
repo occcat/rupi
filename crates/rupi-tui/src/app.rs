@@ -936,8 +936,11 @@ async fn run_loop(
             }
             _ if keys.paste.matches(&key) => match clipboard_paste() {
                 ClipboardPaste::Image { media_type, data } => {
-                    pending_images.push(ContentBlock::Image { media_type, data });
-                    view.push_system("[image attached from clipboard]".into());
+                    pending_images.push(ContentBlock::Image {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    });
+                    view.push_image("clipboard", media_type, data);
                 }
                 ClipboardPaste::Text(s) => {
                     for c in s.chars() {
@@ -1323,9 +1326,20 @@ async fn run_loop(
                             text: send_text.clone(),
                         }]
                     };
-                    blocks.extend(pending_images.drain(..));
+                    let clip_start = blocks.len();
+                    blocks.append(&mut pending_images);
                     let user = Message::from_blocks(Role::User, blocks);
-                    view.push_user(user.full_text());
+                    for (i, block) in user.blocks.iter().enumerate() {
+                        match block {
+                            ContentBlock::Text { text } if !text.is_empty() => {
+                                view.push_user(text.clone());
+                            }
+                            ContentBlock::Image { media_type, data } if i < clip_start => {
+                                view.push_image("file", media_type.clone(), data.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                     scroll = 0;
                     // 发送前刷新 skill 注册表：上一轮蒸馏的新 skill 本轮即对模型可见
                     ctx.skills.refresh(&ctx.skill_dirs);
@@ -1781,8 +1795,14 @@ fn draw<B: Backend>(
     tree: Option<&TreeNavigator>,
     sessions: Option<&SessionNavigator>,
 ) -> anyhow::Result<()> {
+    let inline_images = crate::kitty::supported();
     let lines = view
-        .visual_lines(&chrome.theme, chrome.tools_folded, chrome.thinking_folded)
+        .visual_lines(
+            &chrome.theme,
+            chrome.tools_folded,
+            chrome.thinking_folded,
+            inline_images,
+        )
         .to_vec();
     let footer = footer_text(busy, queued, chrome);
     let theme = chrome.theme.clone();
@@ -1882,6 +1902,32 @@ fn draw<B: Backend>(
             ));
         })
         .context("draw TUI")?;
+    if inline_images && !view.inline_images().is_empty() {
+        let size = terminal.size().unwrap_or_default();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: size.width,
+            height: size.height,
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let total = lines.len() as u16;
+        let start = total.saturating_sub(chunks[0].height.saturating_add(scroll)) as usize;
+        let inner = (
+            chunks[0].x.saturating_add(1),
+            chunks[0].y.saturating_add(1),
+            chunks[0].width.saturating_sub(2),
+            chunks[0].height.saturating_sub(2),
+        );
+        let _ = crate::kitty::paint_visible(std::io::stdout(), view.inline_images(), start, inner);
+    }
     Ok(())
 }
 
