@@ -5,6 +5,7 @@
 use crate::complete;
 use crate::keybindings::KeyTable;
 use crate::session_nav::SessionNavigator;
+use crate::slash;
 use crate::theme::Theme;
 use crate::tree_nav::TreeNavigator;
 use crate::view::{ChatView, InputBuffer};
@@ -331,6 +332,15 @@ fn dispatch_builtin(
     if t == "/quit" {
         return Builtin::Quit;
     }
+    if t == "/copy" || t.starts_with("/copy ") {
+        return Builtin::Done("[copy] no assistant text".into());
+    }
+    if t == "/hotkeys" || t.starts_with("/hotkeys ") {
+        return Builtin::Done(slash::hotkeys_block(&KeyTable::default()));
+    }
+    if t == "/trust" || t.starts_with("/trust ") {
+        return Builtin::Done("[trust]".into());
+    }
     if t == "/skills" {
         // 空注册表给提示（与 CLI skills-list 同文案），不推空行进视图
         let block = skills.index_block();
@@ -502,6 +512,7 @@ fn dispatch_builtin(
     }
     if t == "/reload" {
         // 热重载要 ExtensionSet 可变借用 + 可变工具表：内嵌/单测无 set 时回退提示。
+        // theme 由 run_loop 在 Done 后从 settings 重读。
         return match ext_set {
             Some(set) => {
                 let lines = rupi_ext::refresh_extensions(tools, set);
@@ -651,6 +662,9 @@ async fn run_loop(
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
     let mut chrome = UiChrome::default();
+    if let Some(s) = ctx.settings.as_ref() {
+        chrome.theme = Theme::resolve(s.theme());
+    }
     chrome.footer.model = ctx.provider.name().to_string();
     let mut tree: Option<TreeNavigator> = None;
     let keys = KeyTable::load(&ctx.settings_home);
@@ -1005,6 +1019,30 @@ async fn run_loop(
                         }
                         continue;
                     }
+                    if let Some((name, args)) = slash::parse_local_slash(&text) {
+                        let msg = match name {
+                            "copy" => {
+                                slash::copy_text(slash::last_assistant_from_lines(&view.lines))
+                            }
+                            "hotkeys" => slash::hotkeys_block(&keys),
+                            "trust" => {
+                                let policy = ctx
+                                    .settings
+                                    .as_ref()
+                                    .map(|s| s.project_trust().as_str().to_string())
+                                    .unwrap_or_else(|| "ask".into());
+                                slash::trust_slash(
+                                    args,
+                                    &ctx.settings_home,
+                                    &ctx.settings_cwd,
+                                    &policy,
+                                )
+                            }
+                            _ => String::new(),
+                        };
+                        view.push_system(msg);
+                        continue;
+                    }
                     if let Some(msg) = handle_settings_cmd(
                         &text,
                         ctx.settings.as_deref_mut(),
@@ -1012,6 +1050,9 @@ async fn run_loop(
                         &ctx.settings_cwd,
                         ctx.agent.inbox.as_deref(),
                     ) {
+                        if let Some(s) = ctx.settings.as_ref() {
+                            chrome.theme = Theme::from_name(s.theme());
+                        }
                         view.push_system(msg);
                         continue;
                     }
@@ -1055,6 +1096,19 @@ async fn run_loop(
                             continue;
                         }
                         Builtin::Done(mut msg) => {
+                            if text.trim() == "/reload" {
+                                if let Some(line) = reload_theme_from_disk(
+                                    ctx.settings.as_deref_mut(),
+                                    &ctx.settings_home,
+                                    &ctx.settings_cwd,
+                                    &mut chrome,
+                                ) {
+                                    if !msg.is_empty() {
+                                        msg.push('\n');
+                                    }
+                                    msg.push_str(&line);
+                                }
+                            }
                             if text.trim() == "/session" {
                                 if let Some(cell) = ctx.meter.as_ref() {
                                     let extra =
@@ -1776,6 +1830,21 @@ fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
         out.push(RLine::from(Span::styled(line, style)));
     }
     out
+}
+
+fn reload_theme_from_disk(
+    settings: Option<&mut rupi_config::Settings>,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    chrome: &mut UiChrome,
+) -> Option<String> {
+    let fresh = rupi_config::Settings::load(home, cwd);
+    let name = fresh.theme().to_string();
+    if let Some(s) = settings {
+        s.theme = fresh.theme;
+    }
+    chrome.theme = Theme::from_name(&name);
+    Some(format!("[theme] {name}"))
 }
 
 fn handle_settings_cmd(
@@ -2858,6 +2927,48 @@ mod tests {
             false,
         ));
         assert!(msg.contains("no custom commands"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/copy",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ));
+        assert!(msg.contains("[copy]"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/hotkeys",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ));
+        assert!(msg.contains("send"), "{msg}");
+        let msg = done_text(dispatch_builtin(
+            "/trust",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "t-sess",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ));
+        assert!(msg.contains("[trust]"), "{msg}");
         assert!(matches!(
             dispatch_builtin(
                 "/tree",
@@ -3126,5 +3237,30 @@ mod tests {
             Builtin::Adopt { note, .. } if note.contains("ephemeral")
         ));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn settings_and_reload_apply_theme() {
+        let dir =
+            std::env::temp_dir().join(format!("rupi-tui-theme-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = rupi_config::Settings::default();
+        let msg =
+            handle_settings_cmd("/settings theme light", Some(&mut s), &dir, &dir, None).unwrap();
+        assert!(msg.contains("theme"), "{msg}");
+        assert_eq!(s.theme(), "light");
+        let listed = handle_settings_cmd("/settings", Some(&mut s), &dir, &dir, None).unwrap();
+        assert!(listed.contains("theme"), "{listed}");
+        assert!(listed.contains("light"), "{listed}");
+
+        std::fs::write(dir.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
+        let mut loaded = rupi_config::Settings::default();
+        let mut chrome = UiChrome::default();
+        let line = reload_theme_from_disk(Some(&mut loaded), &dir, &dir, &mut chrome).unwrap();
+        assert!(line.contains("light"), "{line}");
+        assert_eq!(chrome.theme.name, "light");
+        assert_eq!(loaded.theme(), "light");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

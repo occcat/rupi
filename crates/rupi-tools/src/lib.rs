@@ -1,4 +1,5 @@
 //! rupi-tools: Tool trait + Pi 默认七件套 Read / Write / Edit / Bash / Glob / Grep / Think + 注册表。
+//! 可选 `find` / `ls` 默认不注册，由 `--tools` / `settings.tools` 打开。
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
@@ -8,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod optional;
 mod truncate;
 mod utf8;
+pub use optional::{optional_builtins_requested, FindTool, LsTool, OPTIONAL_BUILTIN_NAMES};
 pub use truncate::{
     format_size, truncate_head, truncate_tail, TruncationResult, DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
@@ -141,6 +144,7 @@ impl ToolRegistry {
     }
 
     /// 默认七件套，与 Pi 保持一致（read/write/edit/bash/glob/grep/think）。
+    /// `find` / `ls` 默认不注册，见 [`Self::register_optional`]。
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
@@ -151,6 +155,40 @@ impl ToolRegistry {
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(ThinkTool));
         r
+    }
+
+    /// 按名打开可选内建（`find` / `ls`）。未知名忽略；已注册则覆盖。
+    pub fn register_optional<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for n in names {
+            match n.as_ref() {
+                "find" => self.register(Arc::new(FindTool)),
+                "ls" => self.register(Arc::new(LsTool)),
+                _ => {}
+            }
+        }
+    }
+
+    /// 沙箱版可选内建：`path` 约束在 `root` 内（与 read/glob 同箍）。
+    pub fn register_sandboxed_optional<I, S>(&mut self, root: &std::path::Path, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        for n in names {
+            match n.as_ref() {
+                "find" => self.register(Arc::new(SandboxedTool::new(
+                    Arc::new(FindTool),
+                    root.clone(),
+                ))),
+                "ls" => self.register(Arc::new(SandboxedTool::new(Arc::new(LsTool), root.clone()))),
+                _ => {}
+            }
+        }
     }
 
     /// 沙箱七件套：read/write/edit/glob/grep 的 `path` 约束在 `root` 内
@@ -1130,7 +1168,9 @@ impl Tool for GrepTool {
 const GLOB_MAX_HITS: usize = 200;
 const GREP_MAX_FILE_BYTES: u64 = 2 << 20;
 
-async fn spawn_blocking_tool(f: impl FnOnce() -> ToolOutput + Send + 'static) -> ToolOutput {
+pub(crate) async fn spawn_blocking_tool(
+    f: impl FnOnce() -> ToolOutput + Send + 'static,
+) -> ToolOutput {
     tokio::task::spawn_blocking(f)
         .await
         .unwrap_or_else(|e| ToolOutput::err(format!("search interrupted: {e}")))
@@ -1138,7 +1178,7 @@ async fn spawn_blocking_tool(f: impl FnOnce() -> ToolOutput + Send + 'static) ->
 
 /// 标准过滤器：隐藏文件、`.gitignore` / `.ignore`、全局 exclude。`require_git` 保持默认
 /// true，只在 git 仓库内应用 gitignore（测试夹具建空 `.git` 即可隔离父目录规则）。
-fn ignore_walker(root: impl AsRef<Path>) -> WalkBuilder {
+pub(crate) fn ignore_walker(root: impl AsRef<Path>) -> WalkBuilder {
     let mut b = WalkBuilder::new(root);
     b.standard_filters(true).follow_links(false);
     b
@@ -1146,7 +1186,7 @@ fn ignore_walker(root: impl AsRef<Path>) -> WalkBuilder {
 
 /// 相对路径匹配：`require_literal_separator` 让 `*` 不跨目录（`*.rs` ≠ `sub/c.rs`），
 /// 同时 `**/*.rs` 仍命中根下 `a.rs`（与 `glob::glob("base/**/*.rs")` 一致）。
-fn glob_rel_matches(pattern: &str, rel: &Path) -> bool {
+pub(crate) fn glob_rel_matches(pattern: &str, rel: &Path) -> bool {
     let Ok(p) = glob::Pattern::new(pattern) else {
         return false;
     };
@@ -1485,8 +1525,123 @@ mod tests {
     async fn builtins_register_and_unknown_errors() {
         let r = ToolRegistry::with_builtins();
         assert_eq!(r.definitions().len(), 7);
+        let names = r.names();
+        assert!(!names.iter().any(|n| n == "find" || n == "ls"));
         let out = r.execute("nope", serde_json::json!({})).await.unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn optional_find_ls_off_until_registered() {
+        let mut r = ToolRegistry::with_builtins();
+        let missing = r
+            .execute("find", serde_json::json!({"pattern": "*.rs"}))
+            .await
+            .unwrap();
+        assert!(missing.is_error);
+        assert!(missing.content.contains("unknown tool"));
+        r.register_optional(["find", "ls", "nope"]);
+        assert!(r.names().iter().any(|n| n == "find"));
+        assert!(r.names().iter().any(|n| n == "ls"));
+        assert_eq!(r.definitions().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn find_lists_relative_and_rejects_escapes() {
+        let dir = unique_tmp("rupi-find");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.rs"), "x").unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        std::fs::write(dir.join("sub/c.rs"), "x").unwrap();
+        let mut r = ToolRegistry::with_builtins();
+        r.register_optional(["find"]);
+        let base = dir.to_string_lossy().to_string();
+        let out = r
+            .execute(
+                "find",
+                serde_json::json!({"pattern": "**/*.rs", "path": base}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.rs"), "{}", out.content);
+        assert!(out.content.contains("sub/c.rs"), "{}", out.content);
+        assert!(!out.content.contains("b.txt"));
+        assert!(
+            !out.content.contains(&base),
+            "find must return relative paths: {}",
+            out.content
+        );
+        let esc = r
+            .execute("find", serde_json::json!({"pattern": "../x", "path": base}))
+            .await
+            .unwrap();
+        assert!(esc.is_error);
+        let empty = r
+            .execute("find", serde_json::json!({"pattern": "", "path": base}))
+            .await
+            .unwrap();
+        assert!(empty.is_error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ls_lists_dotfiles_and_dirs() {
+        let dir = unique_tmp("rupi-ls");
+        std::fs::write(dir.join("z.txt"), "x").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut r = ToolRegistry::with_builtins();
+        r.register_optional(["ls"]);
+        let base = dir.to_string_lossy().to_string();
+        let out = r
+            .execute("ls", serde_json::json!({"path": base}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains(".hidden"), "{}", out.content);
+        assert!(out.content.contains("sub/"), "{}", out.content);
+        assert!(out.content.contains("z.txt"), "{}", out.content);
+        let file = dir.join("z.txt").to_string_lossy().to_string();
+        let not_dir = r
+            .execute("ls", serde_json::json!({"path": file}))
+            .await
+            .unwrap();
+        assert!(not_dir.is_error);
+        assert!(not_dir.content.contains("Not a directory"));
+        let missing = r
+            .execute("ls", serde_json::json!({"path": format!("{base}/nope")}))
+            .await
+            .unwrap();
+        assert!(missing.is_error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sandboxed_optional_find_ls_stay_inside_root() {
+        let root = unique_tmp("rupi-opt-sbx");
+        std::fs::write(root.join("in.rs"), "x").unwrap();
+        let mut r = ToolRegistry::with_sandboxed_builtins(&root);
+        r.register_sandboxed_optional(&root, ["find", "ls"]);
+        let listing = r
+            .execute("ls", serde_json::json!({"path": "."}))
+            .await
+            .unwrap();
+        assert!(!listing.is_error, "{}", listing.content);
+        assert!(listing.content.contains("in.rs"), "{}", listing.content);
+        let found = r
+            .execute("find", serde_json::json!({"pattern": "*.rs", "path": "."}))
+            .await
+            .unwrap();
+        assert!(!found.is_error, "{}", found.content);
+        assert!(found.content.contains("in.rs"), "{}", found.content);
+        let esc = r
+            .execute("ls", serde_json::json!({"path": "/tmp"}))
+            .await
+            .unwrap();
+        assert!(esc.is_error);
+        assert!(esc.content.contains("escapes workspace root"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

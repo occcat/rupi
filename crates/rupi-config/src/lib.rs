@@ -201,13 +201,14 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
     };
     let editor = settings.external_editor().unwrap_or("(VISUAL/EDITOR)");
     format!(
-        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}",
+        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}",
         write_path.display(),
         settings.steering_mode_str(),
         settings.follow_up_mode_str(),
         settings.project_trust().as_str(),
         settings.model.as_deref().unwrap_or("(unset)"),
         settings.thinking.as_deref().unwrap_or("(unset)"),
+        settings.theme(),
     )
 }
 
@@ -222,6 +223,7 @@ pub fn is_core_key(key: &str) -> bool {
             | "enabledmodels"
             | "model"
             | "thinking"
+            | "theme"
     )
 }
 
@@ -281,8 +283,13 @@ pub fn apply_setting(
             };
             Ok(("thinking".into(), json!(v)))
         }
+        "theme" => {
+            let v = parse_theme(value)?;
+            settings.theme = Some(v.to_string());
+            Ok(("theme".into(), json!(v)))
+        }
         _ => anyhow::bail!(
-            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels)"
+            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels|theme)"
         ),
     }
 }
@@ -314,6 +321,14 @@ pub fn persist_patch(path: &Path, key: &str, value: Value) -> anyhow::Result<()>
     let body = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, format!("{body}\n"))?;
     Ok(())
+}
+
+fn parse_theme(value: &str) -> anyhow::Result<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "dark" => Ok("dark"),
+        "light" => Ok("light"),
+        other => anyhow::bail!("theme must be dark|light, got '{other}'"),
+    }
 }
 
 fn parse_queue_mode(value: &str) -> anyhow::Result<&'static str> {
@@ -653,6 +668,11 @@ mod tests {
         let (jk, jv) = apply_setting(&mut s, &key, &value).unwrap();
         assert_eq!(jk, "steeringMode");
         assert_eq!(s.steering_mode_str(), "all");
+        let (tk, tv) = apply_setting(&mut s, "theme", "light").unwrap();
+        assert_eq!(tk, "theme");
+        assert_eq!(s.theme(), "light");
+        assert_eq!(tv, json!("light"));
+        assert!(apply_setting(&mut s, "theme", "neon").is_err());
         let dir = std::env::temp_dir().join(format!("rupi-cfg-write-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

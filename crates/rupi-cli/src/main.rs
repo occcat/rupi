@@ -513,11 +513,12 @@ fn sandbox_root() -> PathBuf {
 }
 
 /// 沙箱工具表：文件工具约束在工作区内，相对路径按 root 解析（subagent 克隆继承）。
-fn sandboxed_tools_filtered(builtin_allow: Option<&[String]>) -> ToolRegistry {
+fn sandboxed_tools_filtered(builtin_allow: Option<&[String]>, optional: &[String]) -> ToolRegistry {
     let root = sandbox_root();
     // 诊断走 stderr：`run --json` 的 stdout 必须是纯 JSONL
     eprintln!("[sandbox workspace: {}]", root.display());
     let mut r = ToolRegistry::with_sandboxed_builtins(&root);
+    r.register_sandboxed_optional(&root, optional);
     if let Some(allow) = builtin_allow {
         r.retain(|n| allow.iter().any(|a| a == n));
     }
@@ -525,16 +526,20 @@ fn sandboxed_tools_filtered(builtin_allow: Option<&[String]>) -> ToolRegistry {
 }
 
 fn assemble_tools(cli: &Cli, rt: &Resolved) -> ToolRegistry {
+    let optional = rupi_tools::optional_builtins_requested([
+        rt.tool_allow.as_deref(),
+        rt.builtin_allow.as_deref(),
+    ]);
     if cli.no_tools {
         return ToolRegistry::new();
     }
     if cli.no_builtin_tools {
         if let Some(allow) = rt.tool_allow.as_deref() {
-            return sandboxed_tools_filtered(Some(allow));
+            return sandboxed_tools_filtered(Some(allow), &optional);
         }
         return ToolRegistry::new();
     }
-    sandboxed_tools_filtered(rt.builtin_allow.as_deref())
+    sandboxed_tools_filtered(rt.builtin_allow.as_deref(), &optional)
 }
 
 fn ext_dir(home: &PathBuf, cli: &Cli) -> PathBuf {
@@ -2167,6 +2172,34 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 for l in lines {
                     println!("{l}");
                 }
+            }
+            let fresh = rupi_config::Settings::load(home, &cwd);
+            settings.theme = fresh.theme;
+            println!("[theme] {}", settings.theme());
+            continue;
+        }
+        if let Some((name, args)) = rupi_tui::slash::parse_local_slash(&input) {
+            match name {
+                "copy" => println!(
+                    "{}",
+                    rupi_tui::slash::copy_text(
+                        rupi_tui::slash::last_assistant_from_session(&session).as_deref()
+                    )
+                ),
+                "hotkeys" => println!(
+                    "{}",
+                    rupi_tui::slash::hotkeys_block(&rupi_tui::keybindings::KeyTable::load(home))
+                ),
+                "trust" => println!(
+                    "{}",
+                    rupi_tui::slash::trust_slash(
+                        args,
+                        home,
+                        &cwd,
+                        settings.project_trust().as_str(),
+                    )
+                ),
+                _ => {}
             }
             continue;
         }

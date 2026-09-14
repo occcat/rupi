@@ -46,6 +46,25 @@ impl KeyChord {
         })
     }
 
+    pub fn as_label(&self) -> String {
+        let mut out = String::new();
+        if self.ctrl {
+            out.push_str("Ctrl+");
+        }
+        if self.alt {
+            out.push_str("Alt+");
+        }
+        if self.shift {
+            out.push_str("Shift+");
+        }
+        match self.code {
+            ChordCode::Enter => out.push_str("Enter"),
+            ChordCode::Tab => out.push_str("Tab"),
+            ChordCode::Char(c) => out.push(c.to_ascii_uppercase()),
+        }
+        out
+    }
+
     pub fn matches(&self, key: &KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -135,6 +154,19 @@ impl KeyTable {
         }
         table
     }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "hotkeys (~/.rupi/keybindings.json):\n  send             {}\n  newline          {}\n  paste            {}\n  model            {}\n  enabledModels    {}\n  thinking         {}\n  fold             {}",
+            self.send.as_label(),
+            self.newline.as_label(),
+            self.paste.as_label(),
+            self.model.as_label(),
+            self.enabled_models.as_label(),
+            self.thinking.as_label(),
+            self.fold.as_label(),
+        )
+    }
 }
 
 fn apply_opt(slot: &mut KeyChord, raw: Option<&str>) {
@@ -159,6 +191,13 @@ mod tests {
         assert!(t.newline.matches(&shift_enter));
         assert!(t.paste.matches(&ctrl_v));
         assert!(t.thinking.matches(&backtab));
+        assert_eq!(t.send.as_label(), "Enter");
+        assert_eq!(t.newline.as_label(), "Shift+Enter");
+        let block = t.describe();
+        assert!(
+            block.contains("send") && block.contains("Ctrl+V"),
+            "{block}"
+        );
     }
 
     #[test]
