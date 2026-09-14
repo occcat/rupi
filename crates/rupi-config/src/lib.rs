@@ -98,6 +98,14 @@ pub struct Settings {
     /// TUI 启动不打印帮助与已载 skill/ext/MCP。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quiet_startup: Option<bool>,
+    /// 会话库目录（对标 Pi `sessionDir`）。相对路径相对 cwd，支持 `~`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<String>,
+    /// Prompt 模板开关（对标 Pi `settings.prompts[]`）。
+    /// 缺省：照常扫 `prompts/`；`[]` / `off`：关掉默认 prompts 目录；
+    /// 路径追加扫描；裸名当允许名单；`!name` 排除。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<String>>,
 }
 
 fn compaction_is_empty(c: &CompactionSettings) -> bool {
@@ -164,6 +172,13 @@ impl Settings {
     pub fn quiet_startup(&self) -> bool {
         self.quiet_startup.unwrap_or(false)
     }
+
+    pub fn session_dir(&self) -> Option<&str> {
+        self.session_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// `/settings` 斜杠：列出或改一项。
@@ -207,8 +222,14 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
         settings.enabled_models.join(", ")
     };
     let editor = settings.external_editor().unwrap_or("(VISUAL/EDITOR)");
+    let prompts = match settings.prompts.as_ref() {
+        None => "(default scan)".to_string(),
+        Some(v) if v.is_empty() => "off".to_string(),
+        Some(v) => v.join(", "),
+    };
+    let session_dir = settings.session_dir().unwrap_or("(RUPI_HOME)");
     format!(
-        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}\n  quietStartup           {}",
+        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}\n  quietStartup           {}\n  sessionDir             {session_dir}\n  prompts                {prompts}",
         write_path.display(),
         settings.steering_mode_str(),
         settings.follow_up_mode_str(),
@@ -233,6 +254,8 @@ pub fn is_core_key(key: &str) -> bool {
             | "thinking"
             | "theme"
             | "quietstartup"
+            | "sessiondir"
+            | "prompts"
     )
 }
 
@@ -302,8 +325,37 @@ pub fn apply_setting(
             settings.quiet_startup = Some(v);
             Ok(("quietStartup".into(), json!(v)))
         }
+        "sessiondir" => {
+            let v = value.trim();
+            settings.session_dir = if v.is_empty() || eq_off(v) {
+                None
+            } else {
+                Some(v.to_string())
+            };
+            Ok((
+                "sessionDir".into(),
+                match settings.session_dir.as_ref() {
+                    Some(s) => json!(s),
+                    None => json!(null),
+                },
+            ))
+        }
+        "prompts" => {
+            let t = value.trim();
+            if eq_on(t) {
+                settings.prompts = None;
+                Ok(("prompts".into(), json!(null)))
+            } else if eq_off(t) {
+                settings.prompts = Some(Vec::new());
+                Ok(("prompts".into(), json!([])))
+            } else {
+                let list = parse_model_list(t);
+                settings.prompts = Some(list.clone());
+                Ok(("prompts".into(), json!(list)))
+            }
+        }
         _ => anyhow::bail!(
-            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels|theme|quietStartup)"
+            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels|theme|quietStartup|sessionDir|prompts)"
         ),
     }
 }
@@ -367,6 +419,63 @@ fn parse_model_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
+}
+
+fn eq_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "off" | "false" | "none" | "disable" | "disabled"
+    )
+}
+
+fn eq_on(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "on" | "true" | "default" | "enable" | "enabled"
+    )
+}
+
+/// `--session-dir` > `RUPI_SESSION_DIR` > `PI_CODING_AGENT_SESSION_DIR` > `settings.sessionDir` > fallback。
+pub fn resolve_session_dir(
+    cli: Option<&str>,
+    settings: Option<&str>,
+    fallback: &Path,
+) -> PathBuf {
+    if let Some(p) = nonempty(cli) {
+        return expand_user_path(p);
+    }
+    if let Some(p) = nonempty(std::env::var("RUPI_SESSION_DIR").ok().as_deref()) {
+        return expand_user_path(p);
+    }
+    if let Some(p) = nonempty(std::env::var("PI_CODING_AGENT_SESSION_DIR").ok().as_deref()) {
+        return expand_user_path(p);
+    }
+    if let Some(p) = nonempty(settings) {
+        return expand_user_path(p);
+    }
+    fallback.to_path_buf()
+}
+
+fn nonempty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn expand_user_path(raw: &str) -> PathBuf {
+    let t = raw.trim();
+    if t == "~" {
+        return user_home();
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        return user_home().join(rest);
+    }
+    let p = PathBuf::from(t);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
+    }
 }
 
 fn normalize_key(key: &str) -> String {
@@ -520,6 +629,15 @@ fn merge(mut base: Settings, over: Settings) -> Settings {
     }
     if !over.enabled_models.is_empty() {
         base.enabled_models = over.enabled_models;
+    }
+    if over.quiet_startup.is_some() {
+        base.quiet_startup = over.quiet_startup;
+    }
+    if over.session_dir.is_some() {
+        base.session_dir = over.session_dir;
+    }
+    if over.prompts.is_some() {
+        base.prompts = over.prompts;
     }
     base.compaction = merge_compaction(base.compaction, over.compaction);
     base
@@ -758,6 +876,66 @@ mod tests {
             &["read".into()]
         ));
         assert!(!tool_allowed("bash", Some(&[]), &[]));
+    }
+
+    #[test]
+    fn session_dir_precedence_and_prompt_toggle() {
+        let g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_rupi = std::env::var("RUPI_SESSION_DIR").ok();
+        let saved_pi = std::env::var("PI_CODING_AGENT_SESSION_DIR").ok();
+        unsafe {
+            std::env::remove_var("RUPI_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+        }
+        let fallback = PathBuf::from("/tmp/rupi-fallback");
+        assert_eq!(
+            resolve_session_dir(None, None, &fallback),
+            fallback
+        );
+        assert_eq!(
+            resolve_session_dir(None, Some("/from-settings"), &fallback),
+            PathBuf::from("/from-settings")
+        );
+        unsafe { std::env::set_var("PI_CODING_AGENT_SESSION_DIR", "/from-pi") };
+        assert_eq!(
+            resolve_session_dir(None, Some("/from-settings"), &fallback),
+            PathBuf::from("/from-pi")
+        );
+        unsafe { std::env::set_var("RUPI_SESSION_DIR", "/from-rupi") };
+        assert_eq!(
+            resolve_session_dir(None, Some("/from-settings"), &fallback),
+            PathBuf::from("/from-rupi")
+        );
+        assert_eq!(
+            resolve_session_dir(Some("/from-cli"), Some("/from-settings"), &fallback),
+            PathBuf::from("/from-cli")
+        );
+        match saved_rupi {
+            Some(v) => unsafe { std::env::set_var("RUPI_SESSION_DIR", v) },
+            None => unsafe { std::env::remove_var("RUPI_SESSION_DIR") },
+        }
+        match saved_pi {
+            Some(v) => unsafe { std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_CODING_AGENT_SESSION_DIR") },
+        }
+        drop(g);
+
+        let mut s = Settings::default();
+        let (k, v) = apply_setting(&mut s, "prompts", "off").unwrap();
+        assert_eq!(k, "prompts");
+        assert_eq!(v, json!([]));
+        assert_eq!(s.prompts.as_deref(), Some(&[][..]));
+        let (k, v) = apply_setting(&mut s, "prompts", "review,!draft").unwrap();
+        assert_eq!(k, "prompts");
+        assert_eq!(s.prompts, Some(vec!["review".into(), "!draft".into()]));
+        assert_eq!(v, json!(["review", "!draft"]));
+        apply_setting(&mut s, "prompts", "on").unwrap();
+        assert!(s.prompts.is_none());
+        apply_setting(&mut s, "sessionDir", "/tmp/sess").unwrap();
+        assert_eq!(s.session_dir(), Some("/tmp/sess"));
+        let shown = format_settings(&s, Path::new("/tmp/settings.json"));
+        assert!(shown.contains("sessionDir"), "{shown}");
+        assert!(shown.contains("prompts"), "{shown}");
     }
 
     #[test]

@@ -8,12 +8,12 @@ use crate::session_nav::SessionNavigator;
 use crate::slash;
 use crate::theme::Theme;
 use crate::tree_nav::TreeNavigator;
-use crate::view::{ChatView, InputBuffer};
+use crate::view::{collapse_paste_preview, ChatView, InputBuffer};
 use anyhow::Context;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -59,6 +59,8 @@ pub struct TuiContext<'a> {
     pub ext_set: Option<&'a mut rupi_ext::ExtensionSet>,
     /// 自定义斜杠命令目录：发送前展开（与 REPL 同语义）。
     pub command_dirs: Vec<std::path::PathBuf>,
+    /// 信任门：`/settings prompts` 热改时按此重扫目录。
+    pub load_project: bool,
     /// review 建议行缓冲（agent 回调写入，UI 每帧排空为 System 行）。`--review` 时装配。
     pub review_lines: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// sessions.db 会话 id（共享 cell：`/resume` 切换后落盘回调与亲和头同读此值，
@@ -103,7 +105,12 @@ struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -156,7 +163,11 @@ impl rupi_agent::Approver for TuiApprover {
             return true;
         }
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         eprintln!("[approve] {tool} {args} — {reason} [y(es once)/a(ll session)/N]");
         let mut line = String::new();
         let answer = if std::io::stdin().read_line(&mut line).is_ok() {
@@ -164,7 +175,11 @@ impl rupi_agent::Approver for TuiApprover {
         } else {
             rupi_agent::ApprovalAnswer::Deny
         };
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        );
         let _ = enable_raw_mode();
         match answer {
             rupi_agent::ApprovalAnswer::Deny => false,
@@ -184,7 +199,12 @@ pub async fn launch(ctx: TuiContext<'_>) -> anyhow::Result<()> {
     }
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let _guard = Guard; // panic/返回时必恢复终端
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -346,7 +366,7 @@ fn dispatch_builtin(
         });
     }
     if t == "/commands" {
-        let mut block = commands::index_block(command_dirs);
+        let mut block = commands::index_block_filtered(command_dirs, None);
         if let Some(set) = ext_set.as_ref() {
             let extra = set.command_index();
             if !extra.is_empty() {
@@ -532,6 +552,14 @@ fn dispatch_builtin(
             .map(str::to_string);
         return Builtin::Compact(prompt);
     }
+    if t == "/share" || t.starts_with("/share ") {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        let name = sess_db.and_then(|db| db.get_name(session_id).ok().flatten());
+        let jsonl = rupi_memory::export_tree_jsonl(session, &cwd, name.as_deref(), None);
+        return Builtin::Done(crate::share::share_jsonl(&jsonl, session_id, true));
+    }
     if t == "/export" || t.starts_with("/export ") {
         let arg = t.strip_prefix("/export").unwrap_or("").trim();
         let html = arg.ends_with(".html") || arg == "html";
@@ -647,7 +675,7 @@ enum Control {
     Quit,
 }
 
-const TUI_HELP: &str = "rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出";
+const TUI_HELP: &str = "rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /share /fork /clone /name，鼠标滚轮，/quit 退出";
 
 /// 启动 banner：`quietStartup` 全静音；否则帮助行 + 已载 skill/ext/MCP。
 pub fn startup_banner_lines(
@@ -729,10 +757,15 @@ async fn run_loop(
     loop {
         // 斜杠补全候选：内建 + 自定义命令（小目录扫描，随输入更新；Enter 前 Tab 应用）。
         // 无斜杠候选时回退 @路径补全（root 取 current_dir，失败即无弹窗）。
-        let mut custom_names: Vec<String> = commands::list(&ctx.command_dirs)
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
+        let prompt_filter = ctx
+            .settings
+            .as_ref()
+            .map(|s| commands::PromptFilter::from_specs(s.prompts.as_deref()));
+        let mut custom_names: Vec<String> =
+            commands::list_filtered(&ctx.command_dirs, prompt_filter.as_ref())
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
         if let Some(set) = ctx.ext_set.as_ref() {
             custom_names.extend(set.list_commands().into_iter().map(|c| c.name));
         }
@@ -780,6 +813,15 @@ async fn run_loop(
                 MouseEventKind::ScrollUp => scroll = scroll.saturating_add(3),
                 MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
                 _ => {}
+            }
+            continue;
+        }
+        if let Event::Paste(s) = ev {
+            if tree.is_none() && sessions.is_none() {
+                if let Some(note) = collapse_paste_preview(&s) {
+                    view.push_system(note);
+                }
+                input.insert_str(&s);
             }
             continue;
         }
@@ -1105,6 +1147,23 @@ async fn run_loop(
                         view.push_system(msg);
                         continue;
                     }
+                    if text.trim() == "/commands" {
+                        let filter = ctx
+                            .settings
+                            .as_ref()
+                            .map(|s| commands::PromptFilter::from_specs(s.prompts.as_deref()));
+                        let mut block =
+                            commands::index_block_filtered(&ctx.command_dirs, filter.as_ref());
+                        if let Some(set) = ctx.ext_set.as_ref() {
+                            let extra = set.command_index();
+                            if !extra.is_empty() {
+                                block.push('\n');
+                                block.push_str(&extra);
+                            }
+                        }
+                        view.push_system(block);
+                        continue;
+                    }
                     if let Some(msg) = handle_settings_cmd(
                         &text,
                         ctx.settings.as_deref_mut(),
@@ -1114,6 +1173,13 @@ async fn run_loop(
                     ) {
                         if let Some(s) = ctx.settings.as_ref() {
                             chrome.theme = Theme::from_name(s.theme());
+                            let filter =
+                                rupi_core::commands::PromptFilter::from_specs(s.prompts.as_deref());
+                            ctx.command_dirs = commands::command_dirs_for(
+                                &ctx.settings_home,
+                                ctx.load_project,
+                                &filter,
+                            );
                         }
                         view.push_system(msg);
                         continue;
@@ -1297,18 +1363,22 @@ async fn run_loop(
                         }
                         Builtin::Pass => {}
                     }
-                    // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词；
-                    // 未命中再回退 skill 名（`/skillname args` 即调 skill；`/skill:name` 同义）。
-                    let slash = commands::split(&text).map(|(n, a)| (n.to_owned(), a.to_owned()));
-                    let mut send_text = text.clone();
-                    if let Some((name, args)) = slash.as_ref() {
-                        if let Some(expanded) = commands::expand(&ctx.command_dirs, name, args) {
-                            view.push_system(format!("[command /{name}]"));
-                            send_text = expanded;
-                        } else if let Some(expanded) = ctx.skills.expand_as_command(name, args) {
-                            view.push_system(format!("[skill /{name}]"));
-                            send_text = expanded;
-                        } else if let Some(set) = ctx.ext_set.as_ref() {
+                    // 自定义斜杠：空闲发送才展开 skill/prompt；steer 路径不走这里。
+                    let filter = ctx
+                        .settings
+                        .as_ref()
+                        .map(|s| commands::PromptFilter::from_specs(s.prompts.as_deref()));
+                    let (mut send_text, note) = slash::expand_slash_input(
+                        &text,
+                        &ctx.command_dirs,
+                        ctx.skills,
+                        true,
+                        filter.as_ref(),
+                    );
+                    if let Some(note) = note {
+                        view.push_system(note);
+                    } else if let Some((name, args)) = commands::split(&text) {
+                        if let Some(set) = ctx.ext_set.as_ref() {
                             if let Some(expanded) = set.expand_command(name, args) {
                                 view.push_system(format!("[ext /{name}]"));
                                 send_text = expanded;
@@ -1462,6 +1532,13 @@ where
                             MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
                             _ => {}
                         },
+                        Some(Ok(Event::Paste(s))) => {
+                            if let Some(note) = collapse_paste_preview(&s) {
+                                view.push_system(note);
+                            }
+                            followup.push_str(&s.replace('\r', ""));
+                            qb.set_text(&followup);
+                        }
                         Some(Ok(Event::Key(key))) => {
                             match collect_busy(&mut followup, &key) {
                                 BusyKey::Typed => qb.set_text(&followup),
@@ -1470,6 +1547,13 @@ where
                                     followup.clear();
                                     qb.set_text("");
                                     if !msg.is_empty() {
+                                        let (msg, _) = slash::expand_slash_input(
+                                            &msg,
+                                            &[],
+                                            skills,
+                                            false,
+                                            None,
+                                        );
                                         if let Some(inbox) = &agent.inbox {
                                             inbox.steer(&msg);
                                             view.push_system(format!("[steer] {msg}"));
@@ -1485,6 +1569,13 @@ where
                                     followup.clear();
                                     qb.set_text("");
                                     if !msg.is_empty() {
+                                        let (msg, _) = slash::expand_slash_input(
+                                            &msg,
+                                            &[],
+                                            skills,
+                                            false,
+                                            None,
+                                        );
                                         if let Some(inbox) = &agent.inbox {
                                             inbox.follow_up(&msg);
                                             view.push_system(format!("[follow-up] {msg}"));
@@ -1728,12 +1819,22 @@ fn open_external_editor(initial: &str, configured: Option<&str>) -> anyhow::Resu
         .or_else(|| std::env::var("EDITOR").ok())
         .unwrap_or_else(|| "vi".into());
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} {}", path.display()))
         .status();
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
     let _ = enable_raw_mode();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::remove_file(&path);
@@ -3112,6 +3213,39 @@ mod tests {
             false,
         ));
         assert!(msg.contains("[trust]"), "{msg}");
+        let prev = std::env::current_dir().ok();
+        let share_cwd = std::env::temp_dir().join(format!(
+            "rupi-share-dispatch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&share_cwd);
+        std::fs::create_dir_all(&share_cwd).unwrap();
+        let _ = std::env::set_current_dir(&share_cwd);
+        let saved_off = std::env::var("RUPI_SHARE_OFFLINE").ok();
+        unsafe { std::env::set_var("RUPI_SHARE_OFFLINE", "1") };
+        let msg = done_text(dispatch_builtin(
+            "/share",
+            &mut agent,
+            &mut session,
+            &mut provider,
+            &skills,
+            &[],
+            "abcdef12-share",
+            &mut ToolRegistry::default(),
+            None,
+            None,
+            false,
+        ));
+        match saved_off {
+            Some(v) => unsafe { std::env::set_var("RUPI_SHARE_OFFLINE", v) },
+            None => unsafe { std::env::remove_var("RUPI_SHARE_OFFLINE") },
+        }
+        if let Some(p) = prev {
+            let _ = std::env::set_current_dir(p);
+        }
+        let _ = std::fs::remove_dir_all(&share_cwd);
+        assert!(msg.contains("[share]"), "{msg}");
         assert!(matches!(
             dispatch_builtin(
                 "/tree",

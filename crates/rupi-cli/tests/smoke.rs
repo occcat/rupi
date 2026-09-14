@@ -37,7 +37,12 @@ fn rupi_at(rupi_home: &Path, user_home: &Path, cwd: &Path, args: &[&str]) -> Com
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("RUPI_GEMINI_KEY")
         .env_remove("GEMINI_API_KEY")
-        .env_remove("GOOGLE_API_KEY");
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("RUPI_SESSION_DIR")
+        .env_remove("PI_CODING_AGENT_SESSION_DIR")
+        .env_remove("RUPI_SHARE_VIEWER_URL")
+        .env_remove("PI_SHARE_VIEWER_URL")
+        .env("RUPI_SHARE_OFFLINE", "1");
     cmd
 }
 
@@ -580,6 +585,8 @@ fn settings_and_system_md_apply() {
     );
     for flag in [
         "session",
+        "session-dir",
+        "export",
         "pick-session",
         "fork",
         "print",
@@ -1352,5 +1359,139 @@ fn cloud_subcommand_is_http_client() {
     assert!(
         !help.to_lowercase().contains("ratatui"),
         "cloud 不应绑 TUI:\n{help}"
+    );
+}
+
+fn first_session_id(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.contains('['))?;
+    let rest = line.split(']').nth(1)?.trim();
+    rest.split_whitespace().next().map(str::to_string)
+}
+
+#[test]
+fn session_dir_cli_export_exit_share_and_prompts_toggle() {
+    let home = fresh_home();
+    let sess = home.join("alt-sessions");
+    let o = rupi(
+        &home,
+        &[
+            "--no-approve",
+            "--session-dir",
+            sess.to_str().unwrap(),
+            "--name",
+            "alt",
+            "run",
+            "hello-session-dir",
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "--session-dir run 失败:\n{out}\n{err}"
+    );
+    assert!(
+        sess.join("sessions.db").is_file(),
+        "sessions.db 应落在 --session-dir"
+    );
+    assert!(
+        !home.join("sessions.db").is_file(),
+        "默认 RUPI_HOME 不应再写 sessions.db"
+    );
+
+    let o = rupi(
+        &home,
+        &["--session-dir", sess.to_str().unwrap(), "sessions"],
+    )
+    .output()
+    .unwrap();
+    let (list, err) = out_text(&o);
+    assert!(o.status.success(), "sessions 失败:\n{list}\n{err}");
+    assert!(list.contains("alt"), "sessions 未显示 name:\n{list}");
+    let sid = first_session_id(&list).expect(&format!("no session id:\n{list}"));
+
+    let dest = home.join("exported.html");
+    let o = rupi(
+        &home,
+        &[
+            "--session-dir",
+            sess.to_str().unwrap(),
+            "--export",
+            &sid,
+            dest.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "--export 失败:\n{out}\n{err}");
+    assert!(
+        out.contains("Exported to:"),
+        "缺导出确认:\n{out}\n{err}"
+    );
+    assert!(dest.is_file(), "HTML 未写出: {dest:?}");
+    let html = std::fs::read_to_string(&dest).unwrap();
+    assert!(html.contains("<html") || html.contains("<!DOCTYPE") || html.contains("hello-session-dir") || html.contains("session"), "{html}");
+
+    let jsonl_out = home.join("exported.jsonl");
+    let o = rupi(
+        &home,
+        &[
+            "--session-dir",
+            sess.to_str().unwrap(),
+            "--export",
+            &sid,
+            jsonl_out.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "--export jsonl 失败: {o:?}");
+    let jsonl = std::fs::read_to_string(&jsonl_out).unwrap();
+    assert!(jsonl.contains("\"type\":\"session\"") || jsonl.contains("session"), "{jsonl}");
+
+    std::fs::create_dir_all(home.join("prompts")).unwrap();
+    std::fs::write(home.join("prompts").join("greet.md"), "Hello $ARGUMENTS\n").unwrap();
+    std::fs::create_dir_all(home.join("commands")).unwrap();
+    std::fs::write(home.join("commands").join("ship.md"), "Ship $ARGUMENTS\n").unwrap();
+    std::fs::write(home.join("settings.json"), r#"{"prompts":[]}"#).unwrap();
+    let o = rupi(&home, &["commands"]).output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "commands 失败:\n{out}\n{err}");
+    assert!(out.contains("/ship"), "commands/ 应仍可见:\n{out}");
+    assert!(
+        !out.contains("/greet"),
+        "settings.prompts=[] 应关掉 prompts/:\n{out}"
+    );
+
+    let o = chat_with(
+        &home,
+        &["--no-review"],
+        "/settings prompts review\n/settings\n/quit\n".as_bytes(),
+    );
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "/settings prompts 失败:\n{out}\n{err}");
+    assert!(out.contains("prompts"), "{out}");
+
+    let mut child = rupi(&home, &["--no-review", "chat"])
+        .env("RUPI_SHARE_OFFLINE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/share\n/quit\n")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "/share 失败:\n{out}\n{err}");
+    assert!(
+        out.contains("[share]") || err.contains("[share]"),
+        "缺 /share 回显:\n{out}\n{err}"
     );
 }

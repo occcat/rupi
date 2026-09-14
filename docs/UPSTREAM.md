@@ -32,7 +32,7 @@
 - 持久化：SQLite（WAL）而非上游 JSONL。**本次合并后每个节点完整落盘**：`content` 列存纯文本（FTS/展示），
   `blocks` 列存整条 `Message` JSON（工具调用、工具结果、思考块），`--resume` / TUI `/resume` 按结构回填，模型续聊时看到完整工具上下文。老库自动补列（`user_version=4`：`name`/`cwd`/`updated_at`/`parent_session`）。每轮 3–4 条 INSERT 走 `persist_turn` 一个事务；CLI/TUI 落盘与记忆文件写进 `spawn_blocking`/`tokio::fs`。`memory_search`/`session_search`/`mirror_memory` 复用 `MemoryStore` 里的 `sessions.db` 连接。
 - 互操作：`--continue`/`-c` 最近会话（优先同 cwd）、`--no-session`、`--name`/`/name`、`/export`（Pi JSONL v3 + 简易 HTML）、`/import`、`/fork`（当前路径新 id）、`/clone`（全树 remap）。存储仍是 SQLite；JSONL 是进出口，不是主存。
-- 不移植：`/share`。`--session <id|jsonl>` / `--fork` 把 JSONL 装入 SQLite 后续聊，不把上游文件当主存。
+- `/share`：秘密 gist（`gh gist create`）+ `RUPI_SHARE_VIEWER_URL`/`PI_SHARE_VIEWER_URL`；无凭证写本地 JSONL。不移植 Radius/OAuth。`--session <id|jsonl>` / `--fork` 把 JSONL 装入 SQLite 后续聊，不把上游文件当主存。`--session-dir` / `RUPI_SESSION_DIR` / `PI_CODING_AGENT_SESSION_DIR` / `settings.sessionDir` 改 sessions.db 位置。
 
 ## 工具（`packages/coding-agent/src/core/tools` → `crates/rupi-tools`）
 
@@ -93,13 +93,13 @@
 | `pi -p` | `rupi run "..."` 或 `rupi -p`；stdin 非 TTY 时管道正文拼进 prompt |
 | `pi --mode json` | `rupi run --json "..."`：stdout 每行一个 `AgentEvent`，末行 `run_result` |
 | `pi --mode rpc` / `createAgentSession` | `rupi --mode rpc` JSONL + `rupi_agent::create_agent_session`；`AgentSession::builder().session_path` |
-| `pi --continue/--resume/--session/--fork` | `--continue`/`-c`、`--resume <id>`、`--session <id\|jsonl>`、`-r` 选择器（非 TTY 取最近）、`--fork <id\|path>` |
-| `/export` `/import` `/fork` `/clone` `/name` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页）；另有 `/new` `/session` |
+| `pi --continue/--resume/--session/--fork` | `--continue`/`-c`、`--resume <id>`、`--session <id\|jsonl>`、`-r` 选择器（非 TTY 取最近）、`--fork <id\|path>`、`--session-dir` |
+| `/export` `/import` `/fork` `/clone` `/name` `/share` | 同名（JSONL 贴 Pi session-format v3；HTML 为简易独立页）；`rupi --export <id\|jsonl> [out]` 写出即退；`/share` 走 gist 或本地文件 |
 | `/tree` `/compact` `/model` `/thinking` | 同名；另有 `/rewind` `/goto` `/plan` `/reload` `/skills` `/commands` |
 | `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；只读合并 `~/.pi/agent/settings.json` / `.pi/settings.json`（同键 rupi 优先）。核心键：`steeringMode` / `followUpMode` / `defaultProjectTrust` / `externalEditor` / `enabledModels`。`/settings` 热改并写回（有项目文件则写项目，否则 `~/.rupi/settings.json`）。`--tools/--exclude-tools/--no-tools/--no-builtin-tools`、`--no-context-files`/`-nc`、`-e/--skill/--no-extensions/--no-skills`、`--system-prompt/--append-system-prompt` |
-| 自定义命令 / prompts | `~/.rupi/commands` 与 `prompts`、`.rupi/` 与只读 `~/.pi/agent` / `.pi` 同展开；`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute` |
+| 自定义命令 / prompts | `~/.rupi/commands` 与 `prompts`、`.rupi/` 与只读 `~/.pi/agent` / `.pi` 同展开；`settings.prompts[]` 开关（`off`/`[]` 关默认扫描，路径追加，`!name` 排除）。`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute`。steer / follow-up 排队不展开 skill/prompt 模板 |
 | `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本；TS 跳过并提示改用 JSON-RPC `*.json`） |
-| TUI | Markdown、工具/思考折叠、主题、`!cmd` / `!!cmd`（后者只回显）、Shift+Enter 换行、Ctrl+V 贴图、Ctrl+L/P 模型（P 走 `enabledModels`）、Shift+Tab 思考档、`~/.rupi/keybindings.json` + 扩展 `registerKeybinding`、Ctrl+G、鼠标、`/tree` 导航器、`/sessions` 选择器、footer、增量渲染 |
+| TUI | Markdown、工具/思考折叠、主题、`!cmd` / `!!cmd`（后者只回显）、Shift+Enter 换行、括号粘贴（`Event::Paste`，>10 行预览折叠）、Ctrl+V 贴图、Ctrl+L/P 模型（P 走 `enabledModels`）、Shift+Tab 思考档、`~/.rupi/keybindings.json` + 扩展 `registerKeybinding`、Ctrl+G、鼠标、`/tree` 导航器、`/sessions` 选择器、footer、增量渲染 |
 | RPC 扩面 | `set_model` / `get_available_models` / `switch_session` / `fork` / `clone` / `get_tree` / `set_session_name` / `get_commands`；`prompt`/`steer`/`follow_up` 的 `images[]`（`{type,data,mimeType}`） |
 | bash 环境 | 子进程继承 `RUPI_SESSION_ID` / `RUPI_SESSION_FILE` / `RUPI_PROVIDER` / `RUPI_MODEL` / `RUPI_REASONING_LEVEL`（对标 `PI_*`） |
 | 扩展 provider | `registerProvider`（OpenAI/Anthropic/Gemini 兼容 `base_url`）写入 `providers.json` 并并入 `models.json`；核心事件 tag：`session_start` / `turn_start` / `turn_end` / `tool_call` / `tool_result` / `model_change` |

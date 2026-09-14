@@ -34,6 +34,16 @@ impl InputBuffer {
         self.cursor += 1;
     }
 
+    /// 括号粘贴：整段插入（含换行），不把换行当提交。
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            if c == '\r' {
+                continue;
+            }
+            self.push_char(c);
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -85,6 +95,21 @@ impl InputBuffer {
             self.chars[..self.cursor].iter().collect(),
             self.chars[self.cursor..].iter().collect(),
         )
+    }
+}
+
+/// 对标 Pi TUI：超过 10 行的粘贴在预览里收成一行。
+pub const PASTE_COLLAPSE_LINES: usize = 10;
+
+pub fn collapse_paste_preview(text: &str) -> Option<String> {
+    let lines = text.split('\n').count();
+    if lines <= PASTE_COLLAPSE_LINES {
+        None
+    } else {
+        Some(format!(
+            "[pasted {lines} lines, {} chars]",
+            text.chars().count()
+        ))
     }
 }
 
@@ -381,6 +406,18 @@ mod tests {
         assert_eq!(post, "ab");
         assert_eq!(b.take(), "你ab");
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_keeps_newlines_and_collapses_preview() {
+        let mut b = InputBuffer::default();
+        b.insert_str("one\r\ntwo\nthree");
+        assert_eq!(b.text(), "one\ntwo\nthree");
+        assert!(collapse_paste_preview(&b.text()).is_none());
+        let big = (0..12).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let preview = collapse_paste_preview(&big).expect("should collapse");
+        assert!(preview.contains("12 lines"), "{preview}");
+        assert!(preview.contains("chars"), "{preview}");
     }
 
     #[test]

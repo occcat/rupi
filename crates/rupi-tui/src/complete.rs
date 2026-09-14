@@ -12,7 +12,7 @@ use std::path::Path;
 pub const BUILTINS: &[&str] = &[
     "clone", "commands", "compact", "copy", "export", "fork", "goto", "hotkeys", "import", "model",
     "name", "new", "plan", "quit", "reload", "resume", "rewind", "session", "sessions", "settings",
-    "skills", "thinking", "tree", "trust",
+    "share", "skills", "thinking", "tree", "trust",
 ];
 
 /// 计算候选：`input` 以 `/` 开头且首 token 无空白时，按前缀过滤并排序去重；否则空。
@@ -199,6 +199,7 @@ mod tests {
     #[test]
     fn prefix_filters_builtins_and_customs() {
         assert_eq!(candidates("/sk", &[]), vec!["skills".to_string()]);
+        assert_eq!(candidates("/sha", &[]), vec!["share".to_string()]);
         assert_eq!(candidates("/th", &[]), vec!["thinking".to_string()]);
         assert_eq!(
             candidates("/co", &[]),

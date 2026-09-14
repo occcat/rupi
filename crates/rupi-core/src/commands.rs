@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 
 /// 扫描目录集，返回 命令名 → 文件。先扫描者胜（用户级覆盖项目级请自行排序）。
 pub fn discover(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
+    discover_filtered(dirs, None)
+}
+
+/// 同 [`discover`]，但对来自 `prompts/` 的文件套用 [`PromptFilter`]。
+pub fn discover_filtered(
+    dirs: &[PathBuf],
+    filter: Option<&PromptFilter>,
+) -> HashMap<String, PathBuf> {
     let mut out = HashMap::new();
     for base in dirs {
         let Ok(entries) = std::fs::read_dir(base) else {
@@ -22,9 +30,17 @@ pub fn discover(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
             }
             if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                 let name = stem.to_lowercase();
-                if is_valid_name(&name) {
-                    out.entry(name).or_insert(p);
+                if !is_valid_name(&name) {
+                    continue;
                 }
+                if is_prompt_file(&p) {
+                    if let Some(f) = filter {
+                        if !f.allows_prompt(&name) {
+                            continue;
+                        }
+                    }
+                }
+                out.entry(name).or_insert(p);
             }
         }
     }
@@ -57,7 +73,16 @@ pub fn split(input: &str) -> Option<(&str, &str)> {
 /// 展开命令：读文件、剥 frontmatter、按 [`crate::template`] 替换占位符。
 /// 文件缺失/非法返回 None。
 pub fn expand(dirs: &[PathBuf], name: &str, args: &str) -> Option<String> {
-    let table = discover(dirs);
+    expand_filtered(dirs, name, args, None)
+}
+
+pub fn expand_filtered(
+    dirs: &[PathBuf],
+    name: &str,
+    args: &str,
+    filter: Option<&PromptFilter>,
+) -> Option<String> {
+    let table = discover_filtered(dirs, filter);
     let path = table.get(&name.to_lowercase())?;
     expand_file(path, args)
 }
@@ -86,6 +111,113 @@ fn strip_frontmatter(raw: &str) -> &str {
     }
 }
 
+/// `settings.prompts[]` 对默认 `prompts/` 扫描的开关（commands/ 始终扫）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptFilter {
+    pub include_default: bool,
+    pub extra_dirs: Vec<PathBuf>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Default for PromptFilter {
+    fn default() -> Self {
+        Self {
+            include_default: true,
+            extra_dirs: Vec::new(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+impl PromptFilter {
+    /// `None`：默认扫描。`Some([])` 或仅 `off`：关掉默认 prompts 目录。
+    pub fn from_specs(specs: Option<&[String]>) -> Self {
+        let Some(specs) = specs else {
+            return Self::default();
+        };
+        let items: Vec<&str> = specs
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() || items.iter().all(|s| prompt_token_off(s)) {
+            return Self {
+                include_default: false,
+                extra_dirs: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+            };
+        }
+        if items.iter().all(|s| prompt_token_on(s)) {
+            return Self::default();
+        }
+        let mut out = Self::default();
+        for s in items {
+            if prompt_token_off(s) {
+                out.include_default = false;
+                continue;
+            }
+            if prompt_token_on(s) {
+                continue;
+            }
+            if let Some(name) = s.strip_prefix('!').or_else(|| s.strip_prefix('-')) {
+                if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+                    out.deny.push(name.to_ascii_lowercase());
+                    continue;
+                }
+            }
+            if looks_like_prompt_path(s) {
+                out.extra_dirs.push(PathBuf::from(s));
+            } else {
+                out.allow.push(s.to_ascii_lowercase());
+            }
+        }
+        out
+    }
+
+    pub fn allows_prompt(&self, name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        if self.deny.iter().any(|d| d == &n) {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow.iter().any(|a| a == &n)
+    }
+}
+
+fn prompt_token_off(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "off" | "false" | "none" | "disable" | "disabled"
+    )
+}
+
+fn prompt_token_on(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "on" | "true" | "default" | "enable" | "enabled"
+    )
+}
+
+fn looks_like_prompt_path(s: &str) -> bool {
+    s.contains('/')
+        || s.contains('\\')
+        || s.starts_with('.')
+        || s.starts_with('~')
+        || Path::new(s).exists()
+}
+
+fn is_prompt_file(path: &Path) -> bool {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("prompts")
+}
+
 /// 命令目录：`commands/*.md` 与 `prompts/*.md` 同展开（对标 Pi prompt templates）。
 /// 含 `~/.rupi`、`.rupi`、以及只读的 `~/.pi/agent` / `.pi`。
 pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
@@ -94,18 +226,31 @@ pub fn command_dirs(home: &Path) -> Vec<PathBuf> {
 
 /// `load_project` 为 false 时只留全局层（信任被拒）。
 pub fn command_dirs_filtered(home: &Path, load_project: bool) -> Vec<PathBuf> {
-    let mut dirs = vec![home.join("commands"), home.join("prompts")];
+    command_dirs_for(home, load_project, &PromptFilter::default())
+}
+
+/// 按 `settings.prompts[]` 过滤默认 prompts 目录，并追加额外路径。
+pub fn command_dirs_for(home: &Path, load_project: bool, filter: &PromptFilter) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join("commands")];
+    if filter.include_default {
+        dirs.push(home.join("prompts"));
+    }
     if let Ok(h) = std::env::var("HOME") {
         let user = PathBuf::from(h);
         dirs.push(user.join(".pi/agent/commands"));
-        dirs.push(user.join(".pi/agent/prompts"));
+        if filter.include_default {
+            dirs.push(user.join(".pi/agent/prompts"));
+        }
     }
     if load_project {
         dirs.push(PathBuf::from(".rupi/commands"));
-        dirs.push(PathBuf::from(".rupi/prompts"));
         dirs.push(PathBuf::from(".pi/commands"));
-        dirs.push(PathBuf::from(".pi/prompts"));
+        if filter.include_default {
+            dirs.push(PathBuf::from(".rupi/prompts"));
+            dirs.push(PathBuf::from(".pi/prompts"));
+        }
     }
+    dirs.extend(filter.extra_dirs.iter().cloned());
     dirs
 }
 
@@ -245,7 +390,11 @@ fn read_at_file(rel: &str, root_canon: &Path) -> Option<AtPart> {
 /// 列出命令：按名称排序的 (name, description)。
 /// description 取 frontmatter `description:`，无则取正文首个非空行（压单行、截 80 字符）。
 pub fn list(dirs: &[PathBuf]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = discover(dirs)
+    list_filtered(dirs, None)
+}
+
+pub fn list_filtered(dirs: &[PathBuf], filter: Option<&PromptFilter>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = discover_filtered(dirs, filter)
         .iter()
         .map(|(name, path)| (name.clone(), describe_file(path)))
         .collect();
@@ -255,7 +404,11 @@ pub fn list(dirs: &[PathBuf]) -> Vec<(String, String)> {
 
 /// 渲染 `/commands` 列表块：无命令时给一句提示（含目录指引）。
 pub fn index_block(dirs: &[PathBuf]) -> String {
-    let items = list(dirs);
+    index_block_filtered(dirs, None)
+}
+
+pub fn index_block_filtered(dirs: &[PathBuf], filter: Option<&PromptFilter>) -> String {
+    let items = list_filtered(dirs, filter);
     if items.is_empty() {
         return "no custom commands. drop `<name>.md` into one of:\n".to_owned()
             + &dirs
@@ -394,6 +547,46 @@ mod tests {
     fn index_block_empty_dirs_hints_paths() {
         let block = index_block(&[PathBuf::from("/nonexistent-rupi-cmd")]);
         assert!(block.contains("no custom commands"));
+    }
+
+    #[test]
+    fn prompt_filter_toggles_default_dirs_and_names() {
+        let home = PathBuf::from("/tmp/rupi-home-prompts-filter");
+        let off = PromptFilter::from_specs(Some(&[]));
+        assert!(!off.include_default);
+        let dirs = command_dirs_for(&home, true, &off);
+        assert!(dirs.iter().all(|d| !d.ends_with("prompts")), "{dirs:?}");
+        assert!(dirs.iter().any(|d| d.ends_with("commands")));
+
+        let allow = PromptFilter::from_specs(Some(&["review".into(), "!draft".into()]));
+        assert!(allow.include_default);
+        assert!(allow.allows_prompt("review"));
+        assert!(!allow.allows_prompt("draft"));
+        assert!(!allow.allows_prompt("other"));
+
+        let extra = PromptFilter::from_specs(Some(&["./team-prompts".into()]));
+        assert_eq!(extra.extra_dirs, vec![PathBuf::from("./team-prompts")]);
+        assert!(extra.allows_prompt("anything"));
+
+        let base = std::env::temp_dir().join(format!(
+            "rupi-prompt-filter-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let prompts = base.join("prompts");
+        let commands = base.join("commands");
+        write(&prompts, "review.md", "Review $ARGUMENTS\n");
+        write(&prompts, "draft.md", "Draft $ARGUMENTS\n");
+        write(&commands, "ship.md", "Ship $ARGUMENTS\n");
+        let dirs = vec![commands.clone(), prompts.clone()];
+        assert!(expand_filtered(&dirs, "review", "x", Some(&allow)).is_some());
+        assert!(expand_filtered(&dirs, "draft", "x", Some(&allow)).is_none());
+        assert_eq!(
+            expand_filtered(&dirs, "ship", "now", Some(&allow)).as_deref(),
+            Some("Ship now")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

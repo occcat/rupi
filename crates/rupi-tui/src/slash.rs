@@ -4,7 +4,8 @@ use crate::keybindings::KeyTable;
 use crate::view::Line;
 use rupi_core::trust::TrustStore;
 use rupi_core::{Role, SessionTree};
-use std::path::Path;
+use rupi_skills::SkillRegistry;
+use std::path::{Path, PathBuf};
 
 /// 视图里最后一条非空助手文本。
 pub fn last_assistant_from_lines(lines: &[Line]) -> Option<&str> {
@@ -107,6 +108,31 @@ pub fn parse_local_slash(input: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// 空闲发送才展开 skill / prompt 模板；steer / follow-up 排队原样注入。
+pub fn expand_slash_input(
+    text: &str,
+    command_dirs: &[PathBuf],
+    skills: &SkillRegistry,
+    expand_templates: bool,
+    filter: Option<&rupi_core::commands::PromptFilter>,
+) -> (String, Option<String>) {
+    if !expand_templates {
+        return (text.to_string(), None);
+    }
+    let Some((name, args)) = rupi_core::commands::split(text) else {
+        return (text.to_string(), None);
+    };
+    if let Some(expanded) =
+        rupi_core::commands::expand_filtered(command_dirs, name, args, filter)
+    {
+        return (expanded, Some(format!("[command /{name}]")));
+    }
+    if let Some(expanded) = skills.expand_as_command(name, args) {
+        return (expanded, Some(format!("[skill /{name}]")));
+    }
+    (text.to_string(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +196,41 @@ mod tests {
         );
         assert!(parse_local_slash("/settings").is_none());
         assert!(parse_local_slash("copy").is_none());
+    }
+
+    #[test]
+    fn steer_does_not_expand_skill_or_prompt_templates() {
+        let base = std::env::temp_dir().join(format!(
+            "rupi-slash-steer-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let prompts = base.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("greet.md"), "Hello $ARGUMENTS\n").unwrap();
+        let skill_dir = base.join("skills/demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: d\n---\nDo the thing.\n",
+        )
+        .unwrap();
+        let skills = SkillRegistry::discover(&[base.join("skills")]);
+        let dirs = vec![prompts];
+        let raw = "/greet world";
+        let (kept, note) = expand_slash_input(raw, &dirs, &skills, false, None);
+        assert_eq!(kept, raw);
+        assert!(note.is_none());
+        let (expanded, note) = expand_slash_input(raw, &dirs, &skills, true, None);
+        assert_eq!(expanded, "Hello world");
+        assert_eq!(note.as_deref(), Some("[command /greet]"));
+        let skill_raw = "/demo-skill now";
+        let (kept, _) = expand_slash_input(skill_raw, &dirs, &skills, false, None);
+        assert_eq!(kept, skill_raw);
+        let (expanded, note) = expand_slash_input(skill_raw, &dirs, &skills, true, None);
+        assert!(expanded.contains("Do the thing"), "{expanded}");
+        assert_eq!(note.as_deref(), Some("[skill /demo-skill]"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
