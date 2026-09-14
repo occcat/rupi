@@ -1,22 +1,119 @@
 //! 把用户 `sh -c` 箍在句柄根。
 //!
-//! - Linux：bwrap（若在 PATH）或 landlock；sandboxd 尽量 `unshare(CLONE_NEWNET)`。
-//! - macOS：`sandbox-exec` 约束到句柄根。
+//! - Linux：优先 bwrap + user ns + 每槽独立根；否则 landlock。sandboxd 尽量断网。
+//! - macOS：`sandbox-exec`，`(deny default)` + 必要 allow。
 //! - 其他 Unix：chdir，并尽力 `chroot`。
 //!
 //! jail 必须能执行 `/bin/sh`（只读挂上 `/usr` `/bin` `/lib` 等），但不能读邻居卷。
-//! 这不是微 VM / 容器集群。
+//! 这不是微 VM，也不是本机 Docker。指定了不支持的镜像必须失败，不能静默丢掉。
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
     /// execd：文件系统 jail。
     Jail,
-    /// sandboxd：文件系统 jail + 尽量断网。
+    /// sandboxd：每槽独立根 + 尽量 user ns / 断网。
     Sandbox,
+}
+
+/// sandboxd `CreateIn.image` 解析结果。Docker / OCI 引用不是后端。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxImage {
+    /// 内建隔离 jail（bwrap / user ns / landlock / macOS deny-default）。
+    Default,
+    /// 本地 rootfs 目录，经 bwrap 挂成独立根。不是 Docker。
+    Rootfs(PathBuf),
+}
+
+impl SandboxImage {
+    pub fn as_label(&self) -> String {
+        match self {
+            Self::Default => "default".into(),
+            Self::Rootfs(p) => format!("rootfs:{}", p.display()),
+        }
+    }
+
+    pub fn rootfs(&self) -> Option<&Path> {
+        match self {
+            Self::Default => None,
+            Self::Rootfs(p) => Some(p),
+        }
+    }
+
+    /// 镜像对应的隔离后端是否可用。不可用必须让 create 失败，不能忽略镜像。
+    pub fn require_backend(&self) -> Result<(), String> {
+        match self {
+            Self::Default => Ok(()),
+            Self::Rootfs(p) => {
+                if !which("bwrap") {
+                    return Err(format!(
+                        "unsupported sandbox image {}: isolated rootfs requires bwrap (not Docker)",
+                        p.display()
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 解析 create 的 `image`。空 / `default` / `jail` 走内建隔离；其余要么是本地 rootfs，要么失败。
+pub fn parse_sandbox_image(image: Option<&str>) -> Result<SandboxImage, String> {
+    let raw = image.map(str::trim).unwrap_or("");
+    let key = raw.to_ascii_lowercase();
+    if key.is_empty() || key == "default" || key == "jail" {
+        return Ok(SandboxImage::Default);
+    }
+    if key.starts_with("docker:")
+        || key.starts_with("docker://")
+        || key.starts_with("oci:")
+        || key.starts_with("http://")
+        || key.starts_with("https://")
+    {
+        return Err(format!(
+            "unsupported sandbox image {raw:?}: docker/oci is not a sandboxd backend"
+        ));
+    }
+    if let Some(path) = raw.strip_prefix("rootfs:") {
+        return rootfs_image(PathBuf::from(path));
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return rootfs_image(p.to_path_buf());
+    }
+    if let Ok(dir) = std::env::var("RUPI_SANDBOX_IMAGES") {
+        let cand = PathBuf::from(dir).join(raw);
+        if cand.is_dir() {
+            return rootfs_image(cand);
+        }
+    }
+    Err(format!(
+        "unsupported sandbox image {raw:?}: not a default jail or local rootfs"
+    ))
+}
+
+fn rootfs_image(p: PathBuf) -> Result<SandboxImage, String> {
+    if !p.is_dir() {
+        return Err(format!(
+            "unsupported sandbox image: rootfs {} is not a directory",
+            p.display()
+        ));
+    }
+    let canon = p.canonicalize().unwrap_or(p);
+    if canon == Path::new("/") {
+        return Err("unsupported sandbox image: host / is not an isolated rootfs".into());
+    }
+    if !canon.join("bin/sh").is_file() && !canon.join("bin/bash").is_file() {
+        return Err(format!(
+            "unsupported sandbox image: rootfs {} missing /bin/sh",
+            canon.display()
+        ));
+    }
+    Ok(SandboxImage::Rootfs(canon))
 }
 
 pub struct JailedChild {
@@ -25,18 +122,47 @@ pub struct JailedChild {
 
 /// 构造已 jail 的 `sh -c`。
 pub fn command(root: &Path, script: &str, isolation: Isolation) -> anyhow::Result<Command> {
+    command_with(
+        root,
+        script,
+        JailOpts {
+            isolation,
+            rootfs: None,
+        },
+    )
+}
+
+pub struct JailOpts<'a> {
+    pub isolation: Isolation,
+    pub rootfs: Option<&'a Path>,
+}
+
+pub fn command_with(root: &Path, script: &str, opts: JailOpts<'_>) -> anyhow::Result<Command> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if let Some(rfs) = opts.rootfs {
+        if !which("bwrap") {
+            anyhow::bail!(
+                "unsupported sandbox image: isolated rootfs {} requires bwrap",
+                rfs.display()
+            );
+        }
+        return Ok(bwrap_command(&root, script, opts.isolation, Some(rfs)));
+    }
     if which("bwrap") {
-        return Ok(bwrap_command(&root, script, isolation));
+        return Ok(bwrap_command(&root, script, opts.isolation, None));
     }
     #[cfg(target_os = "macos")]
     if which("sandbox-exec") {
         return Ok(macos_sandbox_command(&root, script));
     }
-    Ok(plain_jailed_sh(&root, script, isolation))
+    if opts.isolation == Isolation::Sandbox {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("sandbox isolation backend unavailable on this OS");
+    }
+    Ok(plain_jailed_sh(&root, script, opts.isolation))
 }
 
-fn which(name: &str) -> bool {
+pub(crate) fn which(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| {
             std::env::split_paths(&p).any(|dir| {
@@ -80,53 +206,102 @@ fn plain_jailed_sh(root: &Path, script: &str, isolation: Isolation) -> Command {
     cmd
 }
 
-fn bwrap_command(root: &Path, script: &str, isolation: Isolation) -> Command {
+fn bwrap_user_ns() -> bool {
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        if !which("bwrap") {
+            return false;
+        }
+        std::process::Command::new("bwrap")
+            .args([
+                "--unshare-user",
+                "--die-with-parent",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind",
+                "/bin",
+                "/bin",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "--dev",
+                "/dev",
+                "--",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+fn bwrap_command(
+    root: &Path,
+    script: &str,
+    isolation: Isolation,
+    rootfs: Option<&Path>,
+) -> Command {
     let root_s = root.display().to_string();
     let mut cmd = Command::new("bwrap");
+    cmd.arg("--die-with-parent");
+    if bwrap_user_ns() {
+        cmd.args(["--unshare-user", "--uid", "0", "--gid", "0"]);
+    }
+    cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    if isolation == Isolation::Sandbox {
+        cmd.arg("--unshare-net");
+    }
+    if let Some(rfs) = rootfs {
+        let rfs_s = rfs.display().to_string();
+        cmd.args(["--ro-bind", &rfs_s, "/"]);
+        cmd.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+    } else {
+        cmd.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+        cmd.args(["--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin"]);
+        cmd.args([
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+        ]);
+        if isolation != Isolation::Sandbox {
+            cmd.args([
+                "--ro-bind-try",
+                "/etc/resolv.conf",
+                "/etc/resolv.conf",
+                "--ro-bind-try",
+                "/etc/ssl",
+                "/etc/ssl",
+            ]);
+        }
+    }
     cmd.args([
-        "--die-with-parent",
-        "--unshare-pid",
-        "--unshare-uts",
-        "--unshare-ipc",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--ro-bind",
-        "/bin",
-        "/bin",
-        "--ro-bind-try",
-        "/lib",
-        "/lib",
-        "--ro-bind-try",
-        "/lib64",
-        "/lib64",
-        "--ro-bind-try",
-        "/etc/resolv.conf",
-        "/etc/resolv.conf",
-        "--ro-bind-try",
-        "/etc/ssl",
-        "/etc/ssl",
         "--bind",
         &root_s,
         "/workspace",
         "--chdir",
         "/workspace",
+        "--hostname",
+        "rupi",
         "--setenv",
         "HOME",
         "/workspace",
         "--setenv",
         "TMPDIR",
         "/workspace",
+        "--setenv",
+        "PWD",
+        "/workspace",
     ]);
-    if isolation == Isolation::Sandbox {
-        cmd.arg("--unshare-net");
-    }
     cmd.arg("--").arg("sh").arg("-c").arg(script);
     cmd.kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -139,47 +314,92 @@ fn bwrap_command(root: &Path, script: &str, isolation: Isolation) -> Command {
     cmd
 }
 
-#[cfg(target_os = "macos")]
-fn macos_sandbox_command(root: &Path, script: &str) -> Command {
-    let root_s = root
-        .display()
+fn escape_sb(root: &Path) -> String {
+    root.display()
         .to_string()
         .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    // GH macOS runner 上 (deny default) 会掐死 echo。改为 allow default，
-    // 再 deny 邻居可能在的树，并 require-not 放行句柄根。
-    let profile = format!(
+        .replace('"', "\\\"")
+}
+
+/// macOS seatbelt：deny-default，只放行跑 `/bin/sh` 与句柄根所需路径。
+/// 全平台可生成，供回归断言，避免再写成 `(allow default)`。
+pub fn macos_sandbox_profile(root: &Path) -> String {
+    let root_s = escape_sb(root);
+    format!(
         r##"(version 1)
-(allow default)
-(deny file-read-data
-  (require-all
-    (subpath "/private/var/folders")
-    (require-not (subpath "{root_s}"))
-  )
+(deny default)
+(allow process-exec*)
+(allow process-fork)
+(allow process-info* (target self))
+(allow signal)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix-shm*)
+(allow ipc-posix-sem*)
+(allow file-read-metadata)
+(allow file-map-executable
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/System")
+  (subpath "/Library")
+  (subpath "/private/var/db/dyld")
+  (subpath "/System/Volumes/Preboot")
+  (subpath "/System/Cryptexes")
 )
-(deny file-read-data
-  (require-all
-    (subpath "/var/folders")
-    (require-not (subpath "{root_s}"))
-  )
+(allow file-read*
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/System")
+  (subpath "/Library")
+  (subpath "/private/var/db/dyld")
+  (subpath "/private/var/db/timezone")
+  (subpath "/System/Volumes/Preboot")
+  (subpath "/System/Cryptexes")
+  (subpath "/opt/homebrew")
+  (subpath "/opt/local")
+  (literal "/etc")
+  (subpath "/etc")
+  (literal "/private/etc")
+  (subpath "/private/etc")
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/tty")
+  (literal "/dev/stdin")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/dtrussHelper")
+  (regex #"^/dev/fd/")
+  (subpath "{root_s}")
 )
-(deny file-read-data
-  (require-all
-    (subpath "/tmp")
-    (require-not (subpath "{root_s}"))
-  )
+(allow file-read* file-write*
+  (subpath "{root_s}")
 )
-(deny file-read-data
-  (require-all
-    (subpath "/private/tmp")
-    (require-not (subpath "{root_s}"))
-  )
+(allow file-write-data
+  (literal "/dev/null")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/tty")
+  (regex #"^/dev/fd/")
 )
-(deny file-read-data
-  (subpath "/Users")
+(allow file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/dtrussHelper")
+  (regex #"^/dev/fd/")
 )
 "##
-    );
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_command(root: &Path, script: &str) -> Command {
+    let profile = macos_sandbox_profile(root);
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(script);
     apply_stdio(&mut cmd, root);
@@ -191,6 +411,7 @@ fn macos_sandbox_command(root: &Path, script: &str) -> Command {
 #[cfg(target_os = "linux")]
 fn apply_restrictions(root: &Path, isolation: Isolation) -> std::io::Result<()> {
     if isolation == Isolation::Sandbox {
+        let _ = unshare_user();
         let _ = unshare_net();
     }
     apply_landlock(root)
@@ -211,6 +432,37 @@ fn chroot_jail(root: &Path) -> std::io::Result<()> {
     if rc == 0 {
         let _ = std::env::set_current_dir("/");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_proc(name: &str, data: &[u8]) -> std::io::Result<()> {
+    let path = format!("/proc/self/{name}");
+    let c = std::ffi::CString::new(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+    unsafe { libc::close(fd) };
+    if n < 0 || n as usize != data.len() {
+        return Err(std::io::Error::other("short write"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unshare_user() -> std::io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    write_proc("setgroups", b"deny")?;
+    write_proc("uid_map", format!("0 {uid} 1").as_bytes())?;
+    write_proc("gid_map", format!("0 {gid} 1").as_bytes())?;
     Ok(())
 }
 
@@ -383,5 +635,73 @@ mod tests {
         assert!(path_inside(root, "a/b"));
         assert!(!path_inside(root, "../x"));
         assert!(!path_inside(root, "a/../../x"));
+    }
+
+    #[test]
+    fn macos_profile_is_deny_default_not_allow_default() {
+        let p = macos_sandbox_profile(Path::new("/tmp/slot-root"));
+        assert!(p.contains("(deny default)"), "{p}");
+        assert!(
+            !p.contains("(allow default)"),
+            "macOS jail must not allow-default: {p}"
+        );
+        assert!(p.contains("/tmp/slot-root"), "{p}");
+        assert!(p.contains("/dev/fd"), "{p}");
+        assert!(p.contains("/usr"), "{p}");
+        assert!(p.contains("/bin"), "{p}");
+        assert!(p.contains("file-write-data"), "{p}");
+        assert!(!p.contains("(subpath \"/Users\")"), "{p}");
+        assert!(!p.contains("(subpath \"/tmp\")"), "{p}");
+    }
+
+    #[test]
+    fn parse_image_default_ok() {
+        assert_eq!(parse_sandbox_image(None).unwrap(), SandboxImage::Default);
+        assert_eq!(
+            parse_sandbox_image(Some("")).unwrap(),
+            SandboxImage::Default
+        );
+        assert_eq!(
+            parse_sandbox_image(Some("default")).unwrap(),
+            SandboxImage::Default
+        );
+        assert_eq!(
+            parse_sandbox_image(Some("jail")).unwrap(),
+            SandboxImage::Default
+        );
+        parse_sandbox_image(Some("default"))
+            .unwrap()
+            .require_backend()
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_image_docker_and_unknown_rejected() {
+        for img in [
+            "ubuntu:22.04",
+            "docker://foo",
+            "docker:latest",
+            "oci:alpine",
+            "https://example/img",
+            "alpine",
+        ] {
+            let err = parse_sandbox_image(Some(img)).unwrap_err();
+            assert!(
+                err.contains("unsupported"),
+                "image {img:?} must fail, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_image_host_root_rejected() {
+        let err = parse_sandbox_image(Some("/")).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn parse_image_missing_rootfs_rejected() {
+        let err = parse_sandbox_image(Some("/no/such/rupi-rootfs-dir")).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
     }
 }

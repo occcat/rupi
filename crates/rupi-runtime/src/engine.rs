@@ -1,7 +1,7 @@
 //! 执行节点上的工作区引擎。`sh -c` / 文件工具只出现在这里，不进控制面。
 //! bash 箍在句柄根；句柄绑 `tenant_id`，对不上 403。
 
-use crate::jail::{self, Isolation};
+use crate::jail::{self, Isolation, JailOpts, SandboxImage};
 use crate::{store, tar, BootstrapKind, ExecResult, ToolText};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +54,8 @@ struct Slot {
     tenant_id: String,
     last_used: Instant,
     children: Vec<u32>,
+    /// 非 default 时，exec 走该 rootfs 的隔离后端；不能兑现则 create 已失败。
+    image: SandboxImage,
 }
 
 pub struct Engine {
@@ -111,9 +113,20 @@ impl Engine {
     }
 
     pub async fn alloc(&self, tenant: &str, session: &str) -> Result<Lease, EngineError> {
+        self.alloc_with(tenant, session, SandboxImage::Default)
+            .await
+    }
+
+    pub async fn alloc_with(
+        &self,
+        tenant: &str,
+        session: &str,
+        image: SandboxImage,
+    ) -> Result<Lease, EngineError> {
         if tenant.is_empty() || tenant.contains("..") || tenant.contains('/') {
             return Err(EngineError::Other("invalid tenant".into()));
         }
+        image.require_backend().map_err(EngineError::Other)?;
         let cap = self.cfg.max_workspaces.max(1);
         let deadline = Instant::now() + self.cfg.alloc_queue;
         let (id, dest) = loop {
@@ -128,6 +141,7 @@ impl Engine {
                         tenant_id: tenant.to_string(),
                         last_used: Instant::now(),
                         children: Vec::new(),
+                        image: image.clone(),
                     },
                 );
                 break (id, dest);
@@ -208,6 +222,26 @@ impl Engine {
         self.dir_for(handle, Some(tenant)).await
     }
 
+    async fn exec_paths(
+        &self,
+        handle: &str,
+        tenant: Option<&str>,
+    ) -> Result<(PathBuf, Option<PathBuf>), EngineError> {
+        let mut g = self.leased.lock().await;
+        match g.get_mut(handle) {
+            Some(s) => {
+                if let Some(t) = tenant {
+                    if s.tenant_id != t {
+                        return Err(EngineError::Forbidden);
+                    }
+                }
+                s.last_used = Instant::now();
+                Ok((s.dir.clone(), s.image.rootfs().map(Path::to_path_buf)))
+            }
+            None => Err(EngineError::NotFound),
+        }
+    }
+
     pub async fn release(&self, handle: &str) -> Result<(), EngineError> {
         self.abort(handle).await;
         let slot = self.leased.lock().await.remove(handle);
@@ -265,13 +299,17 @@ impl Engine {
         command: &str,
         timeout_secs: Option<u64>,
     ) -> Result<ExecResult, EngineError> {
-        let dir = match tenant {
-            Some(t) => self.require_tenant(handle, t).await?,
-            None => self.dir(handle).await?,
-        };
+        let (dir, rootfs) = self.exec_paths(handle, tenant).await?;
         let timeout = timeout_secs.unwrap_or(30).clamp(1, 300);
-        let mut cmd = jail::command(&dir, command, self.cfg.isolation)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let mut cmd = jail::command_with(
+            &dir,
+            command,
+            JailOpts {
+                isolation: self.cfg.isolation,
+                rootfs: rootfs.as_deref(),
+            },
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
         let child = cmd.spawn().map_err(|e| EngineError::Other(e.to_string()))?;
         if let Some(pid) = child.id() {
             if let Some(s) = self.leased.lock().await.get_mut(handle) {
@@ -558,6 +596,62 @@ mod tests {
         assert!(
             !out.stdout.contains("NEIGHBOR-SECRET"),
             "jail leaked neighbor: {}",
+            out.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sandbox_isolation_cannot_read_neighbor_or_engine_root() {
+        let root = std::env::temp_dir().join(format!("rupi-sb-iso-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ENGINE-LEAK"), "ENGINE-SECRET").unwrap();
+        let eng = Engine::new(EngineConfig {
+            root: root.clone(),
+            max_workspaces: 8,
+            warm_pool: 0,
+            isolation: Isolation::Sandbox,
+            alloc_queue: Duration::ZERO,
+        });
+        let a = eng.alloc("ten-a", "s1").await.unwrap();
+        let b = eng.alloc("ten-b", "s1").await.unwrap();
+        std::fs::write(a.dir.join("secret.txt"), "NEIGHBOR-SECRET").unwrap();
+        let inside = eng
+            .exec_for(&b.id, Some("ten-b"), "echo IN-VOLUME", Some(10))
+            .await
+            .expect("sandbox in-volume bash must start");
+        assert!(
+            inside.stdout.contains("IN-VOLUME"),
+            "sandbox in-volume bash failed: exit={} stdout={:?} stderr={:?}",
+            inside.exit_code,
+            inside.stdout,
+            inside.stderr
+        );
+        let escaped = format!(
+            "cat {} 2>/dev/null; cat {} 2>/dev/null; echo DONE",
+            a.dir.join("secret.txt").display(),
+            root.join("ENGINE-LEAK").display()
+        );
+        let out = eng
+            .exec_for(&b.id, Some("ten-b"), &escaped, Some(10))
+            .await
+            .expect("sandbox jailed bash must start");
+        assert!(
+            out.stdout.contains("DONE"),
+            "sandbox jailed bash did not finish: exit={} stdout={:?} stderr={:?}",
+            out.exit_code,
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            !out.stdout.contains("NEIGHBOR-SECRET"),
+            "sandbox jail leaked neighbor: {}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("ENGINE-SECRET"),
+            "sandbox jail leaked engine root: {}",
             out.stdout
         );
         let _ = std::fs::remove_dir_all(root);
