@@ -1,9 +1,10 @@
 //! BashTool 的宿主 shell：Unix `sh -c`，Windows PowerShell。
 //!
-//! `cfg(windows)` 决定运行时选哪条；[`ShellSpec`] / [`IsolationKind`] 在任意
-//! 目标上都能构造，方便非 Windows CI 覆盖 Windows 分支，而不假装有 Windows runner。
+//! `cfg(windows)` 决定运行时选哪条；Windows 规格（`ShellSpec` / 隔离 / taskkill）
+//! 挂在 `cfg(any(windows, test))` 上，非 Windows CI 能编过并单测，不假装有 runner。
 
 /// 对标 Pi `POWERSHELL_ARGS`：`pwsh` / `powershell` 共用。
+#[cfg(any(windows, test))]
 pub(crate) const POWERSHELL_ARGS: &[&str] = &[
     "-NoProfile",
     "-NonInteractive",
@@ -13,6 +14,7 @@ pub(crate) const POWERSHELL_ARGS: &[&str] = &[
 ];
 
 /// 对标 Pi `UTF8_OUTPUT_PREFIX`。OEM 代码页下中文会乱码。
+#[cfg(any(windows, test))]
 pub(crate) const POWERSHELL_UTF8_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
@@ -25,12 +27,14 @@ pub(crate) const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub(crate) const WINDOWS_CREATION_FLAGS: u32 =
     WINDOWS_CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_NO_WINDOW;
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PowerShellExe {
     Pwsh,
     WindowsPowerShell,
 }
 
+#[cfg(any(windows, test))]
 impl PowerShellExe {
     /// 有 PowerShell 7 用 `pwsh`，否则 Windows PowerShell。
     pub(crate) fn select(has_pwsh: bool) -> Self {
@@ -51,7 +55,9 @@ impl PowerShellExe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostShell {
+    #[cfg(any(not(windows), test))]
     UnixSh,
+    #[cfg(any(windows, test))]
     PowerShell(PowerShellExe),
 }
 
@@ -69,7 +75,9 @@ impl HostShell {
 
     pub(crate) fn program(self) -> &'static str {
         match self {
+            #[cfg(any(not(windows), test))]
             Self::UnixSh => "sh",
+            #[cfg(any(windows, test))]
             Self::PowerShell(exe) => exe.program(),
         }
     }
@@ -85,16 +93,18 @@ pub(crate) struct ShellSpec {
 impl ShellSpec {
     pub(crate) fn for_host(host: HostShell, command: &str) -> Self {
         match host {
+            #[cfg(any(not(windows), test))]
             HostShell::UnixSh => Self {
                 program: host.program().into(),
                 args: vec!["-c".into(), command.into()],
             },
-            HostShell::PowerShell(exe) => {
+            #[cfg(any(windows, test))]
+            HostShell::PowerShell(_) => {
                 let mut args: Vec<String> =
                     POWERSHELL_ARGS.iter().map(|s| (*s).to_string()).collect();
                 args.push(wrap_powershell_command(command));
                 Self {
-                    program: exe.program().into(),
+                    program: host.program().into(),
                     args,
                 }
             }
@@ -106,6 +116,7 @@ impl ShellSpec {
     }
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn wrap_powershell_command(command: &str) -> String {
     format!("{POWERSHELL_UTF8_PREFIX}{command}")
 }
