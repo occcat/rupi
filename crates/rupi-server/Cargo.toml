@@ -45,7 +45,7 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
 sha2 = "0.10"
 hex = "0.4"
 tokio-util = { version = "0.7", features = ["rt"] }
