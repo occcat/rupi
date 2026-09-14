@@ -11,6 +11,53 @@ pub trait ObjectStore: Send + Sync {
     async fn delete(&self, key: &str) -> anyhow::Result<()>;
 }
 
+/// 区域标签只允许对象 key 字符。非法字替换成 `-`，空则 `local`。
+pub fn sanitize_region(region: &str) -> String {
+    let s: String = region
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "local".into()
+    } else {
+        s
+    }
+}
+
+/// `{region}/{key}`。快照/对象按区域分，跨区不能撞到同一把 key。
+pub fn regional_object_key(region: &str, key: &str) -> String {
+    format!(
+        "{}/{}",
+        sanitize_region(region),
+        key.trim_start_matches('/')
+    )
+}
+
+/// `us-east/ws/...` → `Some("us-east")`。无区域前缀（旧 `ws/...`）→ `None`。
+pub fn object_key_region(key: &str) -> Option<&str> {
+    let (head, rest) = key.split_once('/')?;
+    if rest.starts_with("ws/") && !head.is_empty() && head != "ws" {
+        Some(head)
+    } else {
+        None
+    }
+}
+
+/// 会话区域必须对上对象 key 的区域前缀。旧 key `ws/...` 只允许 `local`。
+pub fn snapshot_key_matches_region(key: &str, session_region: Option<&str>) -> bool {
+    let sess = sanitize_region(session_region.unwrap_or("local"));
+    match object_key_region(key) {
+        Some(r) => r == sess,
+        None => sess == "local" && key.starts_with("ws/"),
+    }
+}
+
 /// 目录当对象桶。key 只允许 `[A-Za-z0-9/._-]`，禁止 `..`。
 /// 多副本要共享同一 `root`（NFS / 绑定盘）或改用 [`crate::s3::S3ObjectStore`]。
 #[derive(Clone, Debug)]
@@ -165,5 +212,21 @@ mod tests {
         a.put("ws/t/s/h.tgz", b"cross-replica").await.unwrap();
         assert_eq!(b.get("ws/t/s/h.tgz").await.unwrap(), b"cross-replica");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regional_keys_do_not_collide_across_regions() {
+        let us = regional_object_key("us-east", "ws/t/s/h.tgz");
+        let eu = regional_object_key("eu-west", "ws/t/s/h.tgz");
+        assert_eq!(us, "us-east/ws/t/s/h.tgz");
+        assert_ne!(us, eu);
+        assert_eq!(object_key_region(&us), Some("us-east"));
+        assert!(snapshot_key_matches_region(&us, Some("us-east")));
+        assert!(!snapshot_key_matches_region(&us, Some("eu-west")));
+        assert!(snapshot_key_matches_region("ws/t/s/h.tgz", Some("local")));
+        assert!(!snapshot_key_matches_region(
+            "ws/t/s/h.tgz",
+            Some("us-east")
+        ));
     }
 }

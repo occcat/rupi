@@ -1,4 +1,13 @@
 const TOKEN_KEY = "rupi_admin_token";
+let adminRole = "admin";
+
+function canWrite() {
+  return adminRole === "admin" || adminRole === "operator";
+}
+
+function canManageKeys() {
+  return adminRole === "admin";
+}
 
 const $ = (id) => document.getElementById(id);
 const view = () => $("view");
@@ -99,8 +108,11 @@ function setNav(name) {
 
 async function refreshPills() {
   try {
+    const me = await api("/admin/api/me");
+    adminRole = me.role || "admin";
     const o = await api("/admin/api/overview");
     $("pills").innerHTML = [
+      pill("角色", adminRole),
       pill("实例", o.instanceId),
       pill("区域", o.region),
       pill("Postgres", o.postgres ? "ok" : "down", o.postgres),
@@ -548,22 +560,24 @@ async function pageKeys() {
   const rows = (data.keys || []).map((k) => `
     <tr>
       <td class="mono">${esc(k.prefix)}…</td>
+      <td>${esc(k.role || "admin")}</td>
       <td>${when(k.createdAt)}</td>
       <td>${k.revoked ? badge("revoked") : badge("ready")}</td>
-      <td>${k.revoked ? "" : `<button type="button" class="danger" data-arevoke="${esc(k.id)}">吊销</button>`}</td>
+      <td>${k.revoked ? "" : (canManageKeys() ? `<button type="button" class="danger" data-arevoke="${esc(k.id)}">吊销</button>` : "")}</td>
     </tr>`).join("");
   view().innerHTML = `
-    <p class="muted">环境口令已配置：${data.envTokenConfigured ? "是" : "否"}。也可用下方高权限 Key。</p>
-    <p><button type="button" id="btn-adminkey">颁发管理 Key</button></p>
+    <p class="muted">环境口令已配置：${data.envTokenConfigured ? "是" : "否"}。角色：admin / operator / viewer。</p>
+    <p>${canManageKeys() ? `<button type="button" id="btn-adminkey">颁发管理 Key</button>` : ""}</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>前缀</th><th>创建</th><th>状态</th><th></th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="4" class="empty">还没有管理 Key</td></tr>`}</tbody>
+        <thead><tr><th>前缀</th><th>角色</th><th>创建</th><th>状态</th><th></th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" class="empty">还没有管理 Key</td></tr>`}</tbody>
       </table>
     </div>`;
-  $("btn-adminkey").onclick = async () => {
+  const btn = $("btn-adminkey");
+  if (btn) btn.onclick = async () => {
     try {
-      const created = await api("/admin/api/admin-keys", { method: "POST" });
+      const created = await api("/admin/api/admin-keys", { method: "POST", body: { role: "admin" } });
       showOnce("管理 Key（只此一次）", created.key);
       $("modal-close").addEventListener("click", () => render(), { once: true });
     } catch (e) { toast(e.message, true); }

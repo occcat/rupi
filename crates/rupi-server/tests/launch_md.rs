@@ -19,6 +19,17 @@ fn section<'a>(src: &'a str, heading: &str, next: &str) -> &'a str {
 fn launch_md_lists_real_flags_and_loopback_paths() {
     let src = launch_md();
     assert!(src.contains("--redis-cluster"), "missing --redis-cluster");
+    assert!(src.contains("--tls-cert"), "control plane rustls flags");
+    assert!(src.contains("--tls-key"), "control plane rustls flags");
+    assert!(
+        src.contains("RUPI_LISTEN_INSECURE"),
+        "plaintext non-loopback must be explicit"
+    );
+    assert!(src.contains("operator"), "admin RBAC roles");
+    assert!(
+        src.contains("schema_migrations") || src.contains("当前版本 4"),
+        "{src}"
+    );
     assert!(
         src.contains("RUPI_SANDBOX_WARM"),
         "sandboxd --warm-pool env is RUPI_SANDBOX_WARM, not RUPI_EXEC_WARM"

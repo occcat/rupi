@@ -138,6 +138,73 @@ fn unauth() -> Response {
         .into_response()
 }
 
+fn forbidden() -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AdminRole {
+    Viewer = 1,
+    Operator = 2,
+    Admin = 3,
+}
+
+impl AdminRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "admin" => Ok(Self::Admin),
+            "operator" | "ops" => Ok(Self::Operator),
+            "viewer" | "read" | "readonly" => Ok(Self::Viewer),
+            other => Err(format!(
+                "unknown role {other}; allowed: admin, operator, viewer"
+            )),
+        }
+    }
+}
+
+pub fn normalize_admin_role(s: &str) -> anyhow::Result<String> {
+    Ok(AdminRole::parse(s)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .as_str()
+        .into())
+}
+
+#[derive(Debug, Clone)]
+struct AdminActor {
+    role: AdminRole,
+    name: String,
+}
+
+impl AdminActor {
+    fn require_write(&self) -> Result<(), Response> {
+        if self.role >= AdminRole::Operator {
+            Ok(())
+        } else {
+            Err(forbidden())
+        }
+    }
+
+    fn require_manage_keys(&self) -> Result<(), Response> {
+        if self.role >= AdminRole::Admin {
+            Ok(())
+        } else {
+            Err(forbidden())
+        }
+    }
+
+    fn audit_name(&self) -> &str {
+        &self.name
+    }
+}
+
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
 }
@@ -154,12 +221,26 @@ fn internal(e: impl ToString) -> Response {
         .into_response()
 }
 
-async fn write_audit(app: &App, action: &str, target_type: &str, target_id: &str, detail: Value) {
-    let _ =
-        db::insert_admin_audit(&app.pool, "admin", action, target_type, target_id, &detail).await;
+async fn write_audit(
+    app: &App,
+    actor: &AdminActor,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    detail: Value,
+) {
+    let _ = db::insert_admin_audit(
+        &app.pool,
+        actor.audit_name(),
+        action,
+        target_type,
+        target_id,
+        &detail,
+    )
+    .await;
 }
 
-async fn require_admin(app: &App, headers: &HeaderMap) -> Result<(), Response> {
+async fn require_admin(app: &App, headers: &HeaderMap) -> Result<AdminActor, Response> {
     let raw = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -168,11 +249,20 @@ async fn require_admin(app: &App, headers: &HeaderMap) -> Result<(), Response> {
     };
     if let Some(expected) = app.admin_token.as_deref() {
         if auth::tokens_eq(key, expected) {
-            return Ok(());
+            return Ok(AdminActor {
+                role: AdminRole::Admin,
+                name: "env-token".into(),
+            });
         }
     }
     match db::admin_by_key_hash(&app.pool, &auth::hash_key(key)).await {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(row)) => {
+            let role = AdminRole::parse(&row.role).unwrap_or(AdminRole::Admin);
+            Ok(AdminActor {
+                role,
+                name: format!("key:{}", row.key_prefix),
+            })
+        }
         Ok(None) => Err(unauth()),
         Err(e) => Err(internal(e)),
     }
@@ -209,6 +299,7 @@ fn admin_key_json(k: &db::AdminKeyRow) -> Value {
     json!({
         "id": k.id,
         "prefix": k.key_prefix,
+        "role": k.role,
         "createdAt": k.created_at,
         "revokedAt": k.revoked_at,
         "revoked": k.revoked_at.is_some()
@@ -292,14 +383,15 @@ fn clamp_page(limit: Option<u32>, offset: Option<u32>) -> (i64, i64) {
 }
 
 async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
     let via = if app.admin_token.is_some() {
         "token-or-key"
     } else {
         "admin-key"
     };
     Ok(Json(json!({
-        "role": "admin",
+        "role": actor.role.as_str(),
+        "actor": actor.audit_name(),
         "instanceId": app.instance_id,
         "region": app.region,
         "auth": via
@@ -325,6 +417,7 @@ async fn overview(State(app): State<App>, headers: HeaderMap) -> Result<Json<Val
             "keysActive": counts.keys_active
         },
         "pool": pool,
+        "schemaVersion": db::schema_version(&app.pool).await.unwrap_or(0),
         "topology": app.executor.topology()
     })))
 }
@@ -389,7 +482,8 @@ async fn create_tenant(
     headers: HeaderMap,
     Json(body): Json<CreateTenant>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let name = body.name.trim();
     if name.is_empty() {
         return Err(bad("name required"));
@@ -476,7 +570,8 @@ async fn patch_tenant(
     Path(id): Path<String>,
     Json(body): Json<PatchTenant>,
 ) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let t = db::load_tenant(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -513,7 +608,8 @@ async fn delete_tenant(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let t = db::load_tenant(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -530,13 +626,13 @@ async fn delete_tenant(
     if n == 0 {
         return Err(not_found());
     }
-    let _ = db::insert_admin_audit(
-        &app.pool,
-        "admin",
+    write_audit(
+        &app,
+        &actor,
         "delete_tenant",
         "tenant",
         &t.id,
-        &json!({"name": t.name}),
+        json!({"name": t.name}),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -565,7 +661,8 @@ async fn create_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let _ = db::load_tenant(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -576,6 +673,7 @@ async fn create_key(
         .map_err(internal)?;
     write_audit(
         &app,
+        &actor,
         "create_key",
         "api_key",
         &row.id,
@@ -597,7 +695,8 @@ async fn revoke_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let row = db::get_api_key(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -692,7 +791,8 @@ async fn patch_quota(
     Path(id): Path<String>,
     Json(body): Json<QuotaPatch>,
 ) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let _ = db::load_tenant(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -700,6 +800,7 @@ async fn patch_quota(
     apply_quota(&app, &id, &body).await?;
     write_audit(
         &app,
+        &actor,
         "patch_quota",
         "tenant",
         &id,
@@ -738,7 +839,8 @@ async fn patch_settings(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let t = db::load_tenant(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -751,7 +853,15 @@ async fn patch_settings(
         .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
-    write_audit(&app, "patch_settings", "tenant", &id, json!({"keys": keys})).await;
+    write_audit(
+        &app,
+        &actor,
+        "patch_settings",
+        "tenant",
+        &id,
+        json!({"keys": keys}),
+    )
+    .await;
     Ok(Json(json!({
         "ok": true,
         "settings": mask_settings(merged)
@@ -856,7 +966,8 @@ async fn delete_session(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
     let row = db::get_session_any(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -876,14 +987,15 @@ async fn debug_run(
     Path(id): Path<String>,
     Json(body): Json<DebugBody>,
 ) -> Result<Response, Response> {
-    require_admin(&app, &headers).await?;
-    let _ = db::insert_admin_audit(
-        &app.pool,
-        "admin",
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_write()?;
+    write_audit(
+        &app,
+        &actor,
         "debug_run",
         "session",
         &id,
-        &json!({"promptChars": body.prompt.len()}),
+        json!({"promptChars": body.prompt.len()}),
     )
     .await;
     let prompt = body.prompt.trim();
@@ -990,15 +1102,34 @@ async fn list_admin_keys(
     })))
 }
 
+#[derive(Deserialize, Default)]
+struct CreateAdminKeyBody {
+    #[serde(default)]
+    role: Option<String>,
+}
+
 async fn create_admin_key(
     State(app): State<App>,
     headers: HeaderMap,
+    body: Option<Json<CreateAdminKeyBody>>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_manage_keys()?;
+    let role = body
+        .as_ref()
+        .and_then(|b| b.role.as_deref())
+        .unwrap_or("admin");
     let raw = auth::generate_admin_key();
-    let row = db::create_admin_key(&app.pool, &raw)
+    let row = db::create_admin_key(&app.pool, &raw, role)
         .await
-        .map_err(internal)?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("unknown role") {
+                bad(msg)
+            } else {
+                internal(e)
+            }
+        })?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -1014,7 +1145,8 @@ async fn revoke_admin_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    require_admin(&app, &headers).await?;
+    let actor = require_admin(&app, &headers).await?;
+    actor.require_manage_keys()?;
     let row = db::get_admin_key(&app.pool, &id)
         .await
         .map_err(internal)?
@@ -1050,5 +1182,25 @@ mod tests {
         .unwrap();
         assert_eq!(merged["api_key"], "real");
         assert_eq!(merged["model"], "b");
+    }
+
+    #[test]
+    fn admin_roles_are_ordered() {
+        assert!(AdminRole::parse("viewer").unwrap() < AdminRole::parse("operator").unwrap());
+        assert!(AdminRole::parse("ops").unwrap() < AdminRole::parse("admin").unwrap());
+        assert_eq!(normalize_admin_role("readonly").unwrap(), "viewer");
+        assert!(normalize_admin_role("root").is_err());
+        let viewer = AdminActor {
+            role: AdminRole::Viewer,
+            name: "key:x".into(),
+        };
+        assert!(viewer.require_write().is_err());
+        assert!(viewer.require_manage_keys().is_err());
+        let ops = AdminActor {
+            role: AdminRole::Operator,
+            name: "key:y".into(),
+        };
+        assert!(ops.require_write().is_ok());
+        assert!(ops.require_manage_keys().is_err());
     }
 }

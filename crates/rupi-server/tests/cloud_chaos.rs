@@ -298,6 +298,10 @@ async fn killed_replica_session_and_snapshot_readable() {
         .unwrap();
     assert_eq!(snapped.workspace_state.as_deref(), Some("snapshotted"));
     let snap_key = snapped.snapshot_key.clone().expect("snapshot_key");
+    assert!(
+        rupi_runtime::snapshot_key_matches_region(&snap_key, snapped.region.as_deref()),
+        "snapshot key must be region-scoped: {snap_key}"
+    );
     assert!(!h.store.get(&snap_key).await.unwrap().is_empty());
 
     h.kill_a();
@@ -414,6 +418,81 @@ impl LoadN {
             _guard: guard,
         })
     }
+}
+
+async fn run_short_streams(h: &LoadN, streams: usize, conc: usize) -> (usize, usize) {
+    let c = client();
+    let sessions = 2usize.max(conc.min(8));
+    let mut ids = Vec::new();
+    for i in 0..sessions {
+        let resp = c
+            .post(format!("{}/v1/sessions", h.base))
+            .bearer_auth(&h.key)
+            .json(&json!({"name": format!("reg-{i}")}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "{}",
+            resp.text().await.unwrap()
+        );
+        let v: Value = resp.json().await.unwrap();
+        ids.push(v["id"].as_str().unwrap().to_string());
+    }
+    let mut run_ok = 0usize;
+    let mut run_err = 0usize;
+    let workers = conc.min(ids.len()).max(1);
+    for wave in (0..streams).step_by(workers) {
+        let n = workers.min(streams - wave);
+        let mut futs = Vec::new();
+        for (i, sid) in ids.iter().take(n).cloned().enumerate() {
+            let c = c.clone();
+            let base = h.base.clone();
+            let key = h.key.clone();
+            let run_id = format!("short-{wave}-{i}");
+            futs.push(async move {
+                let resp = c
+                    .post(format!("{base}/v1/agent"))
+                    .bearer_auth(&key)
+                    .header("Accept", "text/event-stream")
+                    .json(&json!({
+                        "threadId": sid,
+                        "runId": run_id,
+                        "messages": [{"role":"user","content":"ping"}]
+                    }))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => {
+                        let st = r.status().as_u16();
+                        let body = r.text().await.unwrap_or_default();
+                        st == 200 && (body.contains("RUN_FINISHED") || body.contains("load10k-ok"))
+                    }
+                    Err(_) => false,
+                }
+            });
+        }
+        for ok in futures::future::join_all(futs).await {
+            if ok {
+                run_ok += 1;
+            } else {
+                run_err += 1;
+            }
+        }
+    }
+    (run_ok, run_err)
+}
+
+/// CI 小回归：同一条短流路径，2 会话 / 4 次，不跑一万。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_stream_load_regression() {
+    let Some(h) = LoadN::start(4, 2).await else {
+        return;
+    };
+    let (ok, err) = run_short_streams(&h, 4, 2).await;
+    assert_eq!(ok, 4, "short-stream regression failed err={err}");
 }
 
 /// 本机 / 文档触发的万级短流。默认 CI 不跑（`#[ignore]`）。

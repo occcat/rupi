@@ -112,8 +112,93 @@ pub async fn connect_with_size(database_url: &str, max_size: usize) -> anyhow::R
         .build()?)
 }
 
+/// `schema_migrations` 里应有的最高版本。新步骤只往上加。
+pub const SCHEMA_VERSION: i32 = 4;
+
+pub async fn schema_version(pool: &PgPool) -> anyhow::Result<i32> {
+    let c = pool.get().await?;
+    schema_version_conn(&c).await
+}
+
+async fn schema_version_conn(c: &deadpool_postgres::Object) -> anyhow::Result<i32> {
+    let n: i32 = c
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            &[],
+        )
+        .await?
+        .get(0);
+    Ok(n)
+}
+
+async fn applied_versions(
+    c: &deadpool_postgres::Object,
+) -> anyhow::Result<std::collections::HashSet<i32>> {
+    let rows = c
+        .query("SELECT version FROM schema_migrations", &[])
+        .await?;
+    Ok(rows.iter().map(|r| r.get::<_, i32>(0)).collect())
+}
+
+async fn stamp_version(c: &deadpool_postgres::Object, version: i32) -> anyhow::Result<()> {
+    c.execute(
+        "INSERT INTO schema_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING",
+        &[&version],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     let c = pool.get().await?;
+    c.batch_execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        "#,
+    )
+    .await?;
+    let mut applied = applied_versions(&c).await?;
+    if applied.is_empty() {
+        let tenants_exist = c
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'tenants'
+                 )",
+                &[],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+        if tenants_exist {
+            for v in 1..=3 {
+                stamp_version(&c, v).await?;
+            }
+            applied = applied_versions(&c).await?;
+        }
+    }
+    if !applied.contains(&1) {
+        apply_v1_core(&c).await?;
+        stamp_version(&c, 1).await?;
+    }
+    if !applied.contains(&2) {
+        apply_v2_scale_admin(&c).await?;
+        stamp_version(&c, 2).await?;
+    }
+    if !applied.contains(&3) && apply_v3_cjk(&c).await {
+        stamp_version(&c, 3).await?;
+    }
+    if !applied.contains(&4) {
+        apply_v4_admin_rbac(&c).await?;
+        stamp_version(&c, 4).await?;
+    }
+    Ok(())
+}
+
+async fn apply_v1_core(c: &deadpool_postgres::Object) -> anyhow::Result<()> {
     c.batch_execute(
         r#"
         CREATE TABLE IF NOT EXISTS tenants (
@@ -201,20 +286,23 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         "#,
     )
     .await?;
-    let _ = c
-        .batch_execute(
-            "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_runs_per_day INT NOT NULL DEFAULT 10000;
-             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_tokens_per_day BIGINT NOT NULL DEFAULT 100000000;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS instance_id TEXT;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace_state TEXT NOT NULL DEFAULT 'hot';
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS snapshot_key TEXT;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS region TEXT;
-             ALTER TABLE sessions ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
-             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS default_region TEXT;
-             ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_qps INT NOT NULL DEFAULT 8;",
-        )
-        .await;
+    Ok(())
+}
+
+async fn apply_v2_scale_admin(c: &deadpool_postgres::Object) -> anyhow::Result<()> {
+    c.batch_execute(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_runs_per_day INT NOT NULL DEFAULT 10000;
+         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_tokens_per_day BIGINT NOT NULL DEFAULT 100000000;
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS instance_id TEXT;
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace_state TEXT NOT NULL DEFAULT 'hot';
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS snapshot_key TEXT;
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS region TEXT;
+         ALTER TABLE sessions ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
+         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS default_region TEXT;
+         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_qps INT NOT NULL DEFAULT 8;",
+    )
+    .await?;
     let _ = c
         .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
         .await;
@@ -241,34 +329,38 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
              CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (content_tsv);",
         )
         .await;
-    let _ = c
-        .batch_execute(
-            "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
-             CREATE TABLE IF NOT EXISTS admin_keys (
-               id TEXT PRIMARY KEY,
-               key_hash TEXT NOT NULL UNIQUE,
-               key_prefix TEXT NOT NULL,
-               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-               revoked_at TIMESTAMPTZ
-             );
-             CREATE TABLE IF NOT EXISTS admin_audit (
-               id TEXT PRIMARY KEY,
-               actor TEXT NOT NULL,
-               action TEXT NOT NULL,
-               target_type TEXT,
-               target_id TEXT,
-               detail JSONB NOT NULL DEFAULT '{}',
-               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-             );
-             CREATE TABLE IF NOT EXISTS schema_migrations (
-               version INT PRIMARY KEY,
-               applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-             );
-             INSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING;
-             INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;",
-        )
-        .await;
-    migrate_cjk_fts(&c).await;
+    c.batch_execute(
+        "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+         CREATE TABLE IF NOT EXISTS admin_keys (
+           id TEXT PRIMARY KEY,
+           key_hash TEXT NOT NULL UNIQUE,
+           key_prefix TEXT NOT NULL,
+           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+           revoked_at TIMESTAMPTZ
+         );
+         CREATE TABLE IF NOT EXISTS admin_audit (
+           id TEXT PRIMARY KEY,
+           actor TEXT NOT NULL,
+           action TEXT NOT NULL,
+           target_type TEXT,
+           target_id TEXT,
+           detail JSONB NOT NULL DEFAULT '{}',
+           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         );",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn apply_v3_cjk(c: &deadpool_postgres::Object) -> bool {
+    migrate_cjk_fts(c).await
+}
+
+async fn apply_v4_admin_rbac(c: &deadpool_postgres::Object) -> anyhow::Result<()> {
+    c.batch_execute(
+        "ALTER TABLE admin_keys ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'admin';",
+    )
+    .await?;
     Ok(())
 }
 
@@ -328,28 +420,18 @@ ALTER TABLE memories ADD COLUMN content_tsv tsvector
   ) STORED;
 CREATE INDEX IF NOT EXISTS messages_tsv ON messages USING gin (content_tsv);
 CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (content_tsv);
-INSERT INTO schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING;
 "#;
 
-async fn migrate_cjk_fts(c: &deadpool_postgres::Object) {
+async fn migrate_cjk_fts(c: &deadpool_postgres::Object) -> bool {
     if let Err(e) = c.batch_execute(RUPI_CJK_NGRAMS_SQL).await {
         tracing::warn!("rupi_cjk_ngrams unavailable: {e:#}");
-        return;
-    }
-    let needs_rewrite = c
-        .query_one(
-            "SELECT NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 3)",
-            &[],
-        )
-        .await
-        .map(|r| r.get::<_, bool>(0))
-        .unwrap_or(true);
-    if !needs_rewrite {
-        return;
+        return false;
     }
     if let Err(e) = c.batch_execute(RUPI_CJK_TSV_SQL).await {
         tracing::warn!("content_tsv CJK n-gram rewrite skipped: {e:#}");
+        return false;
     }
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -1526,6 +1608,7 @@ pub struct AdminKeyRow {
     pub key_prefix: String,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1564,6 +1647,7 @@ fn map_admin_key(r: &tokio_postgres::Row) -> AdminKeyRow {
         key_prefix: r.get(1),
         created_at: r.get(2),
         revoked_at: r.get(3),
+        role: r.try_get(4).unwrap_or_else(|_| "admin".into()),
     }
 }
 
@@ -1749,7 +1833,7 @@ pub async fn list_admin_keys(pool: &PgPool) -> anyhow::Result<Vec<AdminKeyRow>> 
     let c = pool.get().await?;
     let rows = c
         .query(
-            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys
+            "SELECT id, key_prefix, created_at, revoked_at, COALESCE(role, 'admin') FROM admin_keys
              ORDER BY created_at DESC",
             &[],
         )
@@ -1761,21 +1845,26 @@ pub async fn get_admin_key(pool: &PgPool, id: &str) -> anyhow::Result<Option<Adm
     let c = pool.get().await?;
     let row = c
         .query_opt(
-            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys WHERE id = $1",
+            "SELECT id, key_prefix, created_at, revoked_at, COALESCE(role, 'admin') FROM admin_keys WHERE id = $1",
             &[&id],
         )
         .await?;
     Ok(row.as_ref().map(map_admin_key))
 }
 
-pub async fn create_admin_key(pool: &PgPool, raw_key: &str) -> anyhow::Result<AdminKeyRow> {
+pub async fn create_admin_key(
+    pool: &PgPool,
+    raw_key: &str,
+    role: &str,
+) -> anyhow::Result<AdminKeyRow> {
     let id = Uuid::new_v4().to_string();
     let hash = crate::auth::hash_key(raw_key);
     let prefix = crate::auth::key_prefix(raw_key, 16);
+    let role = crate::admin::normalize_admin_role(role)?;
     let c = pool.get().await?;
     c.execute(
-        "INSERT INTO admin_keys(id, key_hash, key_prefix) VALUES ($1, $2, $3)",
-        &[&id, &hash, &prefix],
+        "INSERT INTO admin_keys(id, key_hash, key_prefix, role) VALUES ($1, $2, $3, $4)",
+        &[&id, &hash, &prefix, &role],
     )
     .await?;
     get_admin_key(pool, &id)
@@ -1798,7 +1887,7 @@ pub async fn admin_by_key_hash(pool: &PgPool, hash: &str) -> anyhow::Result<Opti
     let c = pool.get().await?;
     let row = c
         .query_opt(
-            "SELECT id, key_prefix, created_at, revoked_at FROM admin_keys
+            "SELECT id, key_prefix, created_at, revoked_at, COALESCE(role, 'admin') FROM admin_keys
              WHERE key_hash = $1 AND revoked_at IS NULL",
             &[&hash],
         )
@@ -2008,5 +2097,10 @@ mod tests {
         );
         assert_eq!(cjk_bigram_tsquery("茶"), "");
         assert_eq!(cjk_bigram_tsquery(""), "");
+    }
+
+    #[test]
+    fn schema_version_constant_is_versioned() {
+        assert!(SCHEMA_VERSION >= 4);
     }
 }
