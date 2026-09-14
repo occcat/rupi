@@ -889,6 +889,14 @@ mod tests {
                 .unwrap();
         assert_eq!(c.streaming_behavior.as_deref(), Some("steer"));
         assert_eq!(c.message.as_deref(), Some("hi"));
+        let steer = parse_line(r#"{"type":"steer","message":"/greet world"}"#)
+            .unwrap()
+            .unwrap();
+        let q = queued_from_cmd(&steer).unwrap();
+        assert_eq!(
+            q.text, "/greet world",
+            "steer 不展开 skill/prompt 模板，原样入队"
+        );
     }
 
     #[test]

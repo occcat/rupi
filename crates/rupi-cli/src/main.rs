@@ -127,6 +127,12 @@ struct Cli {
     /// Fork 会话：id 或 JSONL 路径（对标 pi --fork；不可与 --session/--continue/--resume/--no-session 同用）
     #[arg(long = "fork")]
     fork: Option<String>,
+    /// 会话库目录（对标 pi `--session-dir`；优先于 env / settings.sessionDir）
+    #[arg(long = "session-dir")]
+    session_dir: Option<String>,
+    /// 导出会话（id 或 JSONL）为 HTML（或按后缀 JSONL）后退出（对标 pi `--export`）
+    #[arg(long, num_args = 1..=2, value_names = ["SESSION", "OUT"])]
+    export: Vec<String>,
     /// 会话展示名（`/name`、JSONL session_info）
     #[arg(long, short = 'n')]
     name: Option<String>,
@@ -499,9 +505,63 @@ fn builtin_skills_dir() -> PathBuf {
     PathBuf::from("skills/builtin")
 }
 
-/// 自定义命令目录：与 skills 同门，信任被拒只留全局 `~/commands`。
-fn command_dirs_filtered(home: &PathBuf, load_project: bool) -> Vec<PathBuf> {
-    rupi_core::commands::command_dirs_filtered(home, load_project)
+fn prompt_filter(settings: &rupi_config::Settings) -> rupi_core::commands::PromptFilter {
+    rupi_core::commands::PromptFilter::from_specs(settings.prompts.as_deref())
+}
+
+fn command_dirs_runtime(
+    home: &Path,
+    load_project: bool,
+    settings: &rupi_config::Settings,
+) -> Vec<PathBuf> {
+    rupi_core::commands::command_dirs_for(home, load_project, &prompt_filter(settings))
+}
+
+fn session_store_home(cli: &Cli, home: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
+    let settings = rupi_config::Settings::load(home, &cwd);
+    rupi_config::resolve_session_dir(cli.session_dir.as_deref(), settings.session_dir(), home)
+}
+
+fn export_and_exit(cli: &Cli, home: &Path, src: &str, dest: Option<&str>) -> anyhow::Result<()> {
+    let sess_home = session_store_home(cli, home);
+    let store = SessionStore::open(&sess_home)?;
+    let cwd = cwd_string();
+    let (sid, html, jsonl) = if rupi_memory::looks_like_session_path(src) {
+        let raw = std::fs::read_to_string(src)
+            .map_err(|e| anyhow::anyhow!("read session file {src}: {e}"))?;
+        let imported = rupi_memory::import_jsonl(&raw)?;
+        let title = imported
+            .name
+            .as_deref()
+            .unwrap_or(&imported.tree.id)
+            .to_string();
+        let html = rupi_memory::export_tree_html(&imported.tree, &title);
+        let jsonl =
+            rupi_memory::export_tree_jsonl(&imported.tree, &cwd, imported.name.as_deref(), None);
+        (imported.tree.id, html, jsonl)
+    } else {
+        let id = rupi_memory::resolve_session_ref(&store, src)?;
+        let html = rupi_memory::export_store_html(&store, &id)?;
+        let jsonl = rupi_memory::export_store_jsonl(&store, &id, &cwd)?;
+        (id, html, jsonl)
+    };
+    let dest = dest.map(PathBuf::from).unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("rupi-session-{}.html", &sid[..8.min(sid.len())]))
+    });
+    let body = if dest.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+        jsonl
+    } else {
+        html
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dest, body)?;
+    println!("Exported to: {}", dest.display());
+    Ok(())
 }
 
 /// 工作区沙箱根：启动时 cwd（canonicalize 消解符号链接），read/write/edit 约束其内。
@@ -775,6 +835,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let home = home_dir();
+    if !cli.export.is_empty() {
+        export_and_exit(
+            &cli,
+            &home,
+            &cli.export[0],
+            cli.export.get(1).map(String::as_str),
+        )?;
+        return Ok(());
+    }
     if cli.mode.as_deref() == Some("rpc") {
         run_rpc(&cli, &home).await?;
         return Ok(());
@@ -811,9 +880,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Cmd::Commands) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            let settings = rupi_config::Settings::load(&home, &cwd);
             println!(
                 "{}",
-                rupi_core::commands::index_block(&command_dirs_filtered(&home, true))
+                rupi_core::commands::index_block_filtered(
+                    &command_dirs_runtime(&home, true, &settings),
+                    Some(&prompt_filter(&settings)),
+                )
             );
         }
         Some(Cmd::SkillLoad { name }) => {
@@ -832,8 +906,8 @@ async fn main() -> anyhow::Result<()> {
             let dir = acc.propose(&name, &description, &steps)?;
             println!("skill drafted at {}", dir.display());
         }
-        Some(Cmd::SessionSearch { query }) => {
-            let store = SessionStore::open(&home)?;
+        Some(Cmd::SessionSearch { ref query }) => {
+            let store = SessionStore::open(&session_store_home(&cli, &home))?;
             let hits = store.search(&query, 10)?;
             if hits.is_empty() {
                 println!("no matching sessions for `{query}`");
@@ -878,7 +952,7 @@ async fn main() -> anyhow::Result<()> {
             print!("{}", rupi_llm::format_catalog(&rupi_llm::load_models()));
         }
         Some(Cmd::Sessions) => {
-            let store = SessionStore::open(&home)?;
+            let store = SessionStore::open(&session_store_home(&cli, &home))?;
             let sessions = store.list_sessions(20)?;
             if sessions.is_empty() {
                 println!("no sessions yet — chat or run to create one");
@@ -891,8 +965,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Cmd::SessionShow { id }) => {
-            let store = SessionStore::open(&home)?;
+        Some(Cmd::SessionShow { ref id }) => {
+            let store = SessionStore::open(&session_store_home(&cli, &home))?;
             if !store.has_session(&id)? {
                 println!("unknown session: {id} (see `sessions`)");
                 return Ok(());
@@ -1688,7 +1762,7 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let skills = discover_skills(cli, home, load_project);
-    let sess_db = SessionStore::open(home)?;
+    let sess_db = SessionStore::open(&session_store_home(cli, home))?;
     let (session_tree, sid) = restore_or_new(cli, &sess_db, false)?;
     let provider: Arc<dyn LlmProvider> =
         build_provider(&rt.model, Some(&sid), &provider_options(cli))
@@ -1728,7 +1802,7 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     sess.session_name = cli.name.clone();
     sess.sess_db = Some(store.clone());
     sess.persist = rt.persist;
-    sess.command_dirs = command_dirs_filtered(home, load_project);
+    sess.command_dirs = command_dirs_runtime(home, load_project, &rt.settings);
     sess.provider_opts = provider_options(cli);
     apply_queue_settings(&sess.inbox, &rt.settings);
     sync_tool_env(&sess.session_id, &*sess.provider, sess.agent.thinking);
@@ -1805,7 +1879,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(Mutex::new(SessionStore::open(home)?));
+    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
+        cli, home,
+    ))?));
     let (mut session, sid) = restore_or_new(cli, &sess_db.lock().unwrap(), false)?;
     // provider 在会话 id 落定后构造：亲和头荷载即 sessions.db 会话 id，
     // --resume 同 id 即同一下游（实例级随机 id 只保同进程粘滞）。
@@ -2074,7 +2150,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(Mutex::new(SessionStore::open(home)?));
+    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
+        cli, home,
+    ))?));
     let (mut session, mut sid) = restore_or_new(cli, &sess_db.lock().unwrap(), false)?;
     // provider 与 reviewer 在会话 id 落定后装配：亲和头荷载即 sessions.db 会话 id
     let mut provider: Arc<dyn LlmProvider> =
@@ -2138,7 +2216,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     }
     apply_tool_filter(&mut tools, &rt);
 
-    println!("rupi v0.1.0. /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/settings 改 steeringMode/followUpMode/defaultProjectTrust/externalEditor/enabledModels，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/new /session /sessions /export /import /fork /clone /name");
+    println!("rupi v0.1.0. /quit 退出，Ctrl-C 中止本轮，/rewind 回退，/tree 看树，/goto <短id> 跳转，/compact 手动压实，/model [provider/model[:thinking]] 切换模型，/thinking [off|low|medium|high|xhigh|max] 思考强度，/settings 改 steeringMode/followUpMode/defaultProjectTrust/externalEditor/enabledModels/sessionDir/prompts，/reload 重载扩展，/plan 切换计划模式，/skills 看技能，/commands 看自定义命令，/new /session /sessions /export /import /share /fork /clone /name");
     let stdin = std::io::stdin();
     let mut saved_summary = session.summary.clone().unwrap_or_default();
     let mut line = String::new();
@@ -2164,7 +2242,10 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         if input == "/commands" {
             println!(
                 "{}",
-                rupi_core::commands::index_block(&command_dirs_filtered(home, load_project))
+                rupi_core::commands::index_block_filtered(
+                    &command_dirs_runtime(home, load_project, &settings),
+                    Some(&prompt_filter(&settings)),
+                )
             );
             let extra = ext_set.command_index();
             if !extra.is_empty() {
@@ -2209,6 +2290,16 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                 ),
                 _ => {}
             }
+            continue;
+        }
+        if input == "/share" || input.starts_with("/share ") {
+            let name = {
+                let db = sess_db.lock().unwrap();
+                db.get_name(&sid).ok().flatten()
+            };
+            let jsonl =
+                rupi_memory::export_tree_jsonl(&session, &cwd_string(), name.as_deref(), None);
+            println!("{}", rupi_tui::share::share_jsonl(&jsonl, &sid, true));
             continue;
         }
         if handle_settings_repl(&input, &mut settings, home, Some(&inbox)) {
@@ -2390,19 +2481,16 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             let extra: Vec<PathBuf> = cli.skill.iter().map(PathBuf::from).collect();
             skills.ingest_paths(&extra);
         }
-        // 自定义斜杠命令：内建优先（上已 continue），命中则展开为提示词；
-        // 未命中再回退 skill 名（`/skillname args` 即调 skill；`/skill:name` 同义）。
-        let slash = rupi_core::commands::split(&input).map(|(n, a)| (n.to_owned(), a.to_owned()));
-        if let Some((name, args)) = slash.as_ref() {
-            if let Some(expanded) =
-                rupi_core::commands::expand(&command_dirs_filtered(home, load_project), name, args)
-            {
-                println!("[command /{name}]");
-                input = expanded;
-            } else if let Some(expanded) = skills.expand_as_command(name, args) {
-                println!("[skill /{name}]");
-                input = expanded;
-            } else if let Some(expanded) = ext_set.expand_command(name, args) {
+        // 空闲发送才展开 skill/prompt；steer 不走 REPL 这条路径。
+        let filter = prompt_filter(&settings);
+        let dirs = command_dirs_runtime(home, load_project, &settings);
+        let (expanded, note) =
+            rupi_tui::slash::expand_slash_input(&input, &dirs, &skills, true, Some(&filter));
+        if let Some(note) = note {
+            println!("{note}");
+            input = expanded;
+        } else if let Some((name, args)) = rupi_core::commands::split(&input) {
+            if let Some(expanded) = ext_set.expand_command(name, args) {
                 println!("[ext /{name}]");
                 input = expanded;
             }
@@ -2558,7 +2646,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(home)?));
+    let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(
+        &session_store_home(cli, home),
+    )?));
     let (mut session, sid) = {
         let db = sess_db.lock().unwrap();
         restore_or_new(cli, &db, cli.pick_session)?
@@ -2691,7 +2781,8 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
         mcp_rx: Some(mcp_rx),
         skill_dirs: skill_dirs_runtime(cli, home, load_project),
         ext_set: Some(&mut ext_set),
-        command_dirs: command_dirs_filtered(home, load_project),
+        command_dirs: command_dirs_runtime(home, load_project, &rt.settings),
+        load_project,
         review_lines,
         session_id: sid_cell,
         sess_db: Some(sess_db_ctx),

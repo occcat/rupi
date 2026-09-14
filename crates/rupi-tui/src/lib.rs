@@ -9,6 +9,7 @@ pub mod kitty;
 pub mod markdown;
 pub mod mermaid;
 pub mod session_nav;
+pub mod share;
 pub mod slash;
 pub mod theme;
 pub mod tree_nav;
