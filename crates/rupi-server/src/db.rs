@@ -225,7 +225,8 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
                WHERE workspace_state = 'hot';",
         )
         .await;
-    // FTS：simple 配置对中英都可用；查询仍带 tenant_id，按 tenant 分区时可剪枝。
+    // FTS `simple` 把无空格中文整句当成一个 lexeme，子串召不回。
+    // 先建列（老表达式），v3 再附上 CJK n-gram；查询侧叠加 pg_trgm。
     let _ = c
         .batch_execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
@@ -263,7 +264,88 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
              INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;",
         )
         .await;
+    migrate_cjk_fts(&c).await;
     Ok(())
+}
+
+/// 重叠 2/3-gram，给 `simple` FTS 补中文子串。与本机 FTS5 `tokenize=trigram` 对齐。
+const RUPI_CJK_NGRAMS_SQL: &str = r#"
+CREATE OR REPLACE FUNCTION rupi_cjk_ngrams(t text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $fn$
+DECLARE
+  i int;
+  n int;
+  ch text;
+  prev text := '';
+  prev2 text := '';
+  out text := '';
+  code int;
+BEGIN
+  IF t IS NULL OR t = '' THEN
+    RETURN '';
+  END IF;
+  n := char_length(t);
+  FOR i IN 1..n LOOP
+    ch := substr(t, i, 1);
+    code := ascii(ch);
+    IF code >= 19968 AND code <= 40959 THEN
+      IF prev <> '' THEN
+        out := out || ' ' || prev || ch;
+      END IF;
+      IF prev2 <> '' THEN
+        out := out || ' ' || prev2 || prev || ch;
+      END IF;
+      prev2 := prev;
+      prev := ch;
+    ELSE
+      prev := '';
+      prev2 := '';
+    END IF;
+  END LOOP;
+  RETURN btrim(out);
+END
+$fn$;
+"#;
+
+const RUPI_CJK_TSV_SQL: &str = r#"
+ALTER TABLE messages DROP COLUMN IF EXISTS content_tsv;
+ALTER TABLE memories DROP COLUMN IF EXISTS content_tsv;
+ALTER TABLE messages ADD COLUMN content_tsv tsvector
+  GENERATED ALWAYS AS (
+    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(rupi_cjk_ngrams(content), ''))
+  ) STORED;
+ALTER TABLE memories ADD COLUMN content_tsv tsvector
+  GENERATED ALWAYS AS (
+    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(rupi_cjk_ngrams(content), ''))
+  ) STORED;
+CREATE INDEX IF NOT EXISTS messages_tsv ON messages USING gin (content_tsv);
+CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (content_tsv);
+INSERT INTO schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING;
+"#;
+
+async fn migrate_cjk_fts(c: &deadpool_postgres::Object) {
+    if let Err(e) = c.batch_execute(RUPI_CJK_NGRAMS_SQL).await {
+        tracing::warn!("rupi_cjk_ngrams unavailable: {e:#}");
+        return;
+    }
+    let needs_rewrite = c
+        .query_one(
+            "SELECT NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 3)",
+            &[],
+        )
+        .await
+        .map(|r| r.get::<_, bool>(0))
+        .unwrap_or(true);
+    if !needs_rewrite {
+        return;
+    }
+    if let Err(e) = c.batch_execute(RUPI_CJK_TSV_SQL).await {
+        tracing::warn!("content_tsv CJK n-gram rewrite skipped: {e:#}");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1194,36 +1276,61 @@ pub async fn list_memories(
         .collect())
 }
 
-pub async fn search_memories(
+/// CJK Unified Ideographs（BMP）。与 `rupi_cjk_ngrams` 的码点窗一致。
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF)
+}
+
+/// 重叠汉字 bigram 做成 `simple` tsquery（`乌龙 & 龙茶`）。
+/// `plainto_tsquery('simple', 整句)` 对不上；这是云端对 FTS5 trigram 的补法。
+fn cjk_bigram_tsquery(query: &str) -> String {
+    let chars: Vec<char> = query.chars().filter(|c| is_cjk_ideograph(*c)).collect();
+    if chars.len() < 2 {
+        return String::new();
+    }
+    chars
+        .windows(2)
+        .map(|w| format!("{}{}", w[0], w[1]))
+        .collect::<Vec<_>>()
+        .join(" & ")
+}
+
+/// ILIKE（`gin_trgm_ops`）+ `word_similarity` + simple FTS + CJK bigram。
+async fn search_content(
     pool: &PgPool,
     tenant_id: &str,
     query: &str,
     limit: i64,
+    select_from: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let c = pool.get().await?;
-    let like = format!("%{query}%");
     let q = query.trim();
     if q.is_empty() {
         return Ok(vec![]);
     }
-    let rows = match c
-        .query(
-            "SELECT scope, content FROM memories
-             WHERE tenant_id = $1 AND (
-               content ILIKE $2
-               OR content_tsv @@ plainto_tsquery('simple', $3)
-             )
-             ORDER BY created_at DESC LIMIT $4",
-            &[&tenant_id, &like, &q, &limit],
-        )
-        .await
-    {
+    let like = format!("%{q}%");
+    let cjk = cjk_bigram_tsquery(q);
+    let c = pool.get().await?;
+    let sql = format!(
+        "{select_from}
+         WHERE tenant_id = $1 AND (
+           content ILIKE $2
+           OR word_similarity($3, content) > 0.25
+           OR content_tsv @@ plainto_tsquery('simple', $3)
+           OR ($4 <> '' AND content_tsv @@ to_tsquery('simple', $4))
+         )
+         ORDER BY GREATEST(word_similarity($3, content), similarity($3, content)) DESC,
+                  created_at DESC
+         LIMIT $5"
+    );
+    let rows = match c.query(&sql, &[&tenant_id, &like, &q, &cjk, &limit]).await {
         Ok(r) => r,
         Err(_) => {
             c.query(
-                "SELECT scope, content FROM memories
-                 WHERE tenant_id = $1 AND content ILIKE $2
-                 ORDER BY created_at DESC LIMIT $3",
+                &format!(
+                    "{select_from}
+                     WHERE tenant_id = $1 AND content ILIKE $2
+                     ORDER BY created_at DESC LIMIT $3"
+                ),
                 &[&tenant_id, &like, &limit],
             )
             .await?
@@ -1232,42 +1339,36 @@ pub async fn search_memories(
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
+pub async fn search_memories(
+    pool: &PgPool,
+    tenant_id: &str,
+    query: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<(String, String)>> {
+    search_content(
+        pool,
+        tenant_id,
+        query,
+        limit,
+        "SELECT scope, content FROM memories",
+    )
+    .await
+}
+
 pub async fn search_sessions(
     pool: &PgPool,
     tenant_id: &str,
     query: &str,
     limit: i64,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let c = pool.get().await?;
-    let like = format!("%{query}%");
-    let q = query.trim();
-    if q.is_empty() {
-        return Ok(vec![]);
-    }
-    let rows = match c
-        .query(
-            "SELECT session_id, content FROM messages
-             WHERE tenant_id = $1 AND (
-               content ILIKE $2
-               OR content_tsv @@ plainto_tsquery('simple', $3)
-             )
-             ORDER BY created_at DESC LIMIT $4",
-            &[&tenant_id, &like, &q, &limit],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => {
-            c.query(
-                "SELECT session_id, content FROM messages
-                 WHERE tenant_id = $1 AND content ILIKE $2
-                 ORDER BY created_at DESC LIMIT $3",
-                &[&tenant_id, &like, &limit],
-            )
-            .await?
-        }
-    };
-    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    search_content(
+        pool,
+        tenant_id,
+        query,
+        limit,
+        "SELECT session_id, content FROM messages",
+    )
+    .await
 }
 
 pub async fn insert_interrupt(
@@ -1883,5 +1984,18 @@ mod tests {
             db_wire_mode_with("postgres://rupi:rupi@db.example.com:5432/rupi", true).unwrap();
         assert_eq!(insecure, DbWireMode::PlaintextInsecure);
         assert!(!insecure.uses_tls());
+    }
+
+    #[test]
+    fn cjk_bigram_tsquery_covers_chinese_words() {
+        assert_eq!(cjk_bigram_tsquery("乌龙茶"), "乌龙 & 龙茶");
+        assert_eq!(cjk_bigram_tsquery("乌龙"), "乌龙");
+        assert_eq!(cjk_bigram_tsquery("tea"), "");
+        assert_eq!(
+            cjk_bigram_tsquery("请记住 乌龙茶"),
+            "请记 & 记住 & 住乌 & 乌龙 & 龙茶"
+        );
+        assert_eq!(cjk_bigram_tsquery("茶"), "");
+        assert_eq!(cjk_bigram_tsquery(""), "");
     }
 }
