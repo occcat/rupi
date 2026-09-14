@@ -323,38 +323,66 @@ fn escape_sb(root: &Path) -> String {
 
 /// macOS seatbelt：deny-default，只放行跑 `/bin/sh` 与句柄根所需路径。
 /// 全平台可生成，供回归断言，避免再写成 `(allow default)`。
+///
+/// Tokio 管道是 FIFO vnode，不是 `/dev/fd/N`；缺 FIFO write 时 echo 会
+/// `exit=1 stdout="" stderr=""`。SBPL 没有 `PIPE`，vnode 名是 `FIFO`。
 pub fn macos_sandbox_profile(root: &Path) -> String {
     let root_s = escape_sb(root);
     format!(
         r##"(version 1)
 (deny default)
-(allow process-exec*)
 (allow process-fork)
 (allow process-info* (target self))
 (allow signal)
-(allow sysctl-read)
+(allow sysctl*)
 (allow mach-lookup)
 (allow mach-register)
 (allow ipc-posix-shm*)
 (allow ipc-posix-sem*)
 (allow file-read-metadata)
-(allow file-map-executable
-  (subpath "/usr")
+(allow process-exec*
+  (literal "/bin/sh")
+  (literal "/bin/bash")
+  (literal "/usr/bin/env")
+  (literal "/usr/bin/true")
+  (literal "/usr/bin/false")
   (subpath "/bin")
-  (subpath "/sbin")
+  (subpath "/usr/bin")
+  (subpath "/usr/libexec")
+  (subpath "/usr/sbin")
+  (subpath "/System")
+  (subpath "/Library")
+  (subpath "/System/Cryptexes")
+)
+(allow file-map-executable
+  (literal "/usr/lib/dyld")
+  (literal "/usr/lib/libSystem.B.dylib")
+  (subpath "/usr/lib")
+  (subpath "/usr/lib/system")
+  (subpath "/bin")
+  (subpath "/usr/bin")
   (subpath "/System")
   (subpath "/Library")
   (subpath "/private/var/db/dyld")
+  (subpath "/var/db/dyld")
   (subpath "/System/Volumes/Preboot")
   (subpath "/System/Cryptexes")
 )
 (allow file-read*
+  (literal "/bin/sh")
+  (literal "/bin/bash")
+  (literal "/usr/bin/env")
+  (literal "/usr/lib/dyld")
+  (literal "/usr/lib/libSystem.B.dylib")
   (subpath "/usr")
+  (subpath "/usr/lib")
+  (subpath "/usr/lib/system")
   (subpath "/bin")
   (subpath "/sbin")
   (subpath "/System")
   (subpath "/Library")
   (subpath "/private/var/db/dyld")
+  (subpath "/var/db/dyld")
   (subpath "/private/var/db/timezone")
   (subpath "/System/Volumes/Preboot")
   (subpath "/System/Cryptexes")
@@ -379,6 +407,11 @@ pub fn macos_sandbox_profile(root: &Path) -> String {
 )
 (allow file-read* file-write*
   (subpath "{root_s}")
+)
+(allow file-read-data file-write-data file-ioctl
+  (vnode-type FIFO)
+  (vnode-type SOCKET)
+  (vnode-type CHARACTER-DEVICE)
 )
 (allow file-write-data
   (literal "/dev/null")
@@ -649,9 +682,15 @@ mod tests {
         assert!(p.contains("/dev/fd"), "{p}");
         assert!(p.contains("/usr"), "{p}");
         assert!(p.contains("/bin"), "{p}");
+        assert!(p.contains("/bin/sh"), "{p}");
+        assert!(p.contains("/usr/lib/dyld"), "{p}");
+        assert!(p.contains("/usr/lib/libSystem.B.dylib"), "{p}");
+        assert!(p.contains("(vnode-type FIFO)"), "{p}");
         assert!(p.contains("file-write-data"), "{p}");
         assert!(!p.contains("(subpath \"/Users\")"), "{p}");
         assert!(!p.contains("(subpath \"/tmp\")"), "{p}");
+        assert!(!p.contains("(subpath \"/private/var/folders\")"), "{p}");
+        assert!(!p.contains("(vnode-type PIPE)"), "{p}");
     }
 
     #[test]
