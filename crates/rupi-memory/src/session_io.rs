@@ -2,7 +2,7 @@
 //! 对标 `packages/coding-agent/docs/session-format.md`（header + message/compaction/session_info）。
 
 use crate::{SessionRecord, SessionStore};
-use rupi_core::{ContentBlock, Message, Role, SessionTree};
+use rupi_core::{ContentBlock, Message, Role, SessionTree, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -57,7 +57,9 @@ pub fn export_tree_jsonl(
     for id in ids {
         let node = &tree.nodes[id];
         let parent = node.parent.clone().or_else(|| prev_jsonl_id.clone());
-        for (entry_id, msg_json) in message_entries(id, parent.as_deref(), &node.message) {
+        for (entry_id, msg_json) in
+            message_entries(id, parent.as_deref(), &node.message, tree.node_usage(id))
+        {
             lines.push(msg_json);
             prev_jsonl_id = Some(entry_id);
         }
@@ -105,7 +107,12 @@ pub fn export_tree_jsonl(
     lines.join("\n") + "\n"
 }
 
-fn message_entries(id: &str, parent: Option<&str>, msg: &Message) -> Vec<(String, String)> {
+fn message_entries(
+    id: &str,
+    parent: Option<&str>,
+    msg: &Message,
+    usage: TokenUsage,
+) -> Vec<(String, String)> {
     let ts = msg
         .created_at
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -214,7 +221,7 @@ fn message_entries(id: &str, parent: Option<&str>, msg: &Message) -> Vec<(String
                         "api": "openai-completions",
                         "provider": msg.provider.as_deref().unwrap_or("rupi"),
                         "model": "",
-                        "usage": zero_usage(),
+                        "usage": usage_value(usage),
                         "stopReason": "stop",
                         "timestamp": ms,
                     }
@@ -243,11 +250,57 @@ fn linear_message_line(
     .to_string()
 }
 
-fn zero_usage() -> Value {
+fn usage_value(u: TokenUsage) -> Value {
     serde_json::json!({
-        "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+        "input": u.input,
+        "output": u.output,
+        "cacheRead": u.cache_read,
+        "cacheWrite": u.cache_write,
+        "totalTokens": u.input.saturating_add(u.output),
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
     })
+}
+
+fn usage_from_value(v: &Value) -> TokenUsage {
+    TokenUsage {
+        input: v
+            .get("input")
+            .or_else(|| v.get("input_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        output: v
+            .get("output")
+            .or_else(|| v.get("output_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cache_read: v
+            .get("cacheRead")
+            .or_else(|| v.get("cache_read"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cache_write: v
+            .get("cacheWrite")
+            .or_else(|| v.get("cache_write"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    }
+}
+
+/// 落盘 blocks：Message JSON + 非零 usage（resume / 再导出不丢 cache）。
+pub fn message_blocks_json(msg: &Message, usage: TokenUsage) -> Option<String> {
+    let mut v = serde_json::to_value(msg).ok()?;
+    if !usage.is_zero() {
+        v["usage"] = serde_json::to_value(usage).ok()?;
+    }
+    Some(v.to_string())
+}
+
+pub fn usage_from_blocks_json(raw: &str) -> TokenUsage {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("usage").cloned())
+        .map(|u| usage_from_value(&u))
+        .unwrap_or_default()
 }
 
 /// 解析 JSONL → 树 + 可选名/父会话。坏行跳过。
@@ -299,6 +352,12 @@ pub fn import_jsonl(jsonl: &str) -> anyhow::Result<ImportedSession> {
                     continue;
                 };
                 let message = pi_message_to_rupi(msg_v);
+                if let Some(u) = msg_v.get("usage") {
+                    let usage = usage_from_value(u);
+                    if !usage.is_zero() {
+                        tree.usage_by_node.insert(id.clone(), usage);
+                    }
+                }
                 tree.nodes.insert(
                     id.clone(),
                     rupi_core::SessionNode {
@@ -542,7 +601,7 @@ pub fn persist_tree(
             id: id.clone(),
             role: role.into(),
             content: node.message.full_text(),
-            blocks: serde_json::to_string(&node.message).ok(),
+            blocks: message_blocks_json(&node.message, tree.node_usage(id)),
         });
     }
     let n = rows.len();
@@ -560,18 +619,9 @@ pub fn export_store_jsonl(
     if recs.is_empty() && !store.has_session(session_id)? {
         anyhow::bail!("unknown session: {session_id}");
     }
-    let mut tree = SessionTree::new();
-    tree.id = session_id.to_string();
-    for rec in recs {
-        tree.push_with_id(rec.id.clone(), rec.to_message());
-    }
     let stored = store.get_summary(session_id).unwrap_or_default();
-    if !stored.is_empty() {
-        if let Some(first) = tree.current_path.first().cloned() {
-            tree.summary = Some(stored);
-            tree.summary_through = Some(first);
-        }
-    }
+    let mut tree = tree_from_records(recs, &stored);
+    tree.id = session_id.to_string();
     let name = store.get_name(session_id).ok().flatten();
     let parent = store.get_parent_session(session_id).ok().flatten();
     Ok(export_tree_jsonl(
@@ -666,6 +716,13 @@ pub fn remap_tree(src: &SessionTree, path_only: bool) -> SessionTree {
         .iter()
         .filter_map(|id| map.get(id).cloned())
         .collect();
+    for (old, new_id) in &map {
+        if let Some(u) = src.usage_by_node.get(old).copied() {
+            if !u.is_zero() {
+                out.usage_by_node.insert(new_id.clone(), u);
+            }
+        }
+    }
     if out.current_path.is_empty() {
         if let Some(leaf) = out.nodes.keys().next().cloned() {
             out.goto_node(&leaf);
@@ -811,6 +868,12 @@ pub fn tree_from_records(recs: Vec<SessionRecord>, summary: &str) -> SessionTree
     let mut s = SessionTree::new();
     for rec in recs {
         s.push_with_id(rec.id.clone(), rec.to_message());
+        if let Some(raw) = rec.blocks.as_deref() {
+            let u = usage_from_blocks_json(raw);
+            if !u.is_zero() {
+                s.note_node_usage(&rec.id, u);
+            }
+        }
     }
     if !summary.is_empty() {
         if let Some(first) = s.current_path.first().cloned() {
@@ -840,6 +903,35 @@ mod tests {
         assert_eq!(imported.tree.history().len(), 2);
         assert!(imported.tree.history()[0].full_text().contains("hello"));
         assert!(imported.tree.history()[1].full_text().contains("hi there"));
+    }
+
+    #[test]
+    fn jsonl_export_keeps_cache_usage() {
+        let mut tree = SessionTree::new();
+        tree.push(Message::text(Role::User, "cached prompt"));
+        let aid = tree.push(Message::text(Role::Assistant, "from cache"));
+        tree.note_node_usage(&aid, TokenUsage::new(200, 12, 160, 8));
+        let jsonl = export_tree_jsonl(&tree, "/tmp/proj", None, None);
+        assert!(jsonl.contains("\"cacheRead\":160"), "{jsonl}");
+        assert!(jsonl.contains("\"cacheWrite\":8"), "{jsonl}");
+        assert!(
+            jsonl.contains("\"usage\":{\"cacheRead\":160")
+                || jsonl.contains("\"cacheRead\":160,\"cacheWrite\":8"),
+            "{jsonl}"
+        );
+        let imported = import_jsonl(&jsonl).unwrap();
+        let got = imported
+            .tree
+            .usage_by_node
+            .values()
+            .copied()
+            .find(|u| u.cache_read == 160)
+            .expect("cache usage");
+        assert_eq!(got.cache_write, 8);
+        assert_eq!(got.input, 200);
+        let blocks = message_blocks_json(&tree.nodes[&aid].message, tree.node_usage(&aid)).unwrap();
+        assert!(blocks.contains("\"cacheRead\":160"), "{blocks}");
+        assert_eq!(usage_from_blocks_json(&blocks).cache_read, 160);
     }
 
     #[test]

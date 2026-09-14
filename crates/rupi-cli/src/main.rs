@@ -1393,7 +1393,7 @@ fn turn_rows(session: &SessionTree, before_len: usize) -> Vec<rupi_memory::Sessi
             id: id.clone(),
             role: role_label(&node.message.role).into(),
             content: node.message.full_text(),
-            blocks: serde_json::to_string(&node.message).ok(),
+            blocks: rupi_memory::message_blocks_json(&node.message, session.node_usage(id)),
         })
         .collect()
 }
@@ -1925,12 +1925,20 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
                     rupi_core::AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read,
+                        cache_write,
                     } => {
                         let mut m = rupi_agent::TokenMeter::new(&rt.model);
                         if let Some(w) = rt.context_window {
                             m.set_context_window(w);
                         }
-                        m.note_usage(input_tokens, output_tokens, input_tokens);
+                        m.note_usage_cache(
+                            input_tokens,
+                            output_tokens,
+                            cache_read,
+                            cache_write,
+                            input_tokens,
+                        );
                         eprintln!("\n[{}]", m.footer(m.calibrate(input_tokens)));
                     }
                     rupi_core::AgentEvent::UiHint {
@@ -2430,11 +2438,16 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             rupi_core::AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
+                cache_read,
+                cache_write,
             } => {
-                meter
-                    .lock()
-                    .unwrap()
-                    .note_usage(input_tokens, output_tokens, input_tokens);
+                meter.lock().unwrap().note_usage_cache(
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_write,
+                    input_tokens,
+                );
             }
             rupi_core::AgentEvent::UiHint {
                 source,
@@ -2709,7 +2722,10 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
                     id: id.clone(),
                     role: role_label(&msg.role).into(),
                     content: msg.full_text(),
-                    blocks: serde_json::to_string(msg).ok(),
+                    blocks: rupi_memory::message_blocks_json(
+                        msg,
+                        t.usage.get(id).copied().unwrap_or_default(),
+                    ),
                 })
                 .collect();
             let summary = t.summary.as_ref().and_then(|sum| {

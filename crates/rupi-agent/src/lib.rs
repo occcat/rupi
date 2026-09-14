@@ -3,7 +3,7 @@
 
 use rupi_core::{
     AgentEvent, CancelFlag, ContentBlock, Extension, Message, Role, SessionTree, StopReason,
-    ToolDefinition,
+    TokenUsage, ToolDefinition,
 };
 use rupi_llm::{ChatRequest, LlmProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager};
@@ -719,7 +719,7 @@ impl AgentLoop {
             tokio::pin!(fut);
             let mut partial = String::new();
             // 用量：provider 流末尾给出，多次以最后一次为准，本轮结束统一发一个 Usage 事件
-            let mut usage: Option<(u64, u64)> = None;
+            let mut usage: Option<TokenUsage> = None;
             enum StreamEnd {
                 Done(anyhow::Result<rupi_llm::ChatResponse>),
                 Cancelled,
@@ -732,8 +732,13 @@ impl AgentLoop {
                             partial.push_str(&delta);
                             on_event(AgentEvent::TextDelta { delta });
                         }
-                        Some(rupi_llm::StreamEvent::Usage { input, output }) => {
-                            usage = Some((input, output));
+                        Some(rupi_llm::StreamEvent::Usage {
+                            input,
+                            output,
+                            cache_read,
+                            cache_write,
+                        }) => {
+                            usage = Some(TokenUsage::new(input, output, cache_read, cache_write));
                         }
                         // 发送端已关闭（provider 收尾中）：直接等完成，
                         // 否则关闭后的 recv 永远就绪空转，空烧 CPU。
@@ -785,13 +790,20 @@ impl AgentLoop {
                     rupi_llm::StreamEvent::TextDelta(delta) => {
                         on_event(AgentEvent::TextDelta { delta })
                     }
-                    rupi_llm::StreamEvent::Usage { input, output } => usage = Some((input, output)),
+                    rupi_llm::StreamEvent::Usage {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                    } => usage = Some(TokenUsage::new(input, output, cache_read, cache_write)),
                 }
             }
-            if let Some((input_tokens, output_tokens)) = usage {
+            if let Some(u) = usage {
                 on_event(AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
+                    input_tokens: u.input,
+                    output_tokens: u.output,
+                    cache_read: u.cache_read,
+                    cache_write: u.cache_write,
                 });
             }
             let has_calls = resp
@@ -799,7 +811,10 @@ impl AgentLoop {
                 .blocks
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolCall { .. }));
-            session.push(resp.message.clone());
+            let node_id = session.push(resp.message.clone());
+            if let Some(u) = usage {
+                session.note_node_usage(&node_id, u);
+            }
             Self::emit_thinking(&resp.message, on_event);
 
             if !has_calls {

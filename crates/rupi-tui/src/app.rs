@@ -95,6 +95,8 @@ pub struct TurnRecord {
     /// 本轮新增的全部节点（id + 完整消息）：user、含工具调用的 assistant、工具结果、
     /// 最终答复。调用方应一次 `persist_turn`（blocks JSON），`/resume` 才能结构化回填工具上下文。
     pub messages: Vec<(String, Message)>,
+    /// 本轮节点用量（含 cache），落盘进 blocks JSON。
+    pub usage: std::collections::HashMap<String, rupi_core::TokenUsage>,
 }
 
 struct Guard;
@@ -109,6 +111,8 @@ impl Drop for Guard {
 pub struct FooterState {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     pub model: String,
 }
 
@@ -299,18 +303,9 @@ pub(crate) fn replay_session(
     id: &str,
 ) -> anyhow::Result<(SessionTree, usize)> {
     let msgs = store.session_records(id, 500)?;
-    let mut s = SessionTree::new();
-    for rec in msgs {
-        s.push_with_id(rec.id.clone(), rec.to_message());
-    }
-    let n = s.history().len();
     let stored = store.get_summary(id).unwrap_or_default();
-    if !stored.is_empty() {
-        if let Some(first) = s.current_path.first().cloned() {
-            s.summary = Some(stored);
-            s.summary_through = Some(first);
-        }
-    }
+    let s = rupi_memory::tree_from_records(msgs, &stored);
+    let n = s.history().len();
     Ok((s, n))
 }
 
@@ -652,12 +647,55 @@ enum Control {
     Quit,
 }
 
+const TUI_HELP: &str = "rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出";
+
+/// 启动 banner：`quietStartup` 全静音；否则帮助行 + 已载 skill/ext/MCP。
+pub fn startup_banner_lines(
+    quiet: bool,
+    skills: &[String],
+    extensions: &[String],
+    mcp: &[String],
+) -> Vec<String> {
+    if quiet {
+        return Vec::new();
+    }
+    let mut out = vec![TUI_HELP.to_string()];
+    if !skills.is_empty() {
+        out.push(format!("skills: {}", skills.join(", ")));
+    }
+    if !extensions.is_empty() {
+        out.push(format!("extensions: {}", extensions.join(", ")));
+    }
+    if !mcp.is_empty() {
+        out.push(format!("mcp: {}", mcp.join(", ")));
+    }
+    out
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut ctx: TuiContext<'_>,
 ) -> anyhow::Result<()> {
     let mut view = ChatView::default();
-    view.push_system("rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /fork /clone /name，鼠标滚轮，/quit 退出".into());
+    let quiet = ctx.settings.as_ref().is_some_and(|s| s.quiet_startup());
+    let skill_names: Vec<String> = ctx
+        .skills
+        .command_entries()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let ext_names = ctx
+        .ext_set
+        .as_ref()
+        .map(|s| s.loaded_names())
+        .unwrap_or_default();
+    let mcp_names: Vec<String> = ctx
+        .mcp
+        .map(|m| m.entries.iter().map(|e| e.config.name.clone()).collect())
+        .unwrap_or_default();
+    for line in startup_banner_lines(quiet, &skill_names, &ext_names, &mcp_names) {
+        view.push_system(line);
+    }
     let mut input = InputBuffer::default();
     let mut scroll: u16 = 0;
     let mut reader = EventStream::new();
@@ -820,6 +858,20 @@ async fn run_loop(
             continue;
         }
         if let Some(nav) = tree.as_mut() {
+            let sid = ctx.session_id.lock().unwrap().clone();
+            if nav.labeling.is_some() {
+                match key.code {
+                    KeyCode::Esc => nav.cancel_label(),
+                    KeyCode::Enter => {
+                        nav.commit_label();
+                        nav.persist(&ctx.settings_home, &sid);
+                    }
+                    KeyCode::Backspace => nav.label_backspace(),
+                    KeyCode::Char(c) => nav.label_char(c),
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') if !nav.filtering => {
                     tree = None;
@@ -832,6 +884,16 @@ async fn run_loop(
                 KeyCode::Char('/') if !nav.filtering => {
                     nav.filtering = true;
                     nav.query.clear();
+                    continue;
+                }
+                KeyCode::Char(' ') if !nav.filtering => {
+                    if nav.toggle_collapse() {
+                        nav.persist(&ctx.settings_home, &sid);
+                    }
+                    continue;
+                }
+                KeyCode::Char('b') if !nav.filtering => {
+                    nav.begin_label();
                     continue;
                 }
                 KeyCode::Up | KeyCode::Char('k') if !nav.filtering => {
@@ -1078,7 +1140,12 @@ async fn run_loop(
                     match builtin {
                         Builtin::Quit => return Ok(()),
                         Builtin::TreeNav => {
-                            tree = Some(TreeNavigator::from_session(ctx.session));
+                            let sid = ctx.session_id.lock().unwrap().clone();
+                            tree = Some(TreeNavigator::from_session_persisted(
+                                ctx.session,
+                                &ctx.settings_home,
+                                &sid,
+                            ));
                             continue;
                         }
                         Builtin::SessionNav => {
@@ -1461,18 +1528,24 @@ where
                     if let AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read,
+                        cache_write,
                     } = &e
                     {
                         if let Some(m) = meter {
                             // fut 仍借着 session，不能在此读树；用本轮 input 自校准（ratio≈1）。
-                            m.lock().unwrap().note_usage(
+                            m.lock().unwrap().note_usage_cache(
                                 *input_tokens,
                                 *output_tokens,
+                                *cache_read,
+                                *cache_write,
                                 *input_tokens,
                             );
                         }
                         chrome.footer.input_tokens = *input_tokens;
                         chrome.footer.output_tokens = *output_tokens;
+                        chrome.footer.cache_read = *cache_read;
+                        chrome.footer.cache_write = *cache_write;
                     }
                     view.push_event(&e);
                     flush_turn_view(&mut rx, review_lines, view, chrome);
@@ -1513,6 +1586,7 @@ where
                             user_node,
                             assistant_node,
                             messages,
+                            usage: session.usage_by_node.clone(),
                         };
                         let cb = cb.clone();
                         // 落盘（SQLite）离开渲染任务：`persist_turn` 在 blocking 池跑，不冻 TUI。
@@ -1544,10 +1618,14 @@ fn flush_turn_view(
         if let AgentEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_read,
+            cache_write,
         } = &e
         {
             chrome.footer.input_tokens = *input_tokens;
             chrome.footer.output_tokens = *output_tokens;
+            chrome.footer.cache_read = *cache_read;
+            chrome.footer.cache_write = *cache_write;
         }
         view.push_event(&e);
     }
@@ -1606,10 +1684,21 @@ fn status_footer(
 }
 
 fn footer_text(busy: bool, queued: usize, chrome: &UiChrome) -> String {
-    let usage = if chrome.footer.input_tokens + chrome.footer.output_tokens > 0 {
+    let usage = if chrome.footer.input_tokens + chrome.footer.output_tokens > 0
+        || chrome.footer.cache_read + chrome.footer.cache_write > 0
+    {
+        let hit = if chrome.footer.input_tokens == 0 {
+            0.0
+        } else {
+            (chrome.footer.cache_read as f64) * 100.0 / (chrome.footer.input_tokens as f64)
+        };
         format!(
-            " ↑{} ↓{}",
-            chrome.footer.input_tokens, chrome.footer.output_tokens
+            " ↑{} ↓{} R{} W{} CH{:.0}%",
+            chrome.footer.input_tokens,
+            chrome.footer.output_tokens,
+            chrome.footer.cache_read,
+            chrome.footer.cache_write,
+            hit
         )
     } else {
         String::new()
@@ -1717,7 +1806,11 @@ fn draw<B: Backend>(
                     nav.visible().len()
                 )
             } else if let Some(nav) = tree {
-                format!("rupi /tree  {}/{}", nav.selected + 1, nav.visible().len())
+                format!(
+                    "rupi /tree  {}/{}  Space 折叠  b 标签",
+                    nav.selected + 1,
+                    nav.visible().len()
+                )
             } else {
                 "rupi".into()
             };
@@ -1806,7 +1899,12 @@ fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
         ))];
     }
     let mut out = Vec::new();
-    if nav.filtering {
+    if let Some(draft) = &nav.labeling {
+        out.push(RLine::from(Span::styled(
+            format!("label: {draft}"),
+            Style::default().fg(theme.accent),
+        )));
+    } else if nav.filtering {
         out.push(RLine::from(Span::styled(
             format!("/{}", nav.query),
             Style::default().fg(theme.accent),
@@ -1816,8 +1914,20 @@ fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
         let mark = if e.on_path { '*' } else { '+' };
         let prefix = if i == nav.selected { "▸ " } else { "  " };
         let indent = "  ".repeat(e.depth);
+        let fold = if nav.is_collapsed(&e.id) {
+            "▸"
+        } else if nav.has_children(&e.id) {
+            "▾"
+        } else {
+            " "
+        };
+        let tag = nav
+            .labels
+            .get(&e.id)
+            .map(|l| format!("[{l}] "))
+            .unwrap_or_default();
         let line = format!(
-            "{prefix}{indent}{mark} {} {:?}: {}",
+            "{prefix}{indent}{mark}{fold} {} {:?}: {tag}{}",
             &e.id[..8.min(e.id.len())],
             e.role,
             e.preview
@@ -2078,9 +2188,42 @@ mod tests {
         let line = status_footer(false, 0, Some(&Mutex::new(m)), 12_800);
         assert!(line.contains('↑'), "{line}");
         assert!(line.contains('↓'), "{line}");
+        assert!(line.contains('R'), "{line}");
+        assert!(line.contains("CH"), "{line}");
         assert!(line.contains('%'), "{line}");
         assert!(line.contains('$'), "{line}");
         assert!(line.contains("ready"), "{line}");
+    }
+
+    #[test]
+    fn startup_banner_respects_quiet_and_lists_loaded() {
+        assert!(startup_banner_lines(true, &["s".into()], &["e".into()], &["m".into()]).is_empty());
+        let lines = startup_banner_lines(false, &["tea".into()], &["echo".into()], &["fs".into()]);
+        assert!(lines.iter().any(|l| l.contains("Enter 发送")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("skills: tea")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("extensions: echo")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("mcp: fs")), "{lines:?}");
+    }
+
+    #[test]
+    fn footer_text_shows_cache_hit() {
+        let chrome = UiChrome {
+            footer: FooterState {
+                input_tokens: 200,
+                output_tokens: 10,
+                cache_read: 150,
+                cache_write: 8,
+                model: "claude".into(),
+            },
+            ..UiChrome::default()
+        };
+        let line = footer_text(false, 0, &chrome);
+        assert!(line.contains("R150"), "{line}");
+        assert!(line.contains("W8"), "{line}");
+        assert!(line.contains("CH75%"), "{line}");
     }
 
     #[test]
@@ -3250,9 +3393,20 @@ mod tests {
             handle_settings_cmd("/settings theme light", Some(&mut s), &dir, &dir, None).unwrap();
         assert!(msg.contains("theme"), "{msg}");
         assert_eq!(s.theme(), "light");
+        let q = handle_settings_cmd(
+            "/settings quietStartup true",
+            Some(&mut s),
+            &dir,
+            &dir,
+            None,
+        )
+        .unwrap();
+        assert!(q.contains("quietStartup"), "{q}");
+        assert!(s.quiet_startup());
         let listed = handle_settings_cmd("/settings", Some(&mut s), &dir, &dir, None).unwrap();
         assert!(listed.contains("theme"), "{listed}");
         assert!(listed.contains("light"), "{listed}");
+        assert!(listed.contains("quietStartup"), "{listed}");
 
         std::fs::write(dir.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
         let mut loaded = rupi_config::Settings::default();

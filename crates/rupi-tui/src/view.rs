@@ -171,9 +171,11 @@ impl ChatView {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
+                cache_read,
+                cache_write,
             } => {
                 self.lines.push(Line::System(format!(
-                    "· usage in={input_tokens} out={output_tokens}"
+                    "· usage in={input_tokens} out={output_tokens} R={cache_read} W={cache_write}"
                 )));
             }
             AgentEvent::Error { message } => {

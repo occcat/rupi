@@ -399,6 +399,8 @@ pub fn parse_anthropic_response(v: serde_json::Value) -> anyhow::Result<super::C
 pub struct AnthropicAccumulator {
     /// `message_start` 给出的输入 token 数；`message_delta` 时与输出数一并推 Usage。
     pub input_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     text: String,
     frags: Vec<Frag>,
     pub stop_reason: Option<String>,
@@ -503,28 +505,45 @@ impl AnthropicAccumulator {
                 }
             }
             "message_start" => {
-                if let Some(n) = data
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(|x| x.as_u64())
-                {
-                    self.input_tokens = n;
+                if let Some(u) = data.pointer("/message/usage") {
+                    let (input, _, cache_read, cache_write) = super::parse_provider_usage(u);
+                    if input > 0 {
+                        self.input_tokens = input;
+                    }
+                    if cache_read > 0 {
+                        self.cache_read = cache_read;
+                    }
+                    if cache_write > 0 {
+                        self.cache_write = cache_write;
+                    }
                 }
             }
             "message_delta" => {
                 if let Some(s) = data.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
                     self.stop_reason = Some(s.to_string());
                 }
-                // usage：message_start 给 input_tokens，message_delta 给累计 output_tokens
-                if let Some(n) = data
-                    .pointer("/usage/output_tokens")
-                    .and_then(|x| x.as_u64())
-                {
-                    let _ = tx
-                        .send(super::StreamEvent::Usage {
-                            input: self.input_tokens,
-                            output: n,
-                        })
-                        .await;
+                // usage：message_start 给 input/cache，message_delta 给累计 output（也可能带回 cache）
+                if let Some(u) = data.get("usage") {
+                    let (input, output, cache_read, cache_write) = super::parse_provider_usage(u);
+                    if input > 0 {
+                        self.input_tokens = input;
+                    }
+                    if cache_read > 0 {
+                        self.cache_read = cache_read;
+                    }
+                    if cache_write > 0 {
+                        self.cache_write = cache_write;
+                    }
+                    if output > 0 || self.input_tokens > 0 || self.cache_read > 0 {
+                        let _ = tx
+                            .send(super::StreamEvent::Usage {
+                                input: self.input_tokens,
+                                output,
+                                cache_read: self.cache_read,
+                                cache_write: self.cache_write,
+                            })
+                            .await;
+                    }
                 }
             }
             _ => {}
@@ -1378,6 +1397,43 @@ mod tests {
         assert_eq!(
             headers.get("x-session-id").map(String::as_str),
             Some("sess-7")
+        );
+    }
+
+    #[tokio::test]
+    async fn accumulator_emits_cache_read_write() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = AnthropicAccumulator::default();
+        acc.apply_event(
+            "message_start",
+            &serde_json::json!({
+                "message": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "cache_read_input_tokens": 150,
+                        "cache_creation_input_tokens": 20
+                    }
+                }
+            }),
+            &tx,
+        )
+        .await;
+        acc.apply_event(
+            "message_delta",
+            &serde_json::json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}),
+            &tx,
+        )
+        .await;
+        drop(tx);
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(
+            ev,
+            super::super::StreamEvent::Usage {
+                input: 200,
+                output: 7,
+                cache_read: 150,
+                cache_write: 20,
+            }
         );
     }
 }

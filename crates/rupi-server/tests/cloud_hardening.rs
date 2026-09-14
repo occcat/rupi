@@ -476,6 +476,8 @@ impl LlmProvider for UsageProvider {
             .send(StreamEvent::Usage {
                 input: self.input,
                 output: self.output,
+                cache_read: 0,
+                cache_write: 0,
             })
             .await;
         Ok(resp)

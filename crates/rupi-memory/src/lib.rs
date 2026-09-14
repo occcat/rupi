@@ -1062,9 +1062,10 @@ pub struct SessionMessageRow {
 pub mod session_io;
 pub use session_io::{
     export_store_html, export_store_jsonl, export_tree_html, export_tree_jsonl, fork_session,
-    format_session_status, import_into_store, import_jsonl, looks_like_session_path, open_session,
-    persist_tree, remap_tree, resolve_session_id, resolve_session_ref, restore_tree,
-    tree_from_records, ImportedSession, OpenedSession, SessionHeader,
+    format_session_status, import_into_store, import_jsonl, looks_like_session_path,
+    message_blocks_json, open_session, persist_tree, remap_tree, resolve_session_id,
+    resolve_session_ref, restore_tree, tree_from_records, usage_from_blocks_json, ImportedSession,
+    OpenedSession, SessionHeader,
 };
 
 /// 用户查询转 FTS5 短语：裸 `-` / `:` / `*` 等会被当运算符导致 syntax error，

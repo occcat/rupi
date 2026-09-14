@@ -498,16 +498,16 @@ impl super::LlmProvider for GeminiProvider {
                 }
                 // usageMetadata 每块都可能带（累计值），以最后一次为准
                 if let Some(u) = v.get("usageMetadata") {
-                    let input = u
-                        .get("promptTokenCount")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    let output = u
-                        .get("candidatesTokenCount")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    if input > 0 || output > 0 {
-                        let _ = tx.send(super::StreamEvent::Usage { input, output }).await;
+                    let (input, output, cache_read, cache_write) = super::parse_provider_usage(u);
+                    if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
+                        let _ = tx
+                            .send(super::StreamEvent::Usage {
+                                input,
+                                output,
+                                cache_read,
+                                cache_write,
+                            })
+                            .await;
                     }
                 }
                 acc.apply_response(&v, &tx).await;

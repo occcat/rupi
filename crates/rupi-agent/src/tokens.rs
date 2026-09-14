@@ -99,8 +99,12 @@ pub struct TokenMeter {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     pub last_input: u64,
     pub last_output: u64,
+    pub last_cache_read: u64,
+    pub last_cache_write: u64,
     pub last_estimate: u64,
     /// provider_input / estimate；无校准为 1.0。
     pub ratio: f64,
@@ -113,8 +117,12 @@ impl Default for TokenMeter {
             model: String::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
             last_input: 0,
             last_output: 0,
+            last_cache_read: 0,
+            last_cache_write: 0,
             last_estimate: 0,
             ratio: 1.0,
             context_window: DEFAULT_CONTEXT_WINDOW,
@@ -147,11 +155,26 @@ impl TokenMeter {
 
     /// 记下本轮 provider usage，并用本轮送出估算校准。
     pub fn note_usage(&mut self, input: u64, output: u64, estimated_input: u64) {
+        self.note_usage_cache(input, output, 0, 0, estimated_input);
+    }
+
+    pub fn note_usage_cache(
+        &mut self,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        estimated_input: u64,
+    ) {
         self.last_input = input;
         self.last_output = output;
+        self.last_cache_read = cache_read;
+        self.last_cache_write = cache_write;
         self.last_estimate = estimated_input;
         self.input_tokens = self.input_tokens.saturating_add(input);
         self.output_tokens = self.output_tokens.saturating_add(output);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
+        self.cache_write = self.cache_write.saturating_add(cache_write);
         if estimated_input > 0 && input > 0 {
             let r = input as f64 / estimated_input as f64;
             if r.is_finite() && r > 0.1 && r < 10.0 {
@@ -179,12 +202,22 @@ impl TokenMeter {
         (context_tokens as f64) * 100.0 / (self.context_window as f64)
     }
 
-    /// 状态栏：`↑1.2k ↓340 12% $0.004`
+    pub fn cache_hit_pct(&self) -> f64 {
+        if self.input_tokens == 0 {
+            return 0.0;
+        }
+        (self.cache_read as f64) * 100.0 / (self.input_tokens as f64)
+    }
+
+    /// 状态栏：`↑1.2k ↓340 R1.0k W200 CH83% 12% $0.004`
     pub fn footer(&self, context_tokens: u64) -> String {
         format!(
-            "↑{} ↓{} {:.0}% ${}",
+            "↑{} ↓{} R{} W{} CH{:.0}% {:.0}% ${}",
             fmt_tokens(self.input_tokens),
             fmt_tokens(self.output_tokens),
+            fmt_tokens(self.cache_read),
+            fmt_tokens(self.cache_write),
+            self.cache_hit_pct(),
             self.context_pct(context_tokens),
             fmt_usd(self.cost_usd())
         )
@@ -236,9 +269,24 @@ mod tests {
         let line = m.footer(12_800);
         assert!(line.contains('↑'), "{line}");
         assert!(line.contains('↓'), "{line}");
+        assert!(line.contains('R'), "{line}");
+        assert!(line.contains('W'), "{line}");
+        assert!(line.contains("CH"), "{line}");
         assert!(line.contains('%'), "{line}");
         assert!(line.contains('$'), "{line}");
         assert_eq!(fmt_tokens(1500), "1.5k");
         assert_eq!(fmt_tokens(42), "42");
+    }
+
+    #[test]
+    fn meter_footer_shows_cache_hit() {
+        let mut m = TokenMeter::new("claude-sonnet-4-5");
+        m.note_usage_cache(200, 20, 150, 10, 200);
+        assert_eq!(m.cache_read, 150);
+        assert_eq!(m.cache_write, 10);
+        let line = m.footer(20_000);
+        assert!(line.contains("R150"), "{line}");
+        assert!(line.contains("W10"), "{line}");
+        assert!(line.contains("CH75%"), "{line}");
     }
 }
