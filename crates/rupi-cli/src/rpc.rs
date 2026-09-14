@@ -2,10 +2,16 @@
 //!
 //! 记录分隔符只认 LF；输入行尾 `\r` 会剥掉。事件沿用 `AgentEvent` 的 serde 形状
 //!（`type` 字段）；命令回包为 `{type:"response", command, success, id?}`。
+//!
+//! `bash` / `abort_bash`：可取消句柄。本机 `sh -c` 与远程 Executor 共用同一条路——
+//! 取消只置位 [`CancelFlag`]，杀进程 / 打远端 abort 由已注册 `bash` 工具的
+//! `execute_with_cancel` 落地。stdin 在命令进行中继续读，避免 `abort_bash` 排在
+//! 它所要取消的 `bash` 后面。
 
 use rupi_agent::{AgentSession, MessageInbox, QueueMode, QueuedImage, QueuedMessage};
-use rupi_core::{AgentEvent, CancelFlag};
+use rupi_core::{AgentEvent, CancelFlag, Message, Role};
 use rupi_llm::ThinkingLevel;
+use rupi_tools::ToolOutput;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
@@ -43,6 +49,18 @@ pub struct RpcCommand {
     pub name: Option<String>,
     #[serde(default, rename = "entryId")]
     pub entry_id: Option<String>,
+    /// Pi RPC `bash.command`。
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default, rename = "excludeFromContext")]
+    pub exclude_from_context: Option<bool>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default, rename = "timeout_secs")]
+    pub timeout_secs: Option<u64>,
+    /// `abort_bash` 可点名取消的句柄（默认取消当前进行中的那一个）。
+    #[serde(default)]
+    pub handle: Option<String>,
 }
 
 /// Pi RPC `images[]`：`{type, data, mimeType}`。
@@ -119,6 +137,118 @@ fn emit_event(e: &AgentEvent) {
     }
 }
 
+/// 一次 RPC `bash` 的可取消句柄（本机进程组或远程 Executor 工具都认这面旗）。
+struct BashJob {
+    handle: String,
+    cancel: CancelFlag,
+}
+
+fn bash_timeout_secs(cmd: &RpcCommand) -> u64 {
+    cmd.timeout_secs.or(cmd.timeout).unwrap_or(30).clamp(1, 300)
+}
+
+fn bash_handle_id(cmd: &RpcCommand) -> String {
+    cmd.id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn has_bash_tool(session: &AgentSession) -> bool {
+    session.tools.names().iter().any(|n| n == "bash")
+}
+
+fn record_bash_context(session: &mut AgentSession, command: &str, output: &str) {
+    let text = format!("Ran `{command}`\n```\n{output}\n```");
+    session.session.push(Message::text(Role::User, text));
+}
+
+fn split_exit_tool_output(content: &str) -> (Option<i32>, &str) {
+    // BashTool 失败：`exit {ExitStatus}: {output}`，Unix 上 Display 为
+    // `exit status: N` 或 `signal: N`。
+    if let Some(rest) = content.strip_prefix("exit exit status: ") {
+        if let Some((code, out)) = rest.split_once(": ") {
+            return (code.parse().ok(), out);
+        }
+        return (rest.parse().ok(), "");
+    }
+    if let Some(rest) = content.strip_prefix("exit signal: ") {
+        if let Some((_, out)) = rest.split_once(": ") {
+            return (None, out);
+        }
+        return (None, "");
+    }
+    (None, content)
+}
+
+fn bash_output_text(content: &str) -> String {
+    if let Some(rest) = content.strip_prefix("cancelled by user") {
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        return rest
+            .strip_prefix("[partial output]\n")
+            .unwrap_or(rest)
+            .to_string();
+    }
+    if content.starts_with("exit ") {
+        return split_exit_tool_output(content).1.to_string();
+    }
+    content.to_string()
+}
+
+fn bash_result_from_tool(out: &ToolOutput, handle: &str) -> Value {
+    let cancelled = out.is_error && out.content.contains("cancelled by user");
+    let timed_out = out.is_error && out.content.contains("command timed out");
+    let truncated = out.content.contains("[truncated:");
+    let output = bash_output_text(&out.content);
+    let exit_code = if cancelled || timed_out {
+        Value::Null
+    } else if !out.is_error {
+        json!(0)
+    } else {
+        split_exit_tool_output(&out.content)
+            .0
+            .map(|n| json!(n))
+            .unwrap_or(Value::Null)
+    };
+    json!({
+        "output": output,
+        "exitCode": exit_code,
+        "cancelled": cancelled,
+        "truncated": truncated,
+        "handle": handle,
+    })
+}
+
+fn emit_bash_update(id: Option<&str>, handle: &str, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    let mut v = json!({
+        "type": "bash_execution_update",
+        "delta": delta,
+        "handle": handle,
+    });
+    v["id"] = json!(id.unwrap_or(handle));
+    emit(&v);
+}
+
+fn abort_bash_job(job: &BashJob, cmd: &RpcCommand) {
+    if let Some(h) = cmd
+        .handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if h == job.handle {
+            job.cancel.cancel();
+        }
+        return;
+    }
+    job.cancel.cancel();
+}
+
 /// 驱动 RPC 循环直到 stdin EOF。诊断走 stderr。
 pub async fn serve(mut session: AgentSession) -> anyhow::Result<AgentSession> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -142,6 +272,10 @@ pub async fn serve(mut session: AgentSession) -> anyhow::Result<AgentSession> {
                 continue;
             }
         }
+        if cmd.typ == "bash" {
+            run_bash(&mut session, &cmd, &mut lines).await?;
+            continue;
+        }
         dispatch(&mut session, &cmd).await?;
     }
     Ok(session)
@@ -163,6 +297,12 @@ async fn dispatch(session: &mut AgentSession, cmd: &RpcCommand) -> anyhow::Resul
         "abort" => {
             session.abort();
             emit(&response_ok(id, "abort", None));
+        }
+        "abort_bash" => {
+            emit(&response_ok(id, "abort_bash", None));
+        }
+        "bash" => {
+            emit(&response_err(id, "bash", "missing command"));
         }
         "clear_queue" => {
             let (steering, follow_up) = session.clear_queue();
@@ -450,6 +590,104 @@ async fn run_prompt<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(())
 }
 
+/// 跑一条 RPC `bash`：stdin 继续读，使 `abort_bash` 能取消当前句柄。
+async fn run_bash<R: tokio::io::AsyncBufRead + Unpin>(
+    session: &mut AgentSession,
+    cmd: &RpcCommand,
+    lines: &mut tokio::io::Lines<R>,
+) -> anyhow::Result<()> {
+    let id = cmd.id.as_deref();
+    let command = cmd.command.as_deref().unwrap_or("").trim();
+    if command.is_empty() {
+        emit(&response_err(id, "bash", "missing command"));
+        return Ok(());
+    }
+    if !has_bash_tool(session) {
+        emit(&response_err(id, "bash", "bash tool is not registered"));
+        return Ok(());
+    }
+
+    let handle = bash_handle_id(cmd);
+    let job = BashJob {
+        handle: handle.clone(),
+        cancel: CancelFlag::new(),
+    };
+    let args = json!({
+        "command": command,
+        "timeout_secs": bash_timeout_secs(cmd),
+    });
+    let tools = session.tools.clone();
+    let cancel = job.cancel.clone();
+    let fut = tools.execute_with_cancel("bash", args, &cancel);
+    tokio::pin!(fut);
+
+    let mut stdin_open = true;
+    let out = loop {
+        tokio::select! {
+            biased;
+            res = &mut fut => {
+                break match res {
+                    Ok(o) => o,
+                    Err(e) => {
+                        emit(&response_err(id, "bash", format!("{e:#}")));
+                        return Ok(());
+                    }
+                };
+            }
+            line = lines.next_line(), if stdin_open => {
+                match line {
+                    Ok(Some(l)) => match parse_line(&l) {
+                        Ok(None) => {}
+                        Ok(Some(c)) => handle_during_bash(&job, &c),
+                        Err(e) => emit(&response_err(None, "unknown", e.to_string())),
+                    },
+                    Ok(None) | Err(_) => stdin_open = false,
+                }
+            }
+        }
+    };
+
+    let data = bash_result_from_tool(&out, &job.handle);
+    if let Some(delta) = data.get("output").and_then(|v| v.as_str()) {
+        emit_bash_update(id, &job.handle, delta);
+    }
+    if !cmd.exclude_from_context.unwrap_or(false) {
+        record_bash_context(session, command, data["output"].as_str().unwrap_or(""));
+    }
+    emit(&response_ok(id, "bash", Some(data)));
+    Ok(())
+}
+
+fn handle_during_bash(job: &BashJob, cmd: &RpcCommand) {
+    let id = cmd.id.as_deref();
+    match cmd.typ.as_str() {
+        "abort_bash" => {
+            abort_bash_job(job, cmd);
+            emit(&response_ok(id, "abort_bash", None));
+        }
+        "abort" => {
+            job.cancel.cancel();
+            emit(&response_ok(id, "abort", None));
+        }
+        "get_state" => {
+            emit(&response_ok(
+                id,
+                "get_state",
+                Some(json!({
+                    "isStreaming": false,
+                    "bashHandle": job.handle,
+                    "pendingMessageCount": 0,
+                })),
+            ));
+        }
+        other => emit(&response_err(
+            id,
+            other,
+            format!("{other} not available while bash is running"),
+        )),
+    }
+}
+
 struct StateSnap {
     session_id: String,
     session_name: Option<String>,
@@ -494,6 +732,9 @@ fn handle_during_prompt(
         "abort" => {
             cancel.cancel();
             emit(&response_ok(id, "abort", None));
+        }
+        "abort_bash" => {
+            emit(&response_ok(id, "abort_bash", None));
         }
         "clear_queue" => {
             let (steering, follow_up) = inbox.clear();
@@ -604,5 +845,148 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(c.entry_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn bash_and_abort_fields() {
+        let c = parse_line(
+            r#"{"id":"req-1","type":"bash","command":"ls -la","excludeFromContext":true,"timeout_secs":12}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.typ, "bash");
+        assert_eq!(c.command.as_deref(), Some("ls -la"));
+        assert_eq!(c.exclude_from_context, Some(true));
+        assert_eq!(bash_timeout_secs(&c), 12);
+        assert_eq!(bash_handle_id(&c), "req-1");
+
+        let a = parse_line(r#"{"id":"a1","type":"abort_bash","handle":"req-1"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.typ, "abort_bash");
+        assert_eq!(a.handle.as_deref(), Some("req-1"));
+    }
+
+    #[test]
+    fn bash_result_maps_ok_cancel_exit() {
+        let ok = bash_result_from_tool(&ToolOutput::ok("hello"), "h1");
+        assert_eq!(ok["exitCode"], 0);
+        assert_eq!(ok["cancelled"], false);
+        assert_eq!(ok["truncated"], false);
+        assert_eq!(ok["handle"], "h1");
+        assert_eq!(ok["output"], "hello");
+
+        let cancel = bash_result_from_tool(
+            &ToolOutput::err("cancelled by user\n[partial output]\npartial"),
+            "h1",
+        );
+        assert_eq!(cancel["cancelled"], true);
+        assert_eq!(cancel["exitCode"], Value::Null);
+        assert_eq!(cancel["output"], "partial");
+
+        let fail = bash_result_from_tool(&ToolOutput::err("exit exit status: 7: boom"), "h1");
+        assert_eq!(fail["exitCode"], 7);
+        assert_eq!(fail["cancelled"], false);
+        assert_eq!(fail["output"], "boom");
+
+        let trunc = bash_result_from_tool(
+            &ToolOutput::ok("tail\n\n[truncated: kept last 1 / 9 lines, 4B / 9B]"),
+            "h1",
+        );
+        assert_eq!(trunc["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn bash_result_maps_real_tool_output() {
+        let tools = rupi_tools::ToolRegistry::with_builtins();
+        let ok = tools
+            .execute(
+                "bash",
+                json!({"command": "printf 'hello-map\\n'", "timeout_secs": 10}),
+            )
+            .await
+            .unwrap();
+        let data = bash_result_from_tool(&ok, "h");
+        assert_eq!(data["exitCode"], 0);
+        assert_eq!(data["cancelled"], false);
+        assert!(
+            data["output"].as_str().unwrap().contains("hello-map"),
+            "{}",
+            data
+        );
+
+        let fail = tools
+            .execute("bash", json!({"command": "exit 7", "timeout_secs": 10}))
+            .await
+            .unwrap();
+        let data = bash_result_from_tool(&fail, "h");
+        assert_eq!(data["exitCode"], 7, "{data}");
+        assert!(!data["output"].as_str().unwrap().contains("exit exit"));
+    }
+
+    #[tokio::test]
+    async fn run_bash_abort_handle_is_not_serialized() {
+        let mut session =
+            rupi_agent::create_agent_session(Arc::new(rupi_llm::MockProvider::new(vec![])));
+        let stdin = "{\"id\":\"a\",\"type\":\"abort_bash\"}\n";
+        let mut lines = BufReader::new(stdin.as_bytes()).lines();
+        let cmd = parse_line(r#"{"id":"b","type":"bash","command":"sleep 30","timeout_secs":60}"#)
+            .unwrap()
+            .unwrap();
+        let start = std::time::Instant::now();
+        run_bash(&mut session, &cmd, &mut lines).await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(8),
+            "abort_bash must cancel the in-flight handle, not wait for sleep"
+        );
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| m.full_text().contains("sleep 30")),
+            "cancelled bash still recorded for the next prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_exclude_from_context_and_missing_command() {
+        let mut session =
+            rupi_agent::create_agent_session(Arc::new(rupi_llm::MockProvider::new(vec![])));
+        let mut empty = BufReader::new(&b""[..]).lines();
+        let skip = parse_line(
+            r#"{"id":"x","type":"bash","command":"printf 'secret-not-in-ctx\\n'","excludeFromContext":true}"#,
+        )
+        .unwrap()
+        .unwrap();
+        run_bash(&mut session, &skip, &mut empty).await.unwrap();
+        assert!(
+            session
+                .messages()
+                .iter()
+                .all(|m| !m.full_text().contains("secret-not-in-ctx")),
+            "excludeFromContext must skip the session tree"
+        );
+
+        let mut empty = BufReader::new(&b""[..]).lines();
+        let missing = parse_line(r#"{"id":"z","type":"bash"}"#).unwrap().unwrap();
+        run_bash(&mut session, &missing, &mut empty).await.unwrap();
+    }
+
+    #[test]
+    fn abort_bash_job_matches_handle() {
+        let job = BashJob {
+            handle: "req-1".into(),
+            cancel: CancelFlag::new(),
+        };
+        let other = parse_line(r#"{"type":"abort_bash","handle":"nope"}"#)
+            .unwrap()
+            .unwrap();
+        abort_bash_job(&job, &other);
+        assert!(!job.cancel.is_cancelled());
+        let hit = parse_line(r#"{"type":"abort_bash","handle":"req-1"}"#)
+            .unwrap()
+            .unwrap();
+        abort_bash_job(&job, &hit);
+        assert!(job.cancel.is_cancelled());
     }
 }

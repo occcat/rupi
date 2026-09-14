@@ -137,6 +137,88 @@ fn rpc_set_model_session_fork_images_and_commands() {
 }
 
 #[test]
+fn rpc_bash_records_and_abort_bash_cancels() {
+    let home = fresh_home();
+    let mut child = rupi(&home, &["--mode", "rpc", "--no-approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sin = child.stdin.take().unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"b","type":"bash","command":"printf 'hello-rpc-bash\n'"}}"#
+        )
+        .unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"x","type":"bash","command":"printf 'secret-not-in-ctx\n'","excludeFromContext":true}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"m","type":"get_messages"}}"#).unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "rpc bash 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    assert!(
+        !out.contains(r#"unknown command: bash"#),
+        "bash 仍落到 unknown:\n{out}"
+    );
+    assert!(out.contains(r#""command":"bash""#), "{out}");
+    assert!(out.contains("hello-rpc-bash"), "{out}");
+    assert!(out.contains(r#""handle":"b""#), "{out}");
+    assert!(out.contains("bash_execution_update"), "{out}");
+    assert!(
+        out.contains("Ran `printf 'hello-rpc-bash") || out.contains("hello-rpc-bash"),
+        "get_messages 应含 bash 上下文:\n{out}"
+    );
+    let secret_in_messages = out
+        .lines()
+        .filter(|l| l.contains(r#""command":"get_messages""#))
+        .any(|l| l.contains("secret-not-in-ctx"));
+    assert!(!secret_in_messages, "excludeFromContext 不应进会话:\n{out}");
+
+    let home = fresh_home();
+    let started = std::time::Instant::now();
+    let mut child = rupi(&home, &["--mode", "rpc", "--no-approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sin = child.stdin.take().unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"s","type":"bash","command":"sleep 30","timeout_secs":60}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"a","type":"abort_bash"}}"#).unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "abort_bash 应取消句柄，不能等 sleep 结束:\nstdout={out}\nstderr={err}"
+    );
+    assert!(
+        o.status.success(),
+        "rpc abort_bash 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    assert!(
+        !out.contains(r#"unknown command: abort_bash"#),
+        "abort_bash 仍落到 unknown:\n{out}"
+    );
+    assert!(out.contains(r#""command":"abort_bash""#), "{out}");
+    assert!(out.contains(r#""cancelled":true"#), "{out}");
+}
+
+#[test]
 fn chat_settings_slash_persists_and_trust_never_skips() {
     let home = fresh_home();
     let o = chat_with(
