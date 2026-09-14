@@ -570,10 +570,8 @@ mod tests {
             .expect("in-volume bash must start");
         assert!(
             inside.stdout.contains("IN-VOLUME"),
-            "in-volume bash failed: exit={} stdout={:?} stderr={:?}",
-            inside.exit_code,
-            inside.stdout,
-            inside.stderr
+            "in-volume bash failed: {}",
+            jail::macos_sandbox_diag(&b.dir, inside.exit_code, &inside.stdout, &inside.stderr)
         );
         let escaped = format!(
             "cat {} 2>/dev/null || cat ../{}/s1/{}/secret.txt 2>/dev/null || cat ../../ten-a/s1/{}/secret.txt 2>/dev/null; echo DONE",
@@ -588,10 +586,8 @@ mod tests {
             .expect("jailed bash must start");
         assert!(
             out.stdout.contains("DONE"),
-            "jailed bash did not finish: exit={} stdout={:?} stderr={:?}",
-            out.exit_code,
-            out.stdout,
-            out.stderr
+            "jailed bash did not finish: {}",
+            jail::macos_sandbox_diag(&b.dir, out.exit_code, &out.stdout, &out.stderr)
         );
         assert!(
             !out.stdout.contains("NEIGHBOR-SECRET"),
@@ -623,10 +619,8 @@ mod tests {
             .expect("sandbox in-volume bash must start");
         assert!(
             inside.stdout.contains("IN-VOLUME"),
-            "sandbox in-volume bash failed: exit={} stdout={:?} stderr={:?}",
-            inside.exit_code,
-            inside.stdout,
-            inside.stderr
+            "sandbox in-volume bash failed: {}",
+            jail::macos_sandbox_diag(&b.dir, inside.exit_code, &inside.stdout, &inside.stderr)
         );
         let escaped = format!(
             "cat {} 2>/dev/null; cat {} 2>/dev/null; echo DONE",
@@ -639,10 +633,8 @@ mod tests {
             .expect("sandbox jailed bash must start");
         assert!(
             out.stdout.contains("DONE"),
-            "sandbox jailed bash did not finish: exit={} stdout={:?} stderr={:?}",
-            out.exit_code,
-            out.stdout,
-            out.stderr
+            "sandbox jailed bash did not finish: {}",
+            jail::macos_sandbox_diag(&b.dir, out.exit_code, &out.stdout, &out.stderr)
         );
         assert!(
             !out.stdout.contains("NEIGHBOR-SECRET"),

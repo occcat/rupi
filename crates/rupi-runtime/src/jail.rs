@@ -324,51 +324,34 @@ fn escape_sb(root: &Path) -> String {
 /// macOS seatbelt：deny-default，只放行跑 `/bin/sh` 与句柄根所需路径。
 /// 全平台可生成，供回归断言，避免再写成 `(allow default)`。
 ///
-/// Tokio 管道是 FIFO vnode，不是 `/dev/fd/N`；缺 FIFO write 时 echo 会
-/// `exit=1 stdout="" stderr=""`。SBPL 没有 `PIPE`，vnode 名是 `FIFO`。
+/// GH Actions runner 上 dyld shared cache 的路径不固定，`file-map-executable`
+/// 与 `process-exec*` 不能只绑几个 literal。读文件仍只放行系统树和句柄根；
+/// `/System` 可能 firmlink 到 Data，后面再 deny 邻居 tmp / `/Users`。
 pub fn macos_sandbox_profile(root: &Path) -> String {
     let root_s = escape_sb(root);
     format!(
         r##"(version 1)
 (deny default)
 (allow process-fork)
-(allow process-info* (target self))
+(allow process-exec*)
+(allow process-info*)
+(allow process-codesigning-status*)
 (allow signal)
 (allow sysctl*)
 (allow mach-lookup)
 (allow mach-register)
+(allow mach-priv-host-port)
 (allow ipc-posix-shm*)
 (allow ipc-posix-sem*)
+(allow system-socket)
 (allow file-read-metadata)
-(allow process-exec*
-  (literal "/bin/sh")
-  (literal "/bin/bash")
-  (literal "/usr/bin/env")
-  (literal "/usr/bin/true")
-  (literal "/usr/bin/false")
-  (subpath "/bin")
-  (subpath "/usr/bin")
-  (subpath "/usr/libexec")
-  (subpath "/usr/sbin")
-  (subpath "/System")
-  (subpath "/Library")
-  (subpath "/System/Cryptexes")
-)
-(allow file-map-executable
-  (literal "/usr/lib/dyld")
-  (literal "/usr/lib/libSystem.B.dylib")
-  (subpath "/usr/lib")
-  (subpath "/usr/lib/system")
-  (subpath "/bin")
-  (subpath "/usr/bin")
-  (subpath "/System")
-  (subpath "/Library")
-  (subpath "/private/var/db/dyld")
-  (subpath "/var/db/dyld")
-  (subpath "/System/Volumes/Preboot")
-  (subpath "/System/Cryptexes")
-)
+(allow file-read-xattr)
+(allow file-map-executable)
+(allow file-ioctl)
 (allow file-read*
+  (literal "/")
+  (literal "/private")
+  (literal "/var")
   (literal "/bin/sh")
   (literal "/bin/bash")
   (literal "/usr/bin/env")
@@ -376,67 +359,124 @@ pub fn macos_sandbox_profile(root: &Path) -> String {
   (literal "/usr/lib/libSystem.B.dylib")
   (subpath "/usr")
   (subpath "/usr/lib")
-  (subpath "/usr/lib/system")
   (subpath "/bin")
   (subpath "/sbin")
   (subpath "/System")
   (subpath "/Library")
-  (subpath "/private/var/db/dyld")
-  (subpath "/var/db/dyld")
-  (subpath "/private/var/db/timezone")
-  (subpath "/System/Volumes/Preboot")
-  (subpath "/System/Cryptexes")
+  (subpath "/private/var/db")
+  (subpath "/var/db")
+  (subpath "/private/etc")
+  (subpath "/etc")
   (subpath "/opt/homebrew")
   (subpath "/opt/local")
-  (literal "/etc")
-  (subpath "/etc")
-  (literal "/private/etc")
-  (subpath "/private/etc")
-  (literal "/dev/null")
-  (literal "/dev/zero")
-  (literal "/dev/random")
-  (literal "/dev/urandom")
-  (literal "/dev/tty")
-  (literal "/dev/stdin")
-  (literal "/dev/stdout")
-  (literal "/dev/stderr")
-  (literal "/dev/dtracehelper")
-  (literal "/dev/dtrussHelper")
-  (regex #"^/dev/fd/")
+  (subpath "/dev")
   (subpath "{root_s}")
 )
 (allow file-read* file-write*
   (subpath "{root_s}")
 )
-(allow file-read-data file-write-data file-ioctl
+(allow file-read* file-write* file-ioctl
   (vnode-type FIFO)
   (vnode-type SOCKET)
   (vnode-type CHARACTER-DEVICE)
 )
-(allow file-write-data
+(allow file-write-data file-ioctl
   (literal "/dev/null")
   (literal "/dev/stdout")
   (literal "/dev/stderr")
   (literal "/dev/tty")
   (regex #"^/dev/fd/")
 )
-(allow file-ioctl
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (literal "/dev/dtrussHelper")
-  (regex #"^/dev/fd/")
+(deny file-read-data
+  (require-all
+    (subpath "/System/Volumes/Data")
+    (require-not (subpath "{root_s}"))
+  )
+)
+(deny file-read-data
+  (require-all
+    (subpath "/private/var/folders")
+    (require-not (subpath "{root_s}"))
+  )
+)
+(deny file-read-data
+  (require-all
+    (subpath "/var/folders")
+    (require-not (subpath "{root_s}"))
+  )
+)
+(deny file-read-data
+  (require-all
+    (subpath "/tmp")
+    (require-not (subpath "{root_s}"))
+  )
+)
+(deny file-read-data
+  (require-all
+    (subpath "/private/tmp")
+    (require-not (subpath "{root_s}"))
+  )
+)
+(deny file-read-data
+  (subpath "/Users")
 )
 "##
     )
 }
 
+/// 测试失败时带上 profile 和实际包装命令，避免再只看到空 stdout/stderr。
+pub fn macos_sandbox_diag(root: &Path, exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    format!(
+        "exit={exit_code} stdout={stdout:?} stderr={stderr:?}\nroot={}\ncmd: /bin/sh -c '/usr/bin/sandbox-exec -f .rupi-macos.sb /bin/sh .rupi-job.sh >.rupi-stdout 2>.rupi-stderr; cat ...; echo sandbox-exec exit=$ec'\nprofile:\n{}",
+        root.display(),
+        macos_sandbox_profile(&root)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// 外层 `/bin/sh` 不进 seatbelt：把 sandbox-exec 的 stdio 接到句柄根里的普通文件，
+/// 再 cat 回 Tokio 管道。这样能看到 sandbox-exec 自己的报错；内层仍是 deny-default。
 #[cfg(target_os = "macos")]
 fn macos_sandbox_command(root: &Path, script: &str) -> Command {
-    let profile = macos_sandbox_profile(root);
-    let mut cmd = Command::new("sandbox-exec");
-    cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(script);
-    apply_stdio(&mut cmd, root);
     use std::os::unix::process::CommandExt as _;
+    let profile = macos_sandbox_profile(root);
+    let sb = root.join(".rupi-macos.sb");
+    let job = root.join(".rupi-job.sh");
+    let so = root.join(".rupi-stdout");
+    let se = root.join(".rupi-stderr");
+    if std::fs::write(&sb, profile.as_bytes()).is_ok()
+        && std::fs::write(&job, script.as_bytes()).is_ok()
+    {
+        let wrapper = format!(
+            "/usr/bin/sandbox-exec -f {sb} /bin/sh {job} > {so} 2> {se}\n\
+             ec=$?\n\
+             cat {so}\n\
+             cat {se} >&2\n\
+             if [ \"$ec\" != \"0\" ]; then echo \"sandbox-exec exit=$ec\" >&2; fi\n\
+             exit $ec\n",
+            sb = sh_quote(&sb),
+            job = sh_quote(&job),
+            so = sh_quote(&so),
+            se = sh_quote(&se),
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(wrapper);
+        apply_stdio(&mut cmd, root);
+        cmd.as_std_mut().process_group(0);
+        return cmd;
+    }
+    let mut cmd = Command::new("/usr/bin/sandbox-exec");
+    cmd.arg("-p")
+        .arg(macos_sandbox_profile(root))
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script);
+    apply_stdio(&mut cmd, root);
     cmd.as_std_mut().process_group(0);
     cmd
 }
@@ -670,6 +710,26 @@ mod tests {
         assert!(!path_inside(root, "a/../../x"));
     }
 
+    fn profile_allows_subpath(p: &str, path: &str) -> bool {
+        let needle = format!("(subpath \"{path}\")");
+        let mut in_allow = false;
+        for line in p.lines() {
+            let t = line.trim();
+            if t.starts_with("(allow ") {
+                in_allow = true;
+            } else if t.starts_with("(deny ") {
+                in_allow = false;
+            }
+            if in_allow && t == needle {
+                return true;
+            }
+            if t == ")" {
+                in_allow = false;
+            }
+        }
+        false
+    }
+
     #[test]
     fn macos_profile_is_deny_default_not_allow_default() {
         let p = macos_sandbox_profile(Path::new("/tmp/slot-root"));
@@ -678,19 +738,28 @@ mod tests {
             !p.contains("(allow default)"),
             "macOS jail must not allow-default: {p}"
         );
+        assert!(p.contains("(allow process-exec*)"), "{p}");
+        assert!(p.contains("(allow file-map-executable)"), "{p}");
+        assert!(p.contains("(allow sysctl*)"), "{p}");
+        assert!(p.contains("(allow mach-lookup)"), "{p}");
+        assert!(p.contains("(allow file-read-metadata)"), "{p}");
         assert!(p.contains("/tmp/slot-root"), "{p}");
-        assert!(p.contains("/dev/fd"), "{p}");
+        assert!(p.contains("/dev"), "{p}");
         assert!(p.contains("/usr"), "{p}");
-        assert!(p.contains("/bin"), "{p}");
+        assert!(p.contains("/usr/lib"), "{p}");
+        assert!(p.contains("/System"), "{p}");
         assert!(p.contains("/bin/sh"), "{p}");
         assert!(p.contains("/usr/lib/dyld"), "{p}");
         assert!(p.contains("/usr/lib/libSystem.B.dylib"), "{p}");
         assert!(p.contains("(vnode-type FIFO)"), "{p}");
         assert!(p.contains("file-write-data"), "{p}");
-        assert!(!p.contains("(subpath \"/Users\")"), "{p}");
-        assert!(!p.contains("(subpath \"/tmp\")"), "{p}");
-        assert!(!p.contains("(subpath \"/private/var/folders\")"), "{p}");
+        assert!(!profile_allows_subpath(&p, "/Users"), "{p}");
+        assert!(!profile_allows_subpath(&p, "/tmp"), "{p}");
+        assert!(!profile_allows_subpath(&p, "/private/var/folders"), "{p}");
         assert!(!p.contains("(vnode-type PIPE)"), "{p}");
+        let d = macos_sandbox_diag(Path::new("/tmp/slot-root"), 1, "", "");
+        assert!(d.contains("sandbox-exec"), "{d}");
+        assert!(d.contains("(deny default)"), "{d}");
     }
 
     #[test]
