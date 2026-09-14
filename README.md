@@ -133,7 +133,7 @@ curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" http://127.0.0.1:8080/v1/me
 | Agent loop | `AgentLoop`：流式助手消息 → 工具 → 再循环。TUI、`run`、`--mode rpc`、云 AG-UI 共用。 |
 | 会话树 | `branch_from` / `rewind_to` / `/goto`。`--session` / `-r` / `--fork` / `--resume` / `--continue`。`/export` JSONL 或 HTML。 |
 | 七工具 + 沙箱 | Read / Write / Edit / Bash / Glob / Grep / Think。REPL/TUI 把文件工具箍在启动 cwd。本机 `bash` 是 `sh -c`。 |
-| Providers | OpenAI 兼容 / Anthropic / Gemini / OpenRouter / Azure / Bedrock / Vertex。真 SSE。思考档 `off\|low\|medium\|high\|xhigh\|max`。 |
+| Providers | OpenAI 兼容 / Anthropic / Gemini / OpenRouter / Azure / Bedrock / Vertex / llama.cpp（本机 OpenAI-compat 预设）。真 SSE。思考档 `off\|low\|medium\|high\|xhigh\|max`。 |
 | MCP | stdio 换行 JSON-RPC，或 Streamable HTTP。`rupi mcp-list`。`prompt_snippet` 必填。 |
 | 记忆 | 本机 Hermes：`MEMORY.md` / `USER.md` / `failures.md`。云权威是 Postgres 行，不是 sandbox 卷上的 markdown。 |
 | Skills / 命令 / 包 | Agent Skills 渐进披露。`~/.rupi/commands/<name>.md`。`rupi install git:` / `npm:`，不跑 npm 脚本。 |
@@ -204,7 +204,7 @@ curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" http://127.0.0.1:8080/v1/me
 
 **CLI 常用 flag。** `--session` / `-r` / `--fork` / `--resume` / `--continue` 续聊；`--no-session` 不落盘。位置参数 `@file`。`--tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools`。`--no-context-files` 跳过 `AGENTS.md` / `CLAUDE.md`。`--plan`、`--subagents`、`--parallel-tools`、`--thinking`。状态栏：`↑↓ tokens / context% / $`。
 
-**模型。** `--model provider/model[:thinking]`。`rupi models` / `--list-models`。显式路由：`openai` / `anthropic` / `gemini` / `openrouter` / `azure` / `bedrock` / `vertex`。压实默认 reserve 16384 / keep 20000；`--compress-threshold` / `--compress-keep` 或 settings `compaction`。
+**模型。** `--model provider/model[:thinking]`。`rupi models` / `--list-models`。显式路由：`openai` / `anthropic` / `gemini` / `openrouter` / `azure` / `bedrock` / `vertex` / `llamacpp`（本机 `127.0.0.1:8080/v1`，无 key 也可）。压实默认 reserve 16384 / keep 20000；`--compress-threshold` / `--compress-keep` 或 settings `compaction`。
 
 **MCP。**
 

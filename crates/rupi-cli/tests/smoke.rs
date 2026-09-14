@@ -305,6 +305,7 @@ fn login_is_stubbed_and_models_catalog_prints() {
     assert!(o.status.success(), "models 非零: {o:?}");
     let (out, _) = out_text(&o);
     assert!(out.contains("vertex/"), "models:\n{out}");
+    assert!(out.contains("llamacpp/"), "models:\n{out}");
 }
 
 #[test]

@@ -83,6 +83,12 @@
       "provider": "vertex",
       "name": "Vertex AI · Gemini 2.5 Pro",
       "context": 1048576
+    },
+    {
+      "id": "local",
+      "provider": "llamacpp",
+      "name": "llama.cpp · loaded model (OpenAI-compat · 127.0.0.1:8080/v1)",
+      "context": 0
     }
   ]
 }
