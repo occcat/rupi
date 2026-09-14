@@ -93,6 +93,7 @@ pub struct KeyTable {
     pub thinking: KeyChord,
     pub fold: KeyChord,
     pub enabled_models: KeyChord,
+    pub editor: KeyChord,
 }
 
 impl Default for KeyTable {
@@ -105,6 +106,7 @@ impl Default for KeyTable {
             thinking: KeyChord::parse("shift+tab").unwrap(),
             fold: KeyChord::parse("ctrl+o").unwrap(),
             enabled_models: KeyChord::parse("ctrl+p").unwrap(),
+            editor: KeyChord::parse("ctrl+e").unwrap(),
         }
     }
 }
@@ -120,6 +122,7 @@ struct FileKeys {
     fold: Option<String>,
     #[serde(alias = "enabledModels")]
     enabled_models: Option<String>,
+    editor: Option<String>,
 }
 
 impl KeyTable {
@@ -135,6 +138,7 @@ impl KeyTable {
                 apply_opt(&mut table.thinking, file.thinking.as_deref());
                 apply_opt(&mut table.fold, file.fold.as_deref());
                 apply_opt(&mut table.enabled_models, file.enabled_models.as_deref());
+                apply_opt(&mut table.editor, file.editor.as_deref());
             }
         }
         for kb in rupi_ext::registered_keybindings() {
@@ -149,6 +153,7 @@ impl KeyTable {
                 "thinking" => table.thinking = chord,
                 "fold" => table.fold = chord,
                 "enabledModels" | "enabled_models" => table.enabled_models = chord,
+                "editor" | "edit" => table.editor = chord,
                 _ => {}
             }
         }
@@ -157,7 +162,7 @@ impl KeyTable {
 
     pub fn describe(&self) -> String {
         format!(
-            "hotkeys (~/.rupi/keybindings.json):\n  send             {}\n  newline          {}\n  paste            {}\n  model            {}\n  enabledModels    {}\n  thinking         {}\n  fold             {}",
+            "hotkeys (~/.rupi/keybindings.json):\n  send             {}\n  newline          {}\n  paste            {}\n  model            {}\n  enabledModels    {}\n  thinking         {}\n  fold             {}\n  editor           {}",
             self.send.as_label(),
             self.newline.as_label(),
             self.paste.as_label(),
@@ -165,6 +170,7 @@ impl KeyTable {
             self.enabled_models.as_label(),
             self.thinking.as_label(),
             self.fold.as_label(),
+            self.editor.as_label(),
         )
     }
 }
@@ -193,6 +199,8 @@ mod tests {
         assert!(t.thinking.matches(&backtab));
         assert_eq!(t.send.as_label(), "Enter");
         assert_eq!(t.newline.as_label(), "Shift+Enter");
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert!(t.editor.matches(&ctrl_e));
         let block = t.describe();
         assert!(
             block.contains("send") && block.contains("Ctrl+V"),

@@ -83,7 +83,7 @@
 
 - oneshot：manifest + 子进程 stdin JSON → stdout（原行为）。
 - **jsonrpc**：长连接双向 JSON-RPC（复用 `rupi_mcp::StdioRpc` 帧）。扩展可 `initialize` 注册斜杠命令、订阅 `tool_call` / `turn_end` / `session_*`，`tools/call` 可回 `ui` hint；运行中 `registerCommand` / `subscribe` / `ui/hint`。
-- 不移植：WASM、注册 provider、自定义编辑器/渲染器、快捷键/flag。
+- 不移植：WASM、Pi 进程内 TypeScript 自定义编辑器/渲染器/widget。工作区文件编辑走 `rupi-tui` 的 Rust 覆盖层（`/edit` / Ctrl+E），不是扩展 UI 协议。
 
 ## CLI / TUI（`packages/coding-agent` CLI）
 
@@ -99,7 +99,7 @@
 | `settings.json` + `SYSTEM.md` | `rupi-config`：`~/.rupi/settings.json` + 上溯 `.rupi/settings.json`；只读合并 `~/.pi/agent/settings.json` / `.pi/settings.json`（同键 rupi 优先）。核心键：`steeringMode` / `followUpMode` / `defaultProjectTrust` / `externalEditor` / `enabledModels`。`/settings` 热改并写回（有项目文件则写项目，否则 `~/.rupi/settings.json`）。`--tools/--exclude-tools/--no-tools/--no-builtin-tools`、`--no-context-files`/`-nc`、`-e/--skill/--no-extensions/--no-skills`、`--system-prompt/--append-system-prompt` |
 | 自定义命令 / prompts | `~/.rupi/commands` 与 `prompts`、`.rupi/` 与只读 `~/.pi/agent` / `.pi` 同展开；`settings.prompts[]` 开关（`off`/`[]` 关默认扫描，路径追加，`!name` 排除）。`$ARGUMENTS` / `$1` / `{{var}}`；JSON-RPC 扩展命令走 `commands/execute`。steer / follow-up 排队不展开 skill/prompt 模板 |
 | `pi install git:/npm:` | `rupi install` / `uninstall` / `packages`（`rupi-pkg`；物化 skill/command/`*.json` 扩展，不跑 npm 脚本；TS 跳过并提示改用 JSON-RPC `*.json`） |
-| TUI | Markdown、工具/思考折叠、主题、`!cmd` / `!!cmd`（后者只回显）、Shift+Enter 换行、括号粘贴（`Event::Paste`，>10 行预览折叠）、Ctrl+V 贴图、Ctrl+L/P 模型（P 走 `enabledModels`）、Shift+Tab 思考档、`~/.rupi/keybindings.json` + 扩展 `registerKeybinding`、Ctrl+G、鼠标、`/tree` 导航器、`/sessions` 选择器、footer、增量渲染 |
+| TUI | Markdown、工具/思考折叠、主题、`!cmd` / `!!cmd`（后者只回显）、Shift+Enter 换行、括号粘贴（`Event::Paste`，>10 行预览折叠）、Ctrl+V 贴图、Ctrl+L/P 模型（P 走 `enabledModels`）、Shift+Tab 思考档、`~/.rupi/keybindings.json` + 扩展 `registerKeybinding`、Ctrl+G 外编输入框、Ctrl+E / `/edit` 进程内工作区编辑器（Rust/TUI，不移植 Pi 进程内 TS UI）、鼠标、`/tree` 导航器、`/sessions` 选择器、footer、增量渲染 |
 | RPC 扩面 | `set_model` / `get_available_models` / `switch_session` / `fork` / `clone` / `get_tree` / `set_session_name` / `get_commands`；`prompt`/`steer`/`follow_up` 的 `images[]`（`{type,data,mimeType}`） |
 | bash 环境 | 子进程继承 `RUPI_SESSION_ID` / `RUPI_SESSION_FILE` / `RUPI_PROVIDER` / `RUPI_MODEL` / `RUPI_REASONING_LEVEL`（对标 `PI_*`） |
 | 扩展 provider | `registerProvider`（OpenAI/Anthropic/Gemini 兼容 `base_url`）写入 `providers.json` 并并入 `models.json`；核心事件 tag：`session_start` / `turn_start` / `turn_end` / `tool_call` / `tool_result` / `model_change` |

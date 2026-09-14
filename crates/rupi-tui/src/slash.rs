@@ -1,4 +1,4 @@
-//! TUI / REPL 斜杠：`/copy` `/hotkeys` `/trust`（纯逻辑，可单测）。
+//! TUI / REPL 斜杠：`/copy` `/hotkeys` `/trust` `/edit`（纯逻辑，可单测）。
 
 use crate::keybindings::KeyTable;
 use crate::view::Line;
@@ -99,11 +99,11 @@ pub fn trust_slash(args: &str, home: &Path, cwd: &Path, policy: &str) -> String 
     }
 }
 
-/// 解析本模块三斜杠；非此三项返回 None。
+/// 解析本模块斜杠；非 copy/hotkeys/trust/edit 返回 None。
 pub fn parse_local_slash(input: &str) -> Option<(&str, &str)> {
     let (name, args) = rupi_core::commands::split(input)?;
     match name {
-        "copy" | "hotkeys" | "trust" => Some((name, args)),
+        "copy" | "hotkeys" | "trust" | "edit" => Some((name, args)),
         _ => None,
     }
 }
@@ -191,6 +191,10 @@ mod tests {
         assert_eq!(
             parse_local_slash("/trust always"),
             Some(("trust", "always"))
+        );
+        assert_eq!(
+            parse_local_slash("/edit src/lib.rs"),
+            Some(("edit", "src/lib.rs"))
         );
         assert!(parse_local_slash("/settings").is_none());
         assert!(parse_local_slash("copy").is_none());
