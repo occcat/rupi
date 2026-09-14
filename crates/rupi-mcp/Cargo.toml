@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true
-description = "MCP bridge: stdio JSON-RPC and Streamable HTTP"
+description = "MCP bridge: stdio JSON-RPC, Streamable HTTP, and WebSocket"
 
 [dependencies]
 rupi-core = { path = "../rupi-core" }
@@ -18,3 +18,4 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

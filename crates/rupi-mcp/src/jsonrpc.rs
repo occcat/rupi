@@ -13,6 +13,37 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>;
 
+/// 把一帧 JSON-RPC 分到挂起的 `call` 或 `Incoming`（stdio / WebSocket 共用）。
+pub async fn dispatch_rpc_value(
+    v: serde_json::Value,
+    pending: &PendingMap,
+    incoming: &mpsc::UnboundedSender<Incoming>,
+) {
+    let id = v.get("id").and_then(|i| i.as_i64());
+    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+        let params = v.get("params").cloned().unwrap_or(serde_json::json!({}));
+        let msg = if let Some(id) = id {
+            Incoming::Request {
+                id,
+                method: method.to_string(),
+                params,
+            }
+        } else {
+            Incoming::Notification {
+                method: method.to_string(),
+                params,
+            }
+        };
+        let _ = incoming.send(msg);
+        return;
+    }
+    if let Some(id) = id {
+        if let Some(tx) = pending.lock().await.remove(&id) {
+            let _ = tx.send(v);
+        }
+    }
+}
+
 /// 对端发来的请求或通知（非本端 `call` 的响应）。
 #[derive(Debug, Clone)]
 pub enum Incoming {
@@ -77,29 +108,7 @@ impl StdioRpc {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let id = v.get("id").and_then(|i| i.as_i64());
-                if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-                    let params = v.get("params").cloned().unwrap_or(serde_json::json!({}));
-                    let msg = if let Some(id) = id {
-                        Incoming::Request {
-                            id,
-                            method: method.to_string(),
-                            params,
-                        }
-                    } else {
-                        Incoming::Notification {
-                            method: method.to_string(),
-                            params,
-                        }
-                    };
-                    let _ = tx_in.send(msg);
-                    continue;
-                }
-                if let Some(id) = id {
-                    if let Some(tx) = pending_route.lock().await.remove(&id) {
-                        let _ = tx.send(v);
-                    }
-                }
+                dispatch_rpc_value(v, &pending_route, &tx_in).await;
             }
         });
 

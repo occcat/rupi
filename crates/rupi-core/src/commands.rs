@@ -168,6 +168,12 @@ impl PromptFilter {
                     continue;
                 }
             }
+            if let Some(name) = s.strip_prefix('+') {
+                if !name.is_empty() && !looks_like_prompt_path(name) {
+                    out.allow.push(name.to_ascii_lowercase());
+                    continue;
+                }
+            }
             if looks_like_prompt_path(s) {
                 out.extra_dirs.push(PathBuf::from(s));
             } else {

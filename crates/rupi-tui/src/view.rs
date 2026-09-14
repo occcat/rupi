@@ -121,13 +121,25 @@ pub fn collapse_paste_preview(text: &str) -> Option<String> {
 
 #[derive(Debug, Default)]
 struct VisualCache {
-    key: u8,
+    key: u64,
     rows: Vec<RLine<'static>>,
     images: Vec<InlineImage>,
     /// 每个逻辑行对应视觉行的起始下标。
     starts: Vec<usize>,
     items: usize,
     last_fp: u64,
+}
+
+fn visual_key(
+    theme: &Theme,
+    tools_folded: bool,
+    thinking_folded: bool,
+    inline_images: bool,
+) -> u64 {
+    theme.id
+        ^ ((u64::from(tools_folded)) << 60)
+        ^ ((u64::from(thinking_folded)) << 61)
+        ^ ((u64::from(inline_images)) << 62)
 }
 
 /// 聊天视图：把 `AgentEvent` 流折叠为行；连续 `TextDelta` 合并进同一行。
@@ -286,10 +298,7 @@ impl ChatView {
         thinking_folded: bool,
         inline_images: bool,
     ) -> &[RLine<'static>] {
-        let key = theme.id
-            | ((tools_folded as u8) << 2)
-            | ((thinking_folded as u8) << 3)
-            | ((inline_images as u8) << 4);
+        let key = visual_key(theme, tools_folded, thinking_folded, inline_images);
         if self.cache.key != key {
             self.rebuild(theme, tools_folded, thinking_folded, inline_images);
             return &self.cache.rows;
@@ -329,10 +338,7 @@ impl ChatView {
         self.cache.images.clear();
         self.cache.starts.clear();
         self.cache.items = 0;
-        self.cache.key = theme.id
-            | ((tools_folded as u8) << 2)
-            | ((thinking_folded as u8) << 3)
-            | ((inline_images as u8) << 4);
+        self.cache.key = visual_key(theme, tools_folded, thinking_folded, inline_images);
         for i in 0..self.lines.len() {
             self.append_item(i, theme, tools_folded, thinking_folded, inline_images);
         }

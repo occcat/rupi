@@ -337,6 +337,7 @@ fn help_lists_key_subcommands() {
         "install",
         "uninstall",
         "packages",
+        "config",
     ] {
         assert!(out.contains(sub), "help 缺子命令 {sub}:\n{out}");
     }
@@ -387,6 +388,12 @@ fn install_local_package_lists_skill_command_ext() {
         r#"{"name":"demo-echo","description":"echo","input_schema":{"type":"object"},"command":"true"}"#,
     )
     .unwrap();
+    std::fs::create_dir_all(pkg.join("themes")).unwrap();
+    std::fs::write(
+        pkg.join("themes/neon.json"),
+        r##"{"name":"neon","colors":{"accent":"#ff00aa"}}"##,
+    )
+    .unwrap();
 
     let o = rupi(&home, &["install", pkg.to_str().unwrap()])
         .output()
@@ -394,7 +401,10 @@ fn install_local_package_lists_skill_command_ext() {
     assert!(o.status.success(), "install 失败: {o:?}");
     let (out, err) = out_text(&o);
     assert!(
-        out.contains("demo-skill") && out.contains("greet") && out.contains("demo-echo"),
+        out.contains("demo-skill")
+            && out.contains("greet")
+            && out.contains("demo-echo")
+            && out.contains("neon"),
         "install 报告缺资源:\n{out}\n{err}"
     );
 
@@ -416,6 +426,33 @@ fn install_local_package_lists_skill_command_ext() {
     let o = rupi(&home, &["packages"]).output().unwrap();
     let (out, _) = out_text(&o);
     assert!(out.contains("local:"), "packages 未列出 local 包:\n{out}");
+    assert!(out.contains("themes=[neon]"), "packages 未见 theme:\n{out}");
+
+    let o = rupi(&home, &["config", "list", "themes"]).output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(o.status.success(), "config list themes 失败:\n{out}\n{err}");
+    assert!(out.contains("neon"), "config 未见 neon:\n{out}");
+    assert!(out.contains("on"), "config neon 应默认启用:\n{out}");
+
+    let o = rupi(&home, &["config", "disable", "themes", "neon"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "config disable 失败: {o:?}");
+    let settings = std::fs::read_to_string(home.join("settings.json")).unwrap();
+    assert!(
+        settings.contains("!neon"),
+        "disable 应写入 !neon:\n{settings}"
+    );
+
+    let o = rupi(&home, &["config", "enable", "themes", "neon"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "config enable 失败: {o:?}");
+    let settings = std::fs::read_to_string(home.join("settings.json")).unwrap();
+    assert!(
+        settings.contains("+neon"),
+        "enable 应写入 +neon:\n{settings}"
+    );
 
     let o = rupi(&home, &["uninstall", pkg.to_str().unwrap()])
         .output()

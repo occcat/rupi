@@ -15,17 +15,26 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 pub mod jsonrpc;
+pub mod ws;
 pub use jsonrpc::{Incoming, StdioRpc};
 
+/// `ws://` / `wss://` 走 WebSocket，其余 URL 走 Streamable HTTP。
+pub fn is_ws_url(url: &str) -> bool {
+    let t = url.trim();
+    let lower = t.to_ascii_lowercase();
+    lower.starts_with("ws://") || lower.starts_with("wss://")
+}
+
 /// MCP server 配置：stdio 是一条命令 + 参数 + 可选环境变量；
-/// StreamableHTTP 是 `url`（`command` 可空，`spawn_all` 按有无 url 分流）。
+/// StreamableHTTP / WebSocket 是 `url`（`command` 可空，`spawn_all` 按 scheme 分流）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
-    /// StreamableHTTP 端点（`POST /mcp` 这类完整 URL）；`None` 走 stdio。
+    /// StreamableHTTP 或 WebSocket 端点；`None` 走 stdio。
+    /// `ws://` / `wss://` 走 WebSocket 文本帧 JSON-RPC。
     #[serde(default)]
     pub url: Option<String>,
 }
@@ -191,12 +200,16 @@ impl SseFramer {
     }
 }
 
-/// 传输层：stdio（子进程，server→client 请求可应答）或
+/// 传输层：stdio（子进程，server→client 请求可应答）、
 /// StreamableHTTP（POST + JSON 或增量 SSE，流内反向请求当场 POST 应答；
-/// 另有独立 GET 常驻流收 server 纯推送，桥 drop 时 abort）。
+/// 另有独立 GET 常驻流收 server 纯推送，桥 drop 时 abort）、
+/// 或 WebSocket（一帧一条 JSON-RPC，反向请求当场写回）。
 enum Transport {
     Stdio {
         rpc: Arc<StdioRpc>,
+    },
+    WebSocket {
+        rpc: Arc<ws::WsRpc>,
     },
     Http {
         client: reqwest::Client,
@@ -312,6 +325,70 @@ impl McpBridge {
         Ok(bridge)
     }
 
+    /// WebSocket 建连：`config.url` 为 `ws://` / `wss://`，一帧一条 JSON-RPC。
+    pub async fn spawn_ws(config: McpServerConfig) -> anyhow::Result<Self> {
+        Self::spawn_ws_inner(config, None).await
+    }
+
+    pub async fn spawn_ws_watched(
+        config: McpServerConfig,
+        watch: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_ws_inner(config, Some(watch)).await
+    }
+
+    async fn spawn_ws_inner(
+        config: McpServerConfig,
+        tool_watch: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<Self> {
+        let url = config
+            .url
+            .clone()
+            .context("MCP websocket transport requires config.url")?;
+        let rpc = Arc::new(
+            ws::WsRpc::connect(&url)
+                .await
+                .with_context(|| format!("connect MCP websocket {url}"))?,
+        );
+        let roots_route = vec![McpRoot::cwd()];
+        let mut incoming = rpc
+            .take_incoming()
+            .await
+            .expect("fresh WsRpc always has incoming");
+        let rpc_write = rpc.clone();
+        let roots_in_task = roots_route.clone();
+        let push_route = PushTarget {
+            watch: tool_watch.clone(),
+            server: config.name.clone(),
+        };
+        tokio::spawn(async move {
+            while let Some(msg) = incoming.recv().await {
+                match msg {
+                    Incoming::Notification { method, .. } => {
+                        note_tools_changed(&push_route, &method, None);
+                    }
+                    Incoming::Request { id, method, .. } => {
+                        if let Some(resp) =
+                            server_request_response(&method, Some(id), &roots_in_task)
+                        {
+                            let _ = rpc_write.write_json(&resp).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let bridge = Self {
+            config,
+            roots: roots_route,
+            next_id: AtomicI64::new(1),
+            tool_watch,
+            transport: Transport::WebSocket { rpc },
+        };
+        bridge.handshake().await?;
+        Ok(bridge)
+    }
+
     /// 建连握手（传输无关）：`initialize` + `notifications/initialized`。
     async fn handshake(&self) -> anyhow::Result<()> {
         self.call(
@@ -380,6 +457,7 @@ impl McpBridge {
         };
         match &self.transport {
             Transport::Stdio { rpc } => rpc.call(method, params).await,
+            Transport::WebSocket { rpc } => rpc.call(method, params).await,
             Transport::Http {
                 client,
                 url,
@@ -693,6 +771,7 @@ impl McpBridge {
     pub async fn notify(&self, method: &str, params: serde_json::Value) -> anyhow::Result<()> {
         match &self.transport {
             Transport::Stdio { rpc } => rpc.notify(method, params).await,
+            Transport::WebSocket { rpc } => rpc.notify(method, params).await,
             // notification 只有 202/空体：call_http 本就按 Null 成功处理，id 仅占位
             Transport::Http {
                 client,
@@ -1284,8 +1363,12 @@ impl McpManager {
     ) -> anyhow::Result<Self> {
         let mut entries = vec![];
         for cfg in configs {
-            // 有 url 走 StreamableHTTP，否则 stdio 子进程
-            let spawned = match (&watch, &cfg.url) {
+            // ws/wss → WebSocket；其余 url → StreamableHTTP；无 url → stdio
+            let spawned = match (&watch, cfg.url.as_deref()) {
+                (Some(w), Some(u)) if is_ws_url(u) => {
+                    McpBridge::spawn_ws_watched(cfg.clone(), w.clone()).await
+                }
+                (None, Some(u)) if is_ws_url(u) => McpBridge::spawn_ws(cfg.clone()).await,
                 (Some(w), Some(_)) => McpBridge::spawn_http_watched(cfg.clone(), w.clone()).await,
                 (Some(w), None) => McpBridge::spawn_watched(cfg.clone(), w.clone()).await,
                 (None, Some(_)) => McpBridge::spawn_http(cfg.clone()).await,

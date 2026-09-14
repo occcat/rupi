@@ -499,6 +499,20 @@ impl SkillRegistry {
         }
     }
 
+    /// 按名过滤（`rupi config` 启停 / 禁用包物化出的 skill）。
+    pub fn retain_allowed<F: Fn(&str) -> bool>(&self, allow: F) {
+        self.skills.write().unwrap().retain(|s| allow(&s.meta.name));
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.skills
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.meta.name.clone())
+            .collect()
+    }
+
     /// RPC `get_commands` 用：(name, description)。
     pub fn command_entries(&self) -> Vec<(String, String)> {
         self.skills

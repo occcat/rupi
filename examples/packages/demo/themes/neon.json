@@ -1,0 +1,19 @@
+{
+  "name": "neon",
+  "vars": {
+    "pink": "#ff00aa"
+  },
+  "colors": {
+    "accent": "pink",
+    "user": "#00ffff",
+    "text": "#f5f5f5",
+    "toolTitle": "#ffff00",
+    "muted": 242,
+    "thinkingText": "#ff66ff",
+    "border": "#888888",
+    "mdHeading": "#ffaa00",
+    "mdCode": "#66ff66",
+    "syntaxKeyword": "#00aaff",
+    "syntaxString": "#00ff88"
+  }
+}
