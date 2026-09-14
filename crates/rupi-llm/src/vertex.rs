@@ -124,6 +124,75 @@ impl super::LlmProvider for VertexProvider {
         parsed.message.provider = Some("vertex".into());
         Ok(parsed)
     }
+
+    /// 接到 trait：`url(true)` → `:streamGenerateContent?alt=sse`，复用 Gemini 累积器。
+    async fn complete_streaming(
+        &self,
+        req: super::ChatRequest,
+        tx: tokio::sync::mpsc::Sender<super::StreamEvent>,
+    ) -> anyhow::Result<super::ChatResponse> {
+        use futures::StreamExt as _;
+        let url = format!("{}?alt=sse", self.url(true));
+        let body = self.body(&req);
+        let key = self.api_key.clone();
+        let resp = super::post_json_with_retry(
+            || {
+                self.client
+                    .post(url.clone())
+                    .header("Authorization", format!("Bearer {key}"))
+            },
+            &body,
+            3,
+        )
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+            let msg = crate::gemini::error_text(&v).unwrap_or("vertex request failed");
+            anyhow::bail!("vertex {status}: {msg}");
+        }
+        let mut stream = resp.bytes_stream();
+        let mut parser = crate::SseParser::default();
+        let mut acc = crate::gemini::GeminiAccumulator::default();
+        'stream: while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            for ev in parser.push_bytes(&chunk) {
+                if ev.data.trim() == "[DONE]" {
+                    break 'stream;
+                }
+                let v: serde_json::Value = match serde_json::from_str(&ev.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("vertex: skip non-JSON sse data ({e})");
+                        continue;
+                    }
+                };
+                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                    anyhow::bail!(
+                        "vertex stream error: {}",
+                        crate::gemini::error_text(&v).unwrap_or(&err.to_string())
+                    );
+                }
+                if let Some(u) = v.get("usageMetadata") {
+                    let (input, output, cache_read, cache_write) = crate::parse_provider_usage(u);
+                    if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
+                        let _ = tx
+                            .send(crate::StreamEvent::Usage {
+                                input,
+                                output,
+                                cache_read,
+                                cache_write,
+                            })
+                            .await;
+                    }
+                }
+                acc.apply_response(&v, &tx).await;
+            }
+        }
+        let mut parsed = acc.finish("STOP");
+        parsed.message.provider = Some("vertex".into());
+        Ok(parsed)
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +210,10 @@ mod tests {
         assert_eq!(
             p.url(false),
             "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent"
+        );
+        assert_eq!(
+            p.url(true),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro:streamGenerateContent"
         );
     }
 
@@ -184,6 +257,70 @@ mod tests {
         assert_eq!(
             body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
             Some(&serde_json::json!("HIGH"))
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_hits_stream_generate_content() {
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n",
+        );
+        let (base, seen) = crate::teststub::start_sse(sse).await;
+        let p = VertexProvider::new(base, "vt".into(), "gemini-2.5-pro".into());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let resp = p
+            .complete_streaming(
+                crate::ChatRequest {
+                    system: "sys".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_tokens: None,
+                    temperature: None,
+                    thinking: None,
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.full_text(), "Hello");
+        assert_eq!(resp.message.provider.as_deref(), Some("vertex"));
+        let path = seen.path.lock().unwrap().clone();
+        assert!(
+            path.contains("/models/gemini-2.5-pro:streamGenerateContent"),
+            "{path}"
+        );
+        assert!(path.contains("alt=sse"), "{path}");
+        assert_eq!(
+            seen.headers
+                .lock()
+                .unwrap()
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer vt")
+        );
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                crate::StreamEvent::Usage {
+                    input: 5,
+                    output: 2,
+                    ..
+                }
+            )),
+            "{events:?}"
         );
     }
 }

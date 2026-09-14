@@ -30,7 +30,12 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "azure",
     "bedrock",
     "vertex",
+    "llamacpp",
+    "llama.cpp",
 ];
+
+/// llama.cpp `llama-server` OpenAI-compat 默认根（`/v1/chat/completions`）。
+pub const LLAMACPP_DEFAULT_BASE: &str = "http://127.0.0.1:8080/v1";
 
 /// 拆 `provider/model[:thinking]`。最后一段若是思考档才剥（Bedrock 的 `:0` 保留）。
 pub fn parse_model_spec(input: &str) -> ModelSpec {
@@ -191,6 +196,7 @@ pub fn provider_from_spec(
             spec.model.clone(),
             key,
         )?)),
+        "llamacpp" | "llama.cpp" => Ok(Box::new(llamacpp_provider(spec, key))),
         "openai" | "openai-compat" => {
             let api_key = pick_key(key, &["RUPI_API_KEY", "OPENAI_API_KEY"])?;
             let base = std::env::var("RUPI_BASE_URL")
@@ -203,9 +209,35 @@ pub fn provider_from_spec(
             )))
         }
         other => anyhow::bail!(
-            "unknown provider '{other}' (openai|anthropic|gemini|openrouter|azure|bedrock|vertex)"
+            "unknown provider '{other}' (openai|anthropic|gemini|openrouter|azure|bedrock|vertex|llamacpp)"
         ),
     }
+}
+
+/// 本机 llama.cpp / 任意 OpenAI-compat server：无 key 也能建（默认不发 Authorization）。
+fn llamacpp_provider(spec: &ModelSpec, key: Option<&str>) -> OpenAiCompatProvider {
+    let api_key = optional_local_key(key, &["RUPI_LLAMACPP_KEY", "LLAMA_API_KEY"]);
+    let base = std::env::var("RUPI_LLAMACPP_BASE")
+        .or_else(|_| std::env::var("LLAMA_CPP_BASE_URL"))
+        .or_else(|_| std::env::var("LLAMA_BASE_URL"))
+        .unwrap_or_else(|_| LLAMACPP_DEFAULT_BASE.to_string());
+    OpenAiCompatProvider::new(base, api_key, spec.model.clone()).with_kind(CompatKind::LlamaCpp)
+}
+
+fn optional_local_key(override_key: Option<&str>, names: &[&str]) -> String {
+    if let Some(k) = override_key {
+        if !k.is_empty() {
+            return k.to_string();
+        }
+    }
+    for n in names {
+        if let Ok(v) = std::env::var(n) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    String::new()
 }
 
 fn provider_from_extra(
@@ -289,6 +321,15 @@ mod tests {
         assert!(d.provider.is_none());
         assert_eq!(d.model, "gpt-4o-mini");
 
+        let llama = parse_model_spec("llamacpp/local:high");
+        assert_eq!(llama.provider.as_deref(), Some("llamacpp"));
+        assert_eq!(llama.model, "local");
+        assert_eq!(llama.thinking, Some(ThinkingLevel::High));
+
+        let llama_dot = parse_model_spec("llama.cpp/qwen2.5");
+        assert_eq!(llama_dot.provider.as_deref(), Some("llama.cpp"));
+        assert_eq!(llama_dot.model, "qwen2.5");
+
         let e = parse_model_spec("claude-sonnet-4-5:max");
         assert!(e.provider.is_none());
         assert_eq!(e.model, "claude-sonnet-4-5");
@@ -358,9 +399,63 @@ mod tests {
         .unwrap();
         assert_eq!(p.name(), "openai-compat");
 
+        // 本机预设：无 key 也能建，不回退 mock
+        let local = provider_from_spec(
+            &parse_model_spec("llamacpp/local"),
+            &ProviderOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(local.name(), "llamacpp");
+        assert_eq!(local.model_id(), Some("local"));
+        let local_alias = provider_from_spec(
+            &parse_model_spec("llama.cpp/qwen"),
+            &ProviderOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(local_alias.name(), "llamacpp");
+
         for (k, v) in saved {
             if let Some(val) = v {
                 unsafe { std::env::set_var(k, val) };
+            }
+        }
+    }
+
+    #[test]
+    fn llamacpp_reads_base_and_optional_key() {
+        let saved: Vec<(&str, Option<String>)> = [
+            "RUPI_LLAMACPP_BASE",
+            "LLAMA_CPP_BASE_URL",
+            "LLAMA_BASE_URL",
+            "RUPI_LLAMACPP_KEY",
+            "LLAMA_API_KEY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        let p = llamacpp_provider(&parse_model_spec("llamacpp/local"), None);
+        assert_eq!(p.base_url, LLAMACPP_DEFAULT_BASE);
+        assert!(p.api_key.is_empty());
+        assert_eq!(p.kind, CompatKind::LlamaCpp);
+
+        unsafe { std::env::set_var("RUPI_LLAMACPP_BASE", "http://127.0.0.1:9999/v1") };
+        unsafe { std::env::set_var("RUPI_LLAMACPP_KEY", "localsecret") };
+        let p = llamacpp_provider(&parse_model_spec("llamacpp/m"), None);
+        assert_eq!(p.base_url, "http://127.0.0.1:9999/v1");
+        assert_eq!(p.api_key, "localsecret");
+
+        let p = llamacpp_provider(&parse_model_spec("llamacpp/m"), Some("cli-key"));
+        assert_eq!(p.api_key, "cli-key");
+
+        for (k, v) in saved {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val) };
+            } else {
+                unsafe { std::env::remove_var(k) };
             }
         }
     }

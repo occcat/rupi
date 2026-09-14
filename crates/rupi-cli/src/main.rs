@@ -76,7 +76,7 @@ fn apply_suggestions(home: &PathBuf, pending: &Arc<std::sync::Mutex<Vec<ReviewSu
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// 模型：`name` 或 `provider/model[:thinking]`（openai|anthropic|gemini|openrouter|azure|bedrock|vertex）。
+    /// 模型：`name` 或 `provider/model[:thinking]`（openai|anthropic|gemini|openrouter|azure|bedrock|vertex|llamacpp）。
     /// 未传时由 settings.json 覆盖，再默认 `gpt-4o-mini`。
     #[arg(long)]
     model: Option<String>,

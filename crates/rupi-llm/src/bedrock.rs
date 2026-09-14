@@ -1,6 +1,7 @@
 //! AWS Bedrock 显式路由：Anthropic Messages 形状 + `anthropic_version`，
 //! 鉴权走 Bearer（`AWS_BEARER_TOKEN_BEDROCK` / `BEDROCK_API_KEY` / `--api-key`）。
-//! 流式默认退化为非流（Bedrock 原生是 eventstream，不在本 PR 解析）。
+//! `complete` / `complete_streaming` 都走 `/invoke`（非流）。原生
+//! `invoke-with-response-stream` 是 eventstream，本模块不解析。
 
 use async_trait::async_trait;
 
@@ -85,6 +86,36 @@ impl BedrockProvider {
         }
         serde_json::Value::Object(inner)
     }
+
+    async fn invoke(&self, req: &super::ChatRequest) -> anyhow::Result<serde_json::Value> {
+        let url = self.invoke_url();
+        let body = self.body(req);
+        let key = self.api_key.clone();
+        let resp = super::post_json_with_retry(
+            || {
+                self.client
+                    .post(url.clone())
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Content-Type", "application/json")
+            },
+            &body,
+            3,
+        )
+        .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = crate::anthropic::error_text(&v).unwrap_or("bedrock request failed");
+            anyhow::bail!("bedrock {status}: {msg}");
+        }
+        Ok(v)
+    }
+
+    fn parse_invoke(v: serde_json::Value) -> anyhow::Result<super::ChatResponse> {
+        let mut parsed = crate::anthropic::parse_anthropic_response(v)?;
+        parsed.message.provider = Some("bedrock".into());
+        Ok(parsed)
+    }
 }
 
 /// 模型 id 里的 `:` `/` 要进路径，做最小百分号编码。
@@ -112,28 +143,37 @@ impl super::LlmProvider for BedrockProvider {
     }
 
     async fn complete(&self, req: super::ChatRequest) -> anyhow::Result<super::ChatResponse> {
-        let url = self.invoke_url();
-        let body = self.body(&req);
-        let key = self.api_key.clone();
-        let resp = super::post_json_with_retry(
-            || {
-                self.client
-                    .post(url.clone())
-                    .header("Authorization", format!("Bearer {key}"))
-                    .header("Content-Type", "application/json")
-            },
-            &body,
-            3,
-        )
-        .await?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            let msg = crate::anthropic::error_text(&v).unwrap_or("bedrock request failed");
-            anyhow::bail!("bedrock {status}: {msg}");
+        Self::parse_invoke(self.invoke(&req).await?)
+    }
+
+    /// 接到 trait：仍走 `/invoke`，推 TextDelta + Usage。不解析 eventstream。
+    async fn complete_streaming(
+        &self,
+        req: super::ChatRequest,
+        tx: tokio::sync::mpsc::Sender<super::StreamEvent>,
+    ) -> anyhow::Result<super::ChatResponse> {
+        let v = self.invoke(&req).await?;
+        if let Some(u) = v.get("usage") {
+            let (input, output, cache_read, cache_write) = crate::parse_provider_usage(u);
+            if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
+                let _ = tx
+                    .send(super::StreamEvent::Usage {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                    })
+                    .await;
+            }
         }
-        let mut parsed = crate::anthropic::parse_anthropic_response(v)?;
-        parsed.message.provider = Some("bedrock".into());
+        let parsed = Self::parse_invoke(v)?;
+        for b in &parsed.message.blocks {
+            if let rupi_core::ContentBlock::Text { text } = b {
+                if !text.is_empty() {
+                    let _ = tx.send(super::StreamEvent::TextDelta(text.clone())).await;
+                }
+            }
+        }
         Ok(parsed)
     }
 }
@@ -206,6 +246,64 @@ mod tests {
                 .get("authorization")
                 .map(String::as_str),
             Some("Bearer bk")
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_uses_invoke_and_emits_usage() {
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": "stream-hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 3
+            }
+        });
+        let (base, seen) = crate::teststub::start(payload).await;
+        let p = BedrockProvider::new(base, "bk".into(), "anthropic.claude-x:0".into());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let resp = p
+            .complete_streaming(
+                crate::ChatRequest {
+                    system: "s".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_tokens: None,
+                    temperature: None,
+                    thinking: None,
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.full_text(), "stream-hi");
+        assert_eq!(resp.message.provider.as_deref(), Some("bedrock"));
+        let path = seen.path.lock().unwrap().clone();
+        assert!(path.contains("/invoke"), "{path}");
+        assert!(!path.contains("invoke-with-response-stream"), "{path}");
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                crate::StreamEvent::Usage {
+                    input: 11,
+                    output: 4,
+                    cache_read: 2,
+                    cache_write: 3
+                }
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, crate::StreamEvent::TextDelta(t) if t == "stream-hi")),
+            "{events:?}"
         );
     }
 }

@@ -244,6 +244,9 @@ mod tests {
         assert!(m.iter().any(|e| e.provider == "azure"));
         assert!(m.iter().any(|e| e.provider == "bedrock"));
         assert!(m.iter().any(|e| e.provider == "vertex"));
+        assert!(m
+            .iter()
+            .any(|e| e.provider == "llamacpp" && e.id == "local"));
         let text = format_catalog(&m);
         assert!(text.contains("openai/gpt-4o-mini"));
     }

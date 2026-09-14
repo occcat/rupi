@@ -431,20 +431,21 @@ pub fn apply_session_settings(p: &mut dyn LlmProvider, session_id: Option<&str>)
 
 /// 按 `provider/model[:thinking]` 或模型名前缀选 provider。
 /// `claude-*`→Anthropic，`gemini-*`→Gemini，其余→OpenAI-compatible；
-/// 显式前缀 `openrouter/`/`azure/`/`bedrock/`/`vertex/` 走对应路由。
+/// 显式前缀 `openrouter/`/`azure/`/`bedrock/`/`vertex/`/`llamacpp/` 走对应路由。
 /// 缺 key 即 Err，由调用方决定回 mock 还是报错。CLI 与 TUI `/model` 共用。
 pub fn provider_for_model(model: &str) -> anyhow::Result<Box<dyn LlmProvider>> {
     provider_from_spec(&parse_model_spec(model), &ProviderOptions::default())
 }
 
 /// OpenAI-compat 路由形态：默认 Chat Completions；Azure 走 deployment URL + `api-key`；
-/// OpenRouter 加 Referer/Title 与默认会话亲和。
+/// OpenRouter 加 Referer/Title 与默认会话亲和；llama.cpp / 本机 server 默认可空 key。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompatKind {
     #[default]
     OpenAi,
     OpenRouter,
     Azure,
+    LlamaCpp,
 }
 
 /// 进程内共享的 reqwest Client（rustls + webpki 根证书）。`clone` 只增 Arc；
@@ -539,6 +540,8 @@ impl OpenAiCompatProvider {
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let req = match self.kind {
             CompatKind::Azure => req.header("api-key", &self.api_key),
+            // llama.cpp 默认无 --api-key；空 key 不发 Authorization，避免本机 server 拒 dummy Bearer。
+            CompatKind::LlamaCpp if self.api_key.is_empty() => req,
             _ => req.bearer_auth(&self.api_key),
         };
         let req = match self.kind {
@@ -571,6 +574,7 @@ impl LlmProvider for OpenAiCompatProvider {
             CompatKind::OpenAi => "openai-compat",
             CompatKind::OpenRouter => "openrouter",
             CompatKind::Azure => "azure",
+            CompatKind::LlamaCpp => "llamacpp",
         }
     }
 
@@ -1012,6 +1016,19 @@ mod teststub {
     }
 
     pub async fn start_with_status(payload: serde_json::Value, status: u16) -> (String, Arc<Seen>) {
+        start_response(payload.to_string().into_bytes(), "application/json", status).await
+    }
+
+    /// SSE stub：固定 `text/event-stream` 体，给 Vertex `streamGenerateContent?alt=sse` 等用。
+    pub async fn start_sse(sse: &str) -> (String, Arc<Seen>) {
+        start_response(sse.as_bytes().to_vec(), "text/event-stream", 200).await
+    }
+
+    async fn start_response(
+        body: Vec<u8>,
+        content_type: &'static str,
+        status: u16,
+    ) -> (String, Arc<Seen>) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let seen = Arc::new(Seen::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1023,7 +1040,7 @@ mod teststub {
                     break;
                 };
                 let seen = seen_clone.clone();
-                let payload = payload.clone();
+                let body = body.clone();
                 let status = status;
                 tokio::spawn(async move {
                     let status_line = match status {
@@ -1072,9 +1089,8 @@ mod teststub {
                     *seen.body.lock().unwrap() =
                         serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
                     *seen.count.lock().unwrap() += 1;
-                    let body = payload.to_string().into_bytes();
                     let head = format!(
-                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = wh.write_all(head.as_bytes()).await;
@@ -1504,6 +1520,44 @@ mod tests {
         // 非流式不带 stream 字段（只在 true 时插入）
         assert!(body.get("stream").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn llamacpp_compat_omits_authorization_when_key_empty() {
+        let payload = serde_json::json!({
+            "choices": [{"message": {"content": "local-hi"}, "finish_reason": "stop"}]
+        });
+        let (base, seen) = super::teststub::start(payload).await;
+        let p = OpenAiCompatProvider::new(base, String::new(), "local".into())
+            .with_kind(CompatKind::LlamaCpp);
+        assert_eq!(p.name(), "llamacpp");
+        let resp = p.complete(stub_request()).await.unwrap();
+        assert_eq!(resp.message.full_text(), "local-hi");
+        assert_eq!(*seen.path.lock().unwrap(), "/chat/completions");
+        let headers = seen.headers.lock().unwrap();
+        assert!(
+            headers.get("authorization").is_none(),
+            "empty llamacpp key must not send Authorization: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llamacpp_compat_sends_bearer_when_key_set() {
+        let payload = serde_json::json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        });
+        let (base, seen) = super::teststub::start(payload).await;
+        let p = OpenAiCompatProvider::new(base, "localsecret".into(), "qwen".into())
+            .with_kind(CompatKind::LlamaCpp);
+        p.complete(stub_request()).await.unwrap();
+        assert_eq!(
+            seen.headers
+                .lock()
+                .unwrap()
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer localsecret")
+        );
     }
 
     #[tokio::test]
