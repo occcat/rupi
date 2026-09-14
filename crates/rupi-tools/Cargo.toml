@@ -17,5 +17,7 @@ tracing = { workspace = true }
 ignore = { workspace = true }
 glob = { workspace = true }
 regex = { workspace = true }
-libc = { workspace = true }
 similar = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
