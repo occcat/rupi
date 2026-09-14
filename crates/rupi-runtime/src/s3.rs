@@ -66,6 +66,10 @@ impl S3Config {
             format!("{}/{}", self.prefix.trim_end_matches('/'), key)
         }
     }
+
+    fn object_path(&self, key: &str) -> String {
+        uri_encode_path(&format!("{}/{}", self.bucket, self.object_key(key)))
+    }
 }
 
 #[derive(Clone)]
@@ -91,25 +95,33 @@ impl S3ObjectStore {
         )
     }
 
-    async fn signed(
+    fn bucket_url(&self) -> String {
+        format!("{}/{}", self.cfg.endpoint, self.cfg.bucket)
+    }
+
+    fn host_of(url: &str) -> String {
+        url.split_once("://")
+            .and_then(|(_, r)| r.split('/').next())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn authorization(
         &self,
         method: &str,
-        key: &str,
+        canon_uri: &str,
         body: &[u8],
-    ) -> anyhow::Result<reqwest::RequestBuilder> {
-        let url = self.url(key);
-        let host = url
-            .split_once("://")
-            .and_then(|(_, r)| r.split('/').next())
-            .unwrap_or("");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        host: &str,
+    ) -> (String, String, String) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let ts = chrono_like(now);
         let date = &ts[..8];
         let payload = hex::encode(Sha256::digest(body));
         let canon = format!(
-            "{method}\n/{}/{}\n\nhost:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{ts}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload}",
-            self.cfg.bucket,
-            self.cfg.object_key(key)
+            "{method}\n{canon_uri}\n\nhost:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{ts}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload}"
         );
         let canon_hash = hex::encode(Sha256::digest(canon.as_bytes()));
         let scope = format!("{date}/{}/s3/aws4_request", self.cfg.region);
@@ -120,6 +132,19 @@ impl S3ObjectStore {
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}",
             self.cfg.access_key
         );
+        (auth, payload, ts)
+    }
+
+    async fn signed(
+        &self,
+        method: &str,
+        key: &str,
+        body: &[u8],
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        let url = self.url(key);
+        let host = Self::host_of(&url);
+        let canon_uri = format!("/{}", self.cfg.object_path(key));
+        let (auth, payload, ts) = self.authorization(method, &canon_uri, body, &host);
         let mut req = match method {
             "PUT" => self.client.put(&url),
             "GET" => self.client.get(&url),
@@ -136,6 +161,47 @@ impl S3ObjectStore {
         }
         Ok(req)
     }
+
+    /// 建桶（MinIO / S3 兼容）。已存在则忽略。
+    pub async fn ensure_bucket(&self) -> anyhow::Result<()> {
+        let url = self.bucket_url();
+        let host = Self::host_of(&url);
+        let canon_uri = format!("/{}", uri_encode_path(&self.cfg.bucket));
+        let (auth, payload, ts) = self.authorization("PUT", &canon_uri, b"", &host);
+        let resp = self
+            .client
+            .put(&url)
+            .header("host", host)
+            .header("x-amz-content-sha256", payload)
+            .header("x-amz-date", ts)
+            .header("authorization", auth)
+            .body(Vec::<u8>::new())
+            .send()
+            .await?;
+        let st = resp.status().as_u16();
+        if st == 200 || st == 409 || st == 204 {
+            return Ok(());
+        }
+        anyhow::bail!("s3 create bucket {}: {}", self.cfg.bucket, resp.status())
+    }
+}
+
+fn uri_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for b in seg.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+    }
+    out
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -246,6 +312,15 @@ impl ObjectStore for MemoryObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regional_object_key;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::put;
+    use axum::{body::Bytes, Router};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn memory_store_is_shared() {
@@ -254,5 +329,147 @@ mod tests {
         a.put("ws/t/s/h.tgz", b"blob").await.unwrap();
         assert_eq!(b.get("ws/t/s/h.tgz").await.unwrap(), b"blob");
         assert!(S3Config::from_uri("not-a-uri").is_err());
+    }
+
+    type Bucket = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    async fn spawn_s3_compat() -> (String, tokio::task::JoinHandle<()>) {
+        let store: Bucket = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/{bucket}", put(create_bucket))
+            .route(
+                "/{bucket}/{*key}",
+                put(put_obj).get(get_obj).delete(del_obj),
+            )
+            .with_state(store);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), h)
+    }
+
+    async fn create_bucket(
+        State(store): State<Bucket>,
+        Path(bucket): Path<String>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        if headers.get("authorization").is_none() {
+            return StatusCode::FORBIDDEN;
+        }
+        store.lock().await.insert(format!("{bucket}/"), Vec::new());
+        StatusCode::OK
+    }
+
+    async fn put_obj(
+        State(store): State<Bucket>,
+        Path((bucket, key)): Path<(String, String)>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        if headers.get("authorization").is_none() {
+            return StatusCode::FORBIDDEN;
+        }
+        store
+            .lock()
+            .await
+            .insert(format!("{bucket}/{key}"), body.to_vec());
+        StatusCode::OK
+    }
+
+    async fn get_obj(
+        State(store): State<Bucket>,
+        Path((bucket, key)): Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> Result<Vec<u8>, StatusCode> {
+        if headers.get("authorization").is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        store
+            .lock()
+            .await
+            .get(&format!("{bucket}/{key}"))
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn del_obj(
+        State(store): State<Bucket>,
+        Path((bucket, key)): Path<(String, String)>,
+    ) -> StatusCode {
+        store.lock().await.remove(&format!("{bucket}/{key}"));
+        StatusCode::NO_CONTENT
+    }
+
+    fn store_for(endpoint: &str, bucket: &str) -> S3ObjectStore {
+        S3ObjectStore::new(S3Config {
+            endpoint: endpoint.to_string(),
+            bucket: bucket.into(),
+            region: "us-east-1".into(),
+            access_key: "rupi".into(),
+            secret_key: "rupisecret1".into(),
+            prefix: String::new(),
+        })
+    }
+
+    /// 真 HTTP：两个 S3ObjectStore 客户端走同一 S3 兼容服务，多副本 put/get。
+    #[tokio::test]
+    async fn s3_compat_two_replicas_put_get() {
+        let (endpoint, _h) = spawn_s3_compat().await;
+        let a = store_for(&endpoint, "rupi-snap");
+        let b = store_for(&endpoint, "rupi-snap");
+        a.ensure_bucket().await.unwrap();
+        let us = regional_object_key("us-east", "ws/t/s/h.tgz");
+        let eu = regional_object_key("eu-west", "ws/t/s/h.tgz");
+        a.put(&us, b"from-a").await.unwrap();
+        assert_eq!(b.get(&us).await.unwrap(), b"from-a");
+        b.put(&eu, b"from-b-eu").await.unwrap();
+        assert_eq!(a.get(&eu).await.unwrap(), b"from-b-eu");
+        assert_ne!(a.get(&us).await.unwrap(), a.get(&eu).await.unwrap());
+        a.delete(&us).await.unwrap();
+        assert!(b.get(&us).await.is_err());
+    }
+
+    /// MinIO（或 `RUPI_S3_ENDPOINT` 指向的兼容服务）。未配置则跳过。
+    #[tokio::test]
+    async fn s3_minio_two_replicas_if_configured() {
+        let Ok(endpoint) = std::env::var("RUPI_S3_ENDPOINT") else {
+            return;
+        };
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if endpoint.is_empty() {
+            return;
+        }
+        let access = std::env::var("RUPI_S3_ACCESS_KEY")
+            .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+            .unwrap_or_else(|_| "rupi".into());
+        let secret = std::env::var("RUPI_S3_SECRET_KEY")
+            .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+            .unwrap_or_else(|_| "rupisecret1".into());
+        let region = std::env::var("RUPI_S3_REGION")
+            .or_else(|_| std::env::var("AWS_REGION"))
+            .unwrap_or_else(|_| "us-east-1".into());
+        let bucket = format!("rupi-it-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let cfg = S3Config {
+            endpoint,
+            bucket,
+            region,
+            access_key: access,
+            secret_key: secret,
+            prefix: "it".into(),
+        };
+        let a = S3ObjectStore::new(cfg.clone());
+        let b = S3ObjectStore::new(cfg);
+        a.ensure_bucket().await.expect("MinIO/S3 create bucket");
+        let us = regional_object_key("us-east", "ws/t/s/h.tgz");
+        let eu = regional_object_key("eu-west", "ws/t/s/h.tgz");
+        a.put(&us, b"minio-a").await.expect("s3 put");
+        assert_eq!(b.get(&us).await.expect("s3 get replica"), b"minio-a");
+        b.put(&eu, b"minio-eu").await.unwrap();
+        assert_eq!(a.get(&eu).await.unwrap(), b"minio-eu");
+        assert_ne!(a.get(&us).await.unwrap(), a.get(&eu).await.unwrap());
+        a.delete(&us).await.unwrap();
+        a.delete(&eu).await.unwrap();
     }
 }

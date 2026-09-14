@@ -417,7 +417,11 @@ async fn admin_sessions_executors_and_admin_keys() {
     assert_eq!(regions["controlPlane"], "local");
 
     let (c5, ak) = h
-        .admin_json(reqwest::Method::POST, "/admin/api/admin-keys", None)
+        .admin_json(
+            reqwest::Method::POST,
+            "/admin/api/admin-keys",
+            Some(json!({"role": "admin"})),
+        )
         .await;
     assert_eq!(c5, 201, "{ak}");
     let admin_key = ak["key"].as_str().unwrap().to_string();
@@ -466,6 +470,91 @@ async fn admin_sessions_executors_and_admin_keys() {
         .await
         .unwrap();
     assert_eq!(gone.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn admin_rbac_viewer_cannot_write() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let ver = db::schema_version(&h.pool).await.unwrap();
+    assert_eq!(ver, db::SCHEMA_VERSION, "migrate must stamp current schema");
+
+    let (c, viewer) = h
+        .admin_json(
+            reqwest::Method::POST,
+            "/admin/api/admin-keys",
+            Some(json!({"role": "viewer"})),
+        )
+        .await;
+    assert_eq!(c, 201, "{viewer}");
+    assert_eq!(viewer["record"]["role"], "viewer");
+    let viewer_key = viewer["key"].as_str().unwrap().to_string();
+
+    let (c, ops) = h
+        .admin_json(
+            reqwest::Method::POST,
+            "/admin/api/admin-keys",
+            Some(json!({"role": "operator"})),
+        )
+        .await;
+    assert_eq!(c, 201, "{ops}");
+    let ops_key = ops["key"].as_str().unwrap().to_string();
+
+    let me = h
+        .client()
+        .get(format!("{}/admin/api/me", h.base))
+        .bearer_auth(&viewer_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status().as_u16(), 200);
+    let me: Value = me.json().await.unwrap();
+    assert_eq!(me["role"], "viewer");
+
+    let denied = h
+        .client()
+        .post(format!("{}/admin/api/tenants", h.base))
+        .bearer_auth(&viewer_key)
+        .json(&json!({"name": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 403);
+
+    let listed = h
+        .client()
+        .get(format!("{}/admin/api/tenants", h.base))
+        .bearer_auth(&viewer_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status().as_u16(), 200);
+
+    let ops_write = h
+        .client()
+        .post(format!("{}/admin/api/tenants", h.base))
+        .bearer_auth(&ops_key)
+        .json(&json!({"name": "ops-ok"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ops_write.status().as_u16(),
+        201,
+        "{}",
+        ops_write.text().await.unwrap()
+    );
+
+    let ops_keys = h
+        .client()
+        .post(format!("{}/admin/api/admin-keys", h.base))
+        .bearer_auth(&ops_key)
+        .json(&json!({"role": "viewer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ops_keys.status().as_u16(), 403);
 }
 
 #[test]

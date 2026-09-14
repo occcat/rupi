@@ -26,7 +26,10 @@ pub use jail::Isolation;
 pub use pool::{is_pool_exhausted, parse_endpoint_list, PoolExhausted, PoolNode, PoolScheduler};
 pub use s3::{MemoryObjectStore, S3Config, S3ObjectStore};
 pub use sandbox_http::SandboxExecutor;
-pub use store::{LocalObjectStore, ObjectStore};
+pub use store::{
+    object_key_region, regional_object_key, sanitize_region, snapshot_key_matches_region,
+    LocalObjectStore, ObjectStore,
+};
 pub use token::{
     is_loopback_bind, is_loopback_url, tokens_eq, validate_executor_url, validate_listen_token,
 };

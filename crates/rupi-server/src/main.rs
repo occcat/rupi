@@ -56,6 +56,15 @@ struct Cli {
     /// 允许控制面用明文 HTTP 打非回环执行节点。
     #[arg(long, env = "RUPI_EXEC_INSECURE", default_value_t = false)]
     insecure_exec: bool,
+    /// PEM 证书。与 `--tls-key` 一起在进程内 rustls 终止 TLS。
+    #[arg(long, env = "RUPI_TLS_CERT")]
+    tls_cert: Option<String>,
+    /// PEM 私钥。
+    #[arg(long, env = "RUPI_TLS_KEY")]
+    tls_key: Option<String>,
+    /// 允许非回环明文监听。生产应 `--tls-cert`/`--tls-key` 或前面反代。
+    #[arg(long, env = "RUPI_LISTEN_INSECURE", default_value_t = false)]
+    insecure: bool,
     #[arg(long, env = "RUPI_IDLE_SECS", default_value_t = 1800)]
     idle_secs: u64,
     /// 启动时建一个租户并打印明文 Key（只用于本地/CI）。
@@ -116,13 +125,16 @@ async fn main() -> anyhow::Result<()> {
         idle_secs: cli.idle_secs,
         admin_token: cli.admin_token,
         insecure_exec: cli.insecure_exec,
+        tls_cert: cli.tls_cert,
+        tls_key: cli.tls_key,
+        insecure_listen: cli.insecure,
     };
     if cli.bootstrap_admin || cli.bootstrap_tenant.is_some() {
         let pool = db::connect(&cfg.database_url).await?;
         db::migrate(&pool).await?;
         if cli.bootstrap_admin {
             let key = auth::generate_admin_key();
-            let row = db::create_admin_key(&pool, &key).await?;
+            let row = db::create_admin_key(&pool, &key, "admin").await?;
             println!(
                 "admin_key_id={} key={key} prefix={}",
                 row.id, row.key_prefix

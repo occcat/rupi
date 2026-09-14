@@ -34,12 +34,15 @@
 | `--snapshot-dir` | `RUPI_SNAPSHOT_DIR` | `./rupi-data/snapshots` | 本机对象盘（相对 cwd；多副本不够） |
 | `--snapshot-uri` | `RUPI_SNAPSHOT_URI` | 无 | `s3://bucket/prefix` 或 `memory:`（测试）；优先于 snapshot-dir |
 | `--insecure-exec` | `RUPI_EXEC_INSECURE` | false | 允许控制面用明文 HTTP 打**非回环**执行节点 |
+| `--tls-cert` | `RUPI_TLS_CERT` | 无 | PEM 证书。与 `--tls-key` 一起在进程内 rustls 终止 TLS |
+| `--tls-key` | `RUPI_TLS_KEY` | 无 | PEM 私钥 |
+| `--insecure` | `RUPI_LISTEN_INSECURE` | false | 允许非回环**明文**监听。生产应 rustls 或前面反代 |
 | `--idle-secs` | `RUPI_IDLE_SECS` | 1800 | 闲置回收 |
-| `--admin-token` | `RUPI_ADMIN_TOKEN` | 空 | 管理面共享口令 |
+| `--admin-token` | `RUPI_ADMIN_TOKEN` | 空 | 管理面共享口令（等同 `admin` 角色） |
 | `--bootstrap-tenant NAME` | — | 无 | 建租户、打印明文 Key 后**退出** |
-| `--bootstrap-admin` | — | false | 建管理 Key、打印后**退出** |
+| `--bootstrap-admin` | — | false | 建管理 Key（`admin` 角色）、打印后**退出** |
 
-没有 `--tls` / `--mode` / `--bind`。对外 443 把 TLS 终止放在前面，控制面仍是 `--listen`。
+没有 `--mode` / `--bind`。对外 443 仍可把 TLS 放在前面；也可以 `--tls-cert`/`--tls-key` 让控制面自己终止。明文只给回环，或显式 `--insecure`。
 
 ### `rupi-execd`
 
@@ -86,7 +89,11 @@
 
 - **空 token**：非回环监听直接拒启动。回环空 token 还必须带 `--insecure`（或 `RUPI_EXEC_INSECURE=1`）。`0.0.0.0` 即使 `--insecure` 也不能空 token。比较走恒定时间 `tokens_eq`。
 - **Postgres**：回环可用明文。非回环默认走进程内 **rustls**（强制 `sslmode=require`）。`sslmode=` 字面量不能当 TLS。非回环明文必须 `RUPI_DB_INSECURE=1`。
+- **控制面监听**：回环可用明文。非回环默认必须 `--tls-cert` + `--tls-key`（进程内 rustls）。非回环明文必须 `--insecure` / `RUPI_LISTEN_INSECURE=1`。
 - **执行面 URL**：控制面打 `http://` 非回环节点必须 `--insecure-exec`。回环 `http://127.0.0.1` 可以。生产用 HTTPS 或不要把 execd 暴露到公网。
+- **管理面 RBAC**：库内 `rupi_admin_*` Key 有 `admin` / `operator` / `viewer`。`RUPI_ADMIN_TOKEN` 等同 `admin`。`viewer` 只读；`operator` 可改租户/配额/会话，不能颁发或吊销管理 Key。
+- **快照按区域分**：对象 key 是 `{region}/ws/{tenant}/{session}/{handle}.tgz`。跨区域不会默默读到另一区的副本。
+- **schema**：`migrate` 写 `schema_migrations`，当前版本 4。重复启动只补未登记的步骤。
 - `--bootstrap-tenant` / `--bootstrap-admin` 只用来种第一把 Key。正式进程不要带。
 - 租户 BYOK 按 provider 读 `anthropic_api_key` / `gemini_api_key` / `openai_api_key`（或 `api_key`）。不会把 OpenAI key 塞给 Anthropic。
 - `git` bootstrap 只接受 `https://` 或 `git@host:path`（`file://` 一律拒）。host 默认白名单（github.com / gitlab.com / bitbucket.org / git.sr.ht / codeberg.org），可用 settings / 请求体 `git_hosts` 加。无 token 的 `git@` / https 默认拒；公开只读 https 需 `RUPI_GIT_ALLOW_ANON=1`。租户 token 只进这一次 clone。
@@ -196,7 +203,22 @@ export RUPI_S3_ACCESS_KEY=...
 export RUPI_S3_SECRET_KEY=...
 ```
 
-工作区在 Executor 上，不在 API 盘。`--snapshot-dir` 只够单机；未指定时写到 `./rupi-data/snapshots`。多副本用 `--snapshot-uri` / `RUPI_SNAPSHOT_URI`。
+工作区在 Executor 上，不在 API 盘。`--snapshot-dir` 只够单机；未指定时写到 `./rupi-data/snapshots`。多副本用 `--snapshot-uri` / `RUPI_SNAPSHOT_URI`（S3 兼容，MinIO 或任何 SigV4 路径样式服务）。对象按会话 `region` 分前缀。CI 里 `S3ObjectStore` 走进程内 S3 兼容 HTTP；本机若起了 MinIO，设 `RUPI_S3_ENDPOINT` 会再打一枪真服务。
+
+控制面自己终止 TLS：
+
+```bash
+rupi-server --listen 0.0.0.0:8443 \
+  --tls-cert /etc/rupi/tls.crt --tls-key /etc/rupi/tls.key \
+  --database-url "postgres://rupi:rupi@db.internal:5432/rupi" \
+  ...
+```
+
+非回环明文（只在显式 insecure 时）：
+
+```bash
+rupi-server --listen 0.0.0.0:8080 --insecure ...
+```
 
 非回环 Postgres 走 rustls：
 
@@ -213,9 +235,9 @@ rupi-server --insecure-exec --executor-urls http://10.0.0.8:8090 ...
 
 ## 容量演练
 
-CI `cloud` job 跑缩小规模的池耗尽 / 杀副本（`crates/rupi-server/tests/cloud_chaos.rs`）：池满且有 run → `429`；放开后抢占闲置卷再入院；杀掉一个控制面副本后另一副本仍能读会话树和共享快照。**默认 CI 不跑万级，也不会打满一万条长 SSE。**
+CI `cloud` job 跑缩小规模的池耗尽 / 杀副本（`crates/rupi-server/tests/cloud_chaos.rs`）：池满且有 run → `429`；放开后抢占闲置卷再入院；杀掉一个控制面副本后另一副本仍能读会话树和共享快照。另有一条非 ignore 的短流回归（2 会话 / 4 次）。**默认 CI / 每张 PR 不跑万级，也不会打满一万条长 SSE。**
 
-本机万级入口是短 mock 流（做完就结束），不是一万条常驻连接：
+本机万级入口是短 mock 流（做完就结束），不是一万条常驻连接。GitHub Actions `workflow_dispatch` 勾 `ten_thousand_streams` 也会跑同一条 `#[ignore]` 用例：
 
 ```bash
 # 需要本机 Postgres / Redis（与 cloud job 相同的 DATABASE_URL / REDIS_URL）

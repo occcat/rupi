@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ten_thousand_streams:
+        description: Run ignored 10k-entry short streams (never on pull_request)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -99,10 +104,39 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: MinIO (S3 compatible, optional)
+        continue-on-error: true
+        run: |
+          # 社区版不再保证预编译二进制；失败则跳过，s3_compat 进程内服务仍跑。
+          url="https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z"
+          if ! curl -fL --retry 2 -o /tmp/minio "$url"; then
+            echo "minio binary unavailable; S3 tests use in-process compat server"
+            exit 0
+          fi
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=rupi MINIO_ROOT_PASSWORD=rupisecret1 \
+            /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 &
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "RUPI_S3_ENDPOINT=http://127.0.0.1:9000" >> "$GITHUB_ENV"
+              echo "RUPI_S3_ACCESS_KEY=rupi" >> "$GITHUB_ENV"
+              echo "RUPI_S3_SECRET_KEY=rupisecret1" >> "$GITHUB_ENV"
+              echo "RUPI_S3_REGION=us-east-1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 0.25
+          done
+          echo "minio did not become healthy; continuing without it"
+
       # cloud_chaos 的 ten_thousand_streams 是 #[ignore]：这里只跑缩小规模的
-      # 池耗尽 / 杀副本，不会打满一万长连接。
+      # 池耗尽 / 杀副本 / short_stream_load_regression，不会打满一万长连接。
       - name: cloud crates
         run: cargo test --locked -p rupi-runtime -p rupi-server -p rupi-agent -- --nocapture
+
+      - name: ten thousand streams (manual)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ten_thousand_streams }}
+        run: cargo test --locked -p rupi-server --test cloud_chaos ten_thousand_streams -- --ignored --exact --nocapture
 
       - name: local rpc regression
         run: cargo test --locked -p rupi-cli --test smoke rpc_mode_prompt_and_state -- --exact

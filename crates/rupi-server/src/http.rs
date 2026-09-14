@@ -62,6 +62,7 @@ async fn ready(State(app): State<App>) -> impl IntoResponse {
             "region": n.region,
             "kind": n.kind
         })).collect::<Vec<_>>(),
+        "schemaVersion": db::schema_version(&app.pool).await.unwrap_or(0),
         "ok": ok
     });
     let status = if ok {

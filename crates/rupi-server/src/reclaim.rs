@@ -72,7 +72,10 @@ pub async fn snapshot_and_release(app: &App, sess: &SessionRow) -> anyhow::Resul
         kind: sess.runtime_kind.clone(),
     };
     let blob = app.executor.snapshot(&handle).await?;
-    let key = format!("ws/{}/{}/{}.tgz", sess.tenant_id, sess.id, handle.id);
+    let key = rupi_runtime::regional_object_key(
+        sess.region.as_deref().unwrap_or("local"),
+        &format!("ws/{}/{}/{}.tgz", sess.tenant_id, sess.id, handle.id),
+    );
     app.object_store.put(&key, &blob).await?;
     let _ = db::insert_snapshot(
         &app.pool,
@@ -120,6 +123,12 @@ pub async fn ensure_hot(
         match app.executor.alloc_pref(&req).await {
             Ok(wh) => {
                 if let Some(key) = sess.snapshot_key.as_deref() {
+                    if !rupi_runtime::snapshot_key_matches_region(key, sess.region.as_deref()) {
+                        anyhow::bail!(
+                            "snapshot region mismatch: key={key} session_region={}",
+                            sess.region.as_deref().unwrap_or("local")
+                        );
+                    }
                     match app.object_store.get(key).await {
                         Ok(blob) => {
                             app.executor.restore(&wh, &blob).await?;
@@ -152,4 +161,20 @@ pub async fn ensure_hot(
         }
     }
     Err(last.unwrap_or_else(|| rupi_runtime::PoolExhausted.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn refuse_cross_region_snapshot_key() {
+        let key = rupi_runtime::regional_object_key("us-east", "ws/t/s/h.tgz");
+        assert!(rupi_runtime::snapshot_key_matches_region(
+            &key,
+            Some("us-east")
+        ));
+        assert!(!rupi_runtime::snapshot_key_matches_region(
+            &key,
+            Some("eu-west")
+        ));
+    }
 }

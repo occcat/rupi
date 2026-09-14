@@ -8,6 +8,7 @@ pub mod auth;
 pub mod cache;
 pub mod db;
 pub mod http;
+pub mod listen;
 pub mod memory;
 pub mod quota;
 pub mod reclaim;
@@ -168,6 +169,12 @@ pub struct CloudConfig {
     pub idle_secs: u64,
     pub admin_token: String,
     pub insecure_exec: bool,
+    /// `--tls-cert` / `RUPI_TLS_CERT`
+    pub tls_cert: Option<String>,
+    /// `--tls-key` / `RUPI_TLS_KEY`
+    pub tls_key: Option<String>,
+    /// 非回环明文监听。生产应 rustls 或前面反代。
+    pub insecure_listen: bool,
 }
 
 pub async fn connect_app(cfg: &CloudConfig) -> anyhow::Result<App> {
@@ -294,8 +301,17 @@ pub fn default_snapshot_dir() -> PathBuf {
 }
 
 pub async fn serve(cfg: CloudConfig) -> anyhow::Result<()> {
+    let tls_paths = listen::TlsPaths::from_opts(cfg.tls_cert.clone(), cfg.tls_key.clone())?;
+    let wire = listen::listen_wire(&cfg.bind, tls_paths.as_ref(), cfg.insecure_listen)?;
+    let tls = if wire.uses_tls() {
+        Some(listen::load_tls_config(tls_paths.as_ref().ok_or_else(
+            || anyhow::anyhow!("tls listen selected but cert/key missing"),
+        )?)?)
+    } else {
+        None
+    };
     let app = connect_app(&cfg).await?;
-    let (_addr, h) = spawn(app, &cfg.bind).await?;
+    let (_addr, h) = spawn_listen(app, &cfg.bind, tls).await?;
     h.await?
 }
 
@@ -306,23 +322,31 @@ pub async fn spawn(
     std::net::SocketAddr,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 )> {
+    spawn_listen(app, bind, None).await
+}
+
+pub async fn spawn_listen(
+    app: App,
+    bind: &str,
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     let listener = TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!(
-        "rupi-server listen {addr} instance={} region={}",
+        "rupi-server listen {addr} instance={} region={} tls={}",
         app.instance_id,
-        app.region
+        app.region,
+        tls.is_some()
     );
     let bg = app.clone();
     tokio::spawn(async move {
         reclaim::loop_forever(bg).await;
     });
     let router = http::router(app);
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-    });
+    let handle = tokio::spawn(async move { listen::serve_router(listener, router, tls).await });
     Ok((addr, handle))
 }
 
