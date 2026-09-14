@@ -714,3 +714,69 @@ async fn usage_event_increments_tokens_today() {
     let end = after["quota"]["tokensToday"].as_i64().unwrap_or(0);
     assert_eq!(end, start + 100, "before={before} after={after}");
 }
+
+#[tokio::test]
+async fn ready_is_503_when_executor_unreachable() {
+    let Some(_guard) = lock_harness().await else {
+        return;
+    };
+    let Some((db_url, redis_url)) = env_urls() else {
+        return;
+    };
+    if !ping_deps(&db_url, &redis_url).await {
+        return;
+    }
+    let pool = db::connect(&db_url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    let cache = Cache::connect(&redis_url).await;
+    let app = App::new(
+        pool,
+        cache,
+        Arc::new(rupi_runtime::http::HttpExecutor::new(
+            "http://127.0.0.1:9",
+            "tok",
+        )),
+        Arc::new(|t| rupi_server::run::default_provider(t)),
+    );
+    let (addr, _srv) = spawn(app, "127.0.0.1:0").await.unwrap();
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "{}", resp.status());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["postgres"], true, "{body}");
+}
+
+#[tokio::test]
+async fn ready_is_503_when_executor_pool_empty() {
+    let Some(_guard) = lock_harness().await else {
+        return;
+    };
+    let Some((db_url, redis_url)) = env_urls() else {
+        return;
+    };
+    if !ping_deps(&db_url, &redis_url).await {
+        return;
+    }
+    let pool = db::connect(&db_url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    let cache = Cache::connect(&redis_url).await;
+    let app = App::new(
+        pool,
+        cache,
+        Arc::new(rupi_runtime::PoolScheduler::new(Vec::new())),
+        Arc::new(|t| rupi_server::run::default_provider(t)),
+    );
+    let (addr, _srv) = spawn(app, "127.0.0.1:0").await.unwrap();
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false, "{body}");
+}

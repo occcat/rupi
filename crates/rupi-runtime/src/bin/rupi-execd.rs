@@ -33,7 +33,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    std::fs::create_dir_all(&cli.root)?;
     rupi_runtime::execd::serve(rupi_runtime::execd::ExecdConfig {
         bind: cli.listen,
         root: cli.root,

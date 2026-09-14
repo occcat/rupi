@@ -41,11 +41,13 @@ pub fn router(app: App) -> Router {
         .with_state(app)
 }
 
-async fn ready(State(app): State<App>) -> Json<Value> {
+async fn ready(State(app): State<App>) -> impl IntoResponse {
     let pg = app.pool.get().await.is_ok();
     let nodes = app.executor.node_stats().await;
-    let exec_ok = !nodes.is_empty();
-    Json(json!({
+    // 配置了节点但 stats 失败时 pool 仍回 capacity=0 占位；空列表 / 全 0 都算执行面未就绪。
+    let exec_ok = nodes.iter().any(|n| n.capacity > 0);
+    let ok = pg && exec_ok;
+    let body = json!({
         "instanceId": app.instance_id,
         "region": app.region,
         "postgres": pg,
@@ -60,8 +62,14 @@ async fn ready(State(app): State<App>) -> Json<Value> {
             "region": n.region,
             "kind": n.kind
         })).collect::<Vec<_>>(),
-        "ok": pg && exec_ok
-    }))
+        "ok": ok
+    });
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
 }
 
 async fn metrics(State(app): State<App>) -> impl IntoResponse {

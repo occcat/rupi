@@ -67,6 +67,12 @@ pub async fn spawn(
     tokio::task::JoinHandle<anyhow::Result<()>>,
 )> {
     validate_listen_token(&cfg.bind, &cfg.token, cfg.insecure).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::create_dir_all(&cfg.root).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create sandboxd --root {}: {e} (loopback: use a writable path such as ./rupi-data/sandboxd)",
+            cfg.root.display()
+        )
+    })?;
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!("rupi-sandboxd listen {addr} region={}", cfg.region);

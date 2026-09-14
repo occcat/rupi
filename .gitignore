@@ -7,3 +7,4 @@
 # local
 .worktree/
 .env
+/rupi-data/
