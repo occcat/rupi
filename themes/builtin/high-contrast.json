@@ -1,0 +1,14 @@
+{
+  "name": "high-contrast",
+  "colors": {
+    "accent": "#ffff00",
+    "user": "#00ffff",
+    "text": "#ffffff",
+    "toolTitle": "#ffff00",
+    "muted": "#aaaaaa",
+    "thinkingText": "#ff00ff",
+    "border": "#ffffff",
+    "mdHeading": "#ffff00",
+    "mdCode": "#00ff00"
+  }
+}

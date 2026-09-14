@@ -1,6 +1,7 @@
 //! `rupi`：本机 TUI/CLI，以及 `rupi cloud` 连控制面。
 
 mod cloud;
+mod config_cmd;
 mod rpc;
 
 use clap::{Parser, Subcommand};
@@ -311,7 +312,7 @@ enum Cmd {
     McpList {
         command: String,
         args: Vec<String>,
-        /// StreamableHTTP 端点；给出即走 HTTP 而非 spawn stdio（此时 command/args 忽略）
+        /// StreamableHTTP 或 WebSocket 端点（`ws://` / `wss://` 走 WS）；给出即不 spawn stdio
         #[arg(long)]
         url: Option<String>,
     },
@@ -322,7 +323,7 @@ enum Cmd {
         /// 写入项目 `.rupi/`（默认 `$RUPI_HOME` / `~/.rupi`）
         #[arg(short = 'l', long)]
         local: bool,
-        /// 只装一类：skill / command / extension（默认按包内资源全装）
+        /// 只装一类：skill / command / extension / theme（默认按包内资源全装）
         #[arg(long)]
         kind: Option<String>,
     },
@@ -337,6 +338,14 @@ enum Cmd {
         #[arg(short = 'l', long)]
         local: bool,
     },
+    /// 启停 packages / extensions / skills / prompts / themes（对标 `pi config`，无 OAuth）
+    Config {
+        /// 写项目 `.rupi/settings.json`（默认 `~/.rupi/settings.json`）
+        #[arg(short = 'l', long)]
+        local: bool,
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// 连 `rupi-server`：只发 AG-UI/HTTP。bash 在 Executor 上跑，不进 TUI。
     Cloud {
         /// 控制面根 URL（`RUPI_CLOUD_URL`）
@@ -344,6 +353,22 @@ enum Cmd {
         url: String,
         #[command(subcommand)]
         action: cloud::Action,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// 列出发现到的资源与启停状态
+    List {
+        kind: Option<String>,
+    },
+    Enable {
+        kind: String,
+        name: String,
+    },
+    Disable {
+        kind: String,
+        name: String,
     },
 }
 
@@ -509,6 +534,14 @@ fn prompt_filter(settings: &rupi_config::Settings) -> rupi_core::commands::Promp
     rupi_core::commands::PromptFilter::from_specs(settings.prompts.as_deref())
 }
 
+fn apply_resource_filters(set: &mut rupi_ext::ExtensionSet, settings: &rupi_config::Settings) {
+    let f = rupi_config::ResourceFilter::from_specs(settings.extensions.as_deref());
+    for p in &f.extra_paths {
+        set.add_extra(p.clone());
+    }
+    set.set_name_filter(f.deny, f.force);
+}
+
 fn command_dirs_runtime(
     home: &Path,
     load_project: bool,
@@ -609,13 +642,19 @@ fn ext_dir(home: &PathBuf, cli: &Cli) -> PathBuf {
 }
 
 /// 启动时加载扩展并注册；返回 loader（REPL 每轮 `refresh()` 热重载）。
-fn load_extensions(tools: &mut ToolRegistry, cli: &Cli, home: &PathBuf) -> rupi_ext::ExtensionSet {
+fn load_extensions(
+    tools: &mut ToolRegistry,
+    cli: &Cli,
+    home: &PathBuf,
+    settings: &rupi_config::Settings,
+) -> rupi_ext::ExtensionSet {
     let dir = ext_dir(home, cli);
     let mut set = rupi_ext::ExtensionSet::new(dir.clone());
     set.set_discover(!cli.no_extensions);
     for p in &cli.extension {
         set.add_extra(PathBuf::from(p));
     }
+    apply_resource_filters(&mut set, settings);
     let manifests = set.load_all();
     if !manifests.is_empty() {
         eprintln!(
@@ -804,12 +843,20 @@ fn skill_dirs_runtime(cli: &Cli, home: &PathBuf, load_project: bool) -> Vec<Path
     dirs
 }
 
-fn discover_skills(cli: &Cli, home: &PathBuf, load_project: bool) -> SkillRegistry {
-    let extra: Vec<PathBuf> = cli.skill.iter().map(PathBuf::from).collect();
+fn discover_skills(
+    cli: &Cli,
+    home: &PathBuf,
+    load_project: bool,
+    settings: &rupi_config::Settings,
+) -> SkillRegistry {
+    let mut extra: Vec<PathBuf> = cli.skill.iter().map(PathBuf::from).collect();
+    let filter = rupi_config::ResourceFilter::from_specs(settings.skills.as_deref());
+    extra.extend(filter.extra_paths.iter().cloned());
     let reg = SkillRegistry::discover(&skill_dirs_runtime(cli, home, load_project));
     if !extra.is_empty() {
         reg.ingest_paths(&extra);
     }
+    reg.retain_allowed(|n| filter.allows(n));
     reg
 }
 
@@ -869,7 +916,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Cmd::SkillsList) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            let settings = rupi_config::Settings::load(&home, &cwd);
+            let filter = rupi_config::ResourceFilter::from_specs(settings.skills.as_deref());
             let reg = SkillRegistry::discover(&skill_dirs(&home, true));
+            if !filter.extra_paths.is_empty() {
+                reg.ingest_paths(&filter.extra_paths);
+            }
+            reg.retain_allowed(|n| filter.allows(n));
             // 无技能时工具定义为空（渐进披露无入口），给提示而非光杆标题块
             if reg.tool_definitions().is_empty() {
                 println!(
@@ -891,7 +945,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Cmd::SkillLoad { name }) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            let settings = rupi_config::Settings::load(&home, &cwd);
+            let filter = rupi_config::ResourceFilter::from_specs(settings.skills.as_deref());
             let reg = SkillRegistry::discover(&skill_dirs(&home, true));
+            if !filter.extra_paths.is_empty() {
+                reg.ingest_paths(&filter.extra_paths);
+            }
+            reg.retain_allowed(|n| filter.allows(n));
             match reg.load_skill(&name) {
                 Some(body) => println!("{body}"),
                 None => eprintln!("unknown skill: {name}"),
@@ -928,7 +989,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::ExtList) => {
             let dir = ext_dir(&home, &cli);
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            let settings = rupi_config::Settings::load(&home, &cwd);
             let mut set = rupi_ext::ExtensionSet::new(dir.clone());
+            apply_resource_filters(&mut set, &settings);
             let manifests = set.load_all();
             if manifests.is_empty() {
                 println!("no extensions in {} (*.json manifests)", dir.display());
@@ -1002,14 +1066,36 @@ async fn main() -> anyhow::Result<()> {
             }
             for p in rows {
                 println!(
-                    "{}  {}  skills=[{}] commands=[{}] ext=[{}]",
+                    "{}  {}  skills=[{}] commands=[{}] ext=[{}] themes=[{}]",
                     p.id,
                     p.spec,
                     p.skills.join(","),
                     p.commands.join(","),
-                    p.extensions.join(",")
+                    p.extensions.join(","),
+                    p.themes.join(",")
                 );
             }
+        }
+        Some(Cmd::Config { local, action }) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            let parsed = match action {
+                None => config_cmd::Action::List { kind: None },
+                Some(ConfigAction::List { kind }) => config_cmd::Action::List {
+                    kind: kind
+                        .as_deref()
+                        .map(rupi_config::ConfigKind::parse)
+                        .transpose()?,
+                },
+                Some(ConfigAction::Enable { kind, name }) => config_cmd::Action::Enable {
+                    kind: rupi_config::ConfigKind::parse(&kind)?,
+                    name,
+                },
+                Some(ConfigAction::Disable { kind, name }) => config_cmd::Action::Disable {
+                    kind: rupi_config::ConfigKind::parse(&kind)?,
+                    name,
+                },
+            };
+            config_cmd::run(&home, &cwd, local, parsed)?;
         }
         Some(Cmd::Cloud { url, action }) => {
             let key = cli
@@ -1023,10 +1109,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::McpList { command, args, url }) => {
             let mut cfg = rupi_mcp::McpServerConfig::new("probe", &command, args);
             cfg.url = url;
-            let bridge = if cfg.url.is_some() {
-                rupi_mcp::McpBridge::spawn_http(cfg).await?
-            } else {
-                rupi_mcp::McpBridge::spawn(cfg).await?
+            let bridge = match cfg.url.as_deref() {
+                Some(u) if rupi_mcp::is_ws_url(u) => rupi_mcp::McpBridge::spawn_ws(cfg).await?,
+                Some(_) => rupi_mcp::McpBridge::spawn_http(cfg).await?,
+                None => rupi_mcp::McpBridge::spawn(cfg).await?,
             };
             println!("== tools ==");
             for t in bridge.list_tools().await? {
@@ -1752,7 +1838,7 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     } else {
         None
     };
-    let ext_set = load_extensions(&mut tools, cli, home);
+    let ext_set = load_extensions(&mut tools, cli, home, &rt.settings);
     let mut store = memory_store(home, load_project);
     if cli.no_memory {
         store.memory_enabled = false;
@@ -1761,7 +1847,7 @@ async fn run_rpc(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let frozen = store.frozen_snapshot();
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
-    let skills = discover_skills(cli, home, load_project);
+    let skills = discover_skills(cli, home, load_project, &rt.settings);
     let sess_db = SessionStore::open(&session_store_home(cli, home))?;
     let (session_tree, sid) = restore_or_new(cli, &sess_db, false)?;
     let provider: Arc<dyn LlmProvider> =
@@ -1867,7 +1953,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     } else {
         None
     };
-    let ext_set = load_extensions(&mut tools, cli, home);
+    let ext_set = load_extensions(&mut tools, cli, home, &rt.settings);
     let ext_arcs = ext_set.extension_arcs();
     let mut store = memory_store(home, load_project);
     if cli.no_memory {
@@ -1878,7 +1964,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(discover_skills(cli, home, load_project));
+    let skills = Arc::new(discover_skills(cli, home, load_project, &rt.settings));
     let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
         cli, home,
     ))?));
@@ -2136,7 +2222,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
         None
     };
     // 外部扩展：启动加载 + REPL 每轮自动热重载（/reload 手动触发）
-    let mut ext_set = load_extensions(&mut tools, cli, home);
+    let mut ext_set = load_extensions(&mut tools, cli, home, &rt.settings);
     // 项目信任门已在启动时问过（load_project）。
     // 项目上下文（AGENTS.md 系）同样守信任门。
     agent = apply_context_dirs(agent, cli, load_project, home);
@@ -2149,7 +2235,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(discover_skills(cli, home, load_project));
+    let skills = Arc::new(discover_skills(cli, home, load_project, &rt.settings));
     let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
         cli, home,
     ))?));
@@ -2264,7 +2350,19 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
             }
             let fresh = rupi_config::Settings::load(home, &cwd);
             settings.theme = fresh.theme;
-            println!("[theme] {}", settings.theme());
+            settings.themes = fresh.themes;
+            settings.packages = fresh.packages;
+            settings.extensions = fresh.extensions;
+            settings.skills = fresh.skills;
+            settings.prompts = fresh.prompts;
+            let applied = rupi_tui::theme::Theme::resolve_at(
+                settings.theme(),
+                home,
+                &cwd,
+                load_project,
+                settings.themes.as_deref(),
+            );
+            println!("[theme] {}", applied.name);
             continue;
         }
         if let Some((name, args)) = rupi_tui::slash::parse_local_slash(&input) {
@@ -2636,7 +2734,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
     } else {
         None
     };
-    let mut ext_set = load_extensions(&mut tools, cli, home);
+    let mut ext_set = load_extensions(&mut tools, cli, home, &rt.settings);
     let mut store = memory_store(home, load_project);
     if cli.no_memory {
         store.memory_enabled = false;
@@ -2646,7 +2744,7 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
     let mut mem_mgr = MemoryManager::new(store);
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
-    let skills = Arc::new(discover_skills(cli, home, load_project));
+    let skills = Arc::new(discover_skills(cli, home, load_project, &rt.settings));
     let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(
         &session_store_home(cli, home),
     )?));

@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod resources;
+pub use resources::{
+    config_write_target, names_match, persist_toggle, settings_specs, toggle_in_settings,
+    toggle_spec_list, ConfigKind, ResourceFilter,
+};
+
 /// 压实参数（对标上游 `compaction`：`reserveTokens` / `keepRecentTokens`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -106,6 +112,18 @@ pub struct Settings {
     /// 路径追加扫描；裸名当允许名单；`!name` 排除。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<Vec<String>>,
+    /// 已装包启停（`rupi config`；`!id` 禁用该包物化出的资源）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<String>>,
+    /// 扩展路径 / 启停（对标 Pi `settings.extensions`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+    /// Skill 路径 / 启停（对标 Pi `settings.skills`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// 主题路径 / 启停（对标 Pi `settings.themes`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub themes: Option<Vec<String>>,
 }
 
 fn compaction_is_empty(c: &CompactionSettings) -> bool {
@@ -229,7 +247,7 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
     };
     let session_dir = settings.session_dir().unwrap_or("(RUPI_HOME)");
     format!(
-        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}\n  quietStartup           {}\n  sessionDir             {session_dir}\n  prompts                {prompts}",
+        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}\n  quietStartup           {}\n  sessionDir             {session_dir}\n  prompts                {prompts}\n  packages               {}\n  extensions             {}\n  skills                 {}\n  themes                 {}",
         write_path.display(),
         settings.steering_mode_str(),
         settings.follow_up_mode_str(),
@@ -238,7 +256,19 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
         settings.thinking.as_deref().unwrap_or("(unset)"),
         settings.theme(),
         settings.quiet_startup(),
+        join_opt(&settings.packages),
+        join_opt(&settings.extensions),
+        join_opt(&settings.skills),
+        join_opt(&settings.themes),
     )
+}
+
+fn join_opt(v: &Option<Vec<String>>) -> String {
+    match v {
+        None => "(default)".to_string(),
+        Some(x) if x.is_empty() => "[]".to_string(),
+        Some(x) => x.join(", "),
+    }
 }
 
 /// 可热改的核心键。
@@ -317,7 +347,7 @@ pub fn apply_setting(
         }
         "theme" => {
             let v = parse_theme(value)?;
-            settings.theme = Some(v.to_string());
+            settings.theme = Some(v.clone());
             Ok(("theme".into(), json!(v)))
         }
         "quietstartup" => {
@@ -397,12 +427,12 @@ fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
     }
 }
 
-fn parse_theme(value: &str) -> anyhow::Result<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "dark" => Ok("dark"),
-        "light" => Ok("light"),
-        other => anyhow::bail!("theme must be dark|light, got '{other}'"),
+fn parse_theme(value: &str) -> anyhow::Result<String> {
+    let v = value.trim();
+    if v.is_empty() || v.contains('/') {
+        anyhow::bail!("theme name must be non-empty and must not contain '/'");
     }
+    Ok(v.to_string())
 }
 
 fn parse_queue_mode(value: &str) -> anyhow::Result<&'static str> {
@@ -582,7 +612,7 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn load_file(path: &Path) -> Settings {
+pub(crate) fn load_file(path: &Path) -> Settings {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Settings::default();
     };
@@ -634,6 +664,18 @@ fn merge(mut base: Settings, over: Settings) -> Settings {
     }
     if over.prompts.is_some() {
         base.prompts = over.prompts;
+    }
+    if over.packages.is_some() {
+        base.packages = over.packages;
+    }
+    if over.extensions.is_some() {
+        base.extensions = over.extensions;
+    }
+    if over.skills.is_some() {
+        base.skills = over.skills;
+    }
+    if over.themes.is_some() {
+        base.themes = over.themes;
     }
     base.compaction = merge_compaction(base.compaction, over.compaction);
     base
@@ -808,7 +850,11 @@ mod tests {
         assert_eq!(tk, "theme");
         assert_eq!(s.theme(), "light");
         assert_eq!(tv, json!("light"));
-        assert!(apply_setting(&mut s, "theme", "neon").is_err());
+        let (nk, nv) = apply_setting(&mut s, "theme", "neon").unwrap();
+        assert_eq!(nk, "theme");
+        assert_eq!(s.theme(), "neon");
+        assert_eq!(nv, json!("neon"));
+        assert!(apply_setting(&mut s, "theme", "bad/name").is_err());
         let (qk, qv) = apply_setting(&mut s, "quietStartup", "true").unwrap();
         assert_eq!(qk, "quietStartup");
         assert_eq!(qv, json!(true));

@@ -1,4 +1,4 @@
-//! 扫描 Pi 包布局：`package.json#pi` 或 `skills/` `prompts/` `commands/` `extensions/`。
+//! 扫描 Pi 包布局：`package.json#pi` 或 `skills/` `prompts/` `commands/` `extensions/` `themes/`。
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -9,12 +9,16 @@ pub struct PackageResources {
     pub skills: Vec<PathBuf>,
     pub commands: Vec<PathBuf>,
     pub extensions: Vec<PathBuf>,
+    pub themes: Vec<PathBuf>,
     pub skipped_ts_extensions: usize,
 }
 
 impl PackageResources {
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty() && self.commands.is_empty() && self.extensions.is_empty()
+        self.skills.is_empty()
+            && self.commands.is_empty()
+            && self.extensions.is_empty()
+            && self.themes.is_empty()
     }
 }
 
@@ -25,6 +29,7 @@ pub enum ResourceKind {
     Skill,
     Command,
     Extension,
+    Theme,
 }
 
 impl ResourceKind {
@@ -36,7 +41,10 @@ impl ResourceKind {
                 Ok(Self::Command)
             }
             Some("extension") | Some("ext") | Some("extensions") => Ok(Self::Extension),
-            Some(other) => anyhow::bail!("unknown --kind `{other}` (skill|command|extension)"),
+            Some("theme") | Some("themes") => Ok(Self::Theme),
+            Some(other) => {
+                anyhow::bail!("unknown --kind `{other}` (skill|command|extension|theme)")
+            }
         }
     }
 
@@ -46,16 +54,25 @@ impl ResourceKind {
             Self::Skill => {
                 r.commands.clear();
                 r.extensions.clear();
+                r.themes.clear();
                 r
             }
             Self::Command => {
                 r.skills.clear();
                 r.extensions.clear();
+                r.themes.clear();
                 r
             }
             Self::Extension => {
                 r.skills.clear();
                 r.commands.clear();
+                r.themes.clear();
+                r
+            }
+            Self::Theme => {
+                r.skills.clear();
+                r.commands.clear();
+                r.extensions.clear();
                 r
             }
         }
@@ -95,7 +112,16 @@ fn discover_file(path: &Path) -> PackageResources {
     } else if ext == "md" {
         res.commands.push(path.to_path_buf());
     } else if ext == "json" {
-        res.extensions.push(path.to_path_buf());
+        let parent = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if parent.eq_ignore_ascii_case("themes") {
+            res.themes.push(path.to_path_buf());
+        } else {
+            res.extensions.push(path.to_path_buf());
+        }
     }
     res
 }
@@ -109,6 +135,7 @@ fn discover_from_package_json(root: &Path) -> Option<PackageResources> {
     collect_md_entries(root, pi.get("prompts"), &mut res.commands);
     collect_md_entries(root, pi.get("commands"), &mut res.commands);
     collect_ext_entries(root, pi.get("extensions"), &mut res);
+    collect_theme_entries(root, pi.get("themes"), &mut res.themes);
     if res.is_empty() && res.skipped_ts_extensions == 0 {
         return None;
     }
@@ -130,6 +157,10 @@ fn discover_convention(root: &Path) -> PackageResources {
     let ext_dir = root.join("extensions");
     if ext_dir.is_dir() {
         collect_ext_dir(&ext_dir, &mut res);
+    }
+    let themes_dir = root.join("themes");
+    if themes_dir.is_dir() {
+        collect_theme_dir(&themes_dir, &mut res.themes);
     }
     res
 }
@@ -180,6 +211,30 @@ fn collect_md_entries(root: &Path, v: Option<&Value>, out: &mut Vec<PathBuf>) {
             collect_md_dir(&p, out);
         }
     }
+}
+
+fn collect_theme_entries(root: &Path, v: Option<&Value>, out: &mut Vec<PathBuf>) {
+    for rel in path_list(v) {
+        let p = resolve_entry(root, &rel);
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json") {
+            out.push(p);
+        } else if p.is_dir() {
+            collect_theme_dir(&p, out);
+        }
+    }
+}
+
+fn collect_theme_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json") && p.is_file())
+        .collect();
+    files.sort();
+    out.extend(files);
 }
 
 fn collect_ext_entries(root: &Path, v: Option<&Value>, res: &mut PackageResources) {
@@ -301,6 +356,25 @@ pub fn command_install_name(path: &Path) -> Option<String> {
     }
 }
 
+/// 主题名：JSON `name` 或文件 stem（不得含 `/`）。
+pub fn theme_install_name(path: &Path) -> String {
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                let n = n.trim();
+                if is_theme_name(n) {
+                    return n.to_string();
+                }
+            }
+        }
+    }
+    sanitize_file_stem(path.file_stem().and_then(|s| s.to_str()).unwrap_or("theme"))
+}
+
+fn is_theme_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.contains('/') && !name.contains('\\')
+}
+
 /// 扩展名：manifest `name` 或文件 stem。
 pub fn extension_install_name(path: &Path) -> String {
     if let Ok(raw) = std::fs::read_to_string(path) {
@@ -410,22 +484,30 @@ mod tests {
             r#"{"name":"upper","description":"d","input_schema":{},"command":"true"}"#,
         );
         write(&base, "extensions/legacy.ts", "export default {}");
+        write(
+            &base,
+            "themes/neon.json",
+            r##"{"name":"neon","colors":{"accent":"#ff00aa"}}"##,
+        );
         let r = discover(&base).unwrap();
         assert_eq!(r.skills.len(), 1);
         assert_eq!(skill_install_name(&r.skills[0]), "foo");
         assert_eq!(r.commands.len(), 1);
         assert_eq!(r.extensions.len(), 1);
+        assert_eq!(r.themes.len(), 1);
+        assert_eq!(theme_install_name(&r.themes[0]), "neon");
         assert_eq!(r.skipped_ts_extensions, 1);
 
         write(
             &base,
             "package.json",
-            r#"{"name":"x","pi":{"skills":["./skills"],"prompts":["./prompts"],"extensions":[]}}"#,
+            r#"{"name":"x","pi":{"skills":["./skills"],"prompts":["./prompts"],"extensions":[],"themes":["./themes"]}}"#,
         );
         let r = discover(&base).unwrap();
         assert_eq!(r.skills.len(), 1);
         assert_eq!(r.commands.len(), 1);
         assert!(r.extensions.is_empty());
+        assert_eq!(r.themes.len(), 1);
         let _ = std::fs::remove_dir_all(&base);
     }
 

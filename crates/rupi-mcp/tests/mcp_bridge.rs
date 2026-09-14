@@ -519,3 +519,84 @@ async fn tools_list_changed_refreshes_registry() {
     // 未知 server 刷新直接报错，不动注册表
     assert!(manager.refresh_server(&mut registry, "nope").await.is_err());
 }
+
+async fn start_ws_stub() -> String {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    let txt = match msg {
+                        Message::Text(t) => t.to_string(),
+                        Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => continue,
+                    };
+                    let req: serde_json::Value =
+                        serde_json::from_str(&txt).unwrap_or(serde_json::json!({}));
+                    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let id = req.get("id").cloned().unwrap_or(serde_json::json!(0));
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let payload = match method {
+                        "initialize" => serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "result":{"protocolVersion":"2024-11-05"}
+                        }),
+                        "notifications/initialized" => continue,
+                        "tools/list" => serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "result":{"tools":[{
+                                "name":"wecho","description":"ws echo",
+                                "inputSchema":{"type":"object"}
+                            }]}
+                        }),
+                        "tools/call" => serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "result":{"content":[{"type":"text","text":"WS-HI"}]}
+                        }),
+                        "ping" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        other => serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "error":{"code":-32601,"message":format!("not found: {other}")}
+                        }),
+                    };
+                    let _ = ws.send(Message::Text(payload.to_string().into())).await;
+                }
+            });
+        }
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test]
+async fn ws_transport_lists_and_calls_tools() {
+    let url = start_ws_stub().await;
+    let mut cfg = McpServerConfig::new("w", "", vec![]);
+    cfg.url = Some(url.clone());
+    let bridge = rupi_mcp::McpBridge::spawn_ws(cfg).await.expect("spawn ws");
+    let tools = bridge.list_tools().await.expect("list");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "wecho");
+    let r = bridge
+        .call_tool("wecho", serde_json::json!({}), &tools[0].input_schema)
+        .await
+        .expect("call");
+    assert!(!r.is_error);
+    assert_eq!(r.text, "WS-HI");
+
+    let mut cfg2 = McpServerConfig::new("w2", "", vec![]);
+    cfg2.url = Some(url);
+    let manager = McpManager::spawn_all(&[cfg2]).await.expect("spawn all ws");
+    assert_eq!(manager.entries.len(), 1);
+    drop(bridge);
+}

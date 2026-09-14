@@ -2,7 +2,7 @@
 
 use crate::layout::{
     command_install_name, copy_tree, discover, extension_install_name, skill_install_name,
-    PackageResources, ResourceKind,
+    theme_install_name, PackageResources, ResourceKind,
 };
 use crate::spec::{git_slug, npm_slug, parse_spec, PackageSource};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub struct PackageRecord {
     pub skills: Vec<String>,
     pub commands: Vec<String>,
     pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub themes: Vec<String>,
     pub local: bool,
 }
 
@@ -73,7 +75,7 @@ pub async fn install(spec: &str, opts: &InstallOpts) -> anyhow::Result<InstallRe
             );
         }
         anyhow::bail!(
-            "no skills/, prompts|commands/*.md, or extensions/*.json in {}",
+            "no skills/, prompts|commands/*.md, extensions/*.json, or themes/*.json in {}",
             checkout.display()
         );
     }
@@ -94,6 +96,7 @@ pub async fn install(spec: &str, opts: &InstallOpts) -> anyhow::Result<InstallRe
         skills: materialized.skills,
         commands: materialized.commands,
         extensions: materialized.extensions,
+        themes: materialized.themes,
         local: opts.local,
     };
     lock.packages.retain(|p| p.id != record.id);
@@ -293,12 +296,14 @@ struct Materialized {
     skills: Vec<String>,
     commands: Vec<String>,
     extensions: Vec<String>,
+    themes: Vec<String>,
 }
 
 fn materialize(root: &Path, res: &PackageResources) -> anyhow::Result<Materialized> {
     let mut skills = Vec::new();
     let mut commands = Vec::new();
     let mut extensions = Vec::new();
+    let mut themes = Vec::new();
     for dir in &res.skills {
         let name = skill_install_name(dir);
         let dest = root.join("skills").join(&name);
@@ -324,13 +329,22 @@ fn materialize(root: &Path, res: &PackageResources) -> anyhow::Result<Materializ
         std::fs::copy(path, dest_dir.join(format!("{name}.json")))?;
         extensions.push(name);
     }
+    for path in &res.themes {
+        let name = theme_install_name(path);
+        let dest_dir = root.join("themes");
+        std::fs::create_dir_all(&dest_dir)?;
+        std::fs::copy(path, dest_dir.join(format!("{name}.json")))?;
+        themes.push(name);
+    }
     skills.sort();
     commands.sort();
     extensions.sort();
+    themes.sort();
     Ok(Materialized {
         skills,
         commands,
         extensions,
+        themes,
     })
 }
 
@@ -345,6 +359,10 @@ fn remove_materialized(root: &Path, rec: &PackageRecord) {
     }
     for e in &rec.extensions {
         let p = root.join("extensions").join(format!("{e}.json"));
+        let _ = std::fs::remove_file(p);
+    }
+    for t in &rec.themes {
+        let p = root.join("themes").join(format!("{t}.json"));
         let _ = std::fs::remove_file(p);
     }
 }
@@ -389,6 +407,9 @@ pub fn format_report(r: &InstallReport) -> String {
     }
     if !rec.extensions.is_empty() {
         lines.push(format!("  extensions: {}", rec.extensions.join(", ")));
+    }
+    if !rec.themes.is_empty() {
+        lines.push(format!("  themes: {}", rec.themes.join(", ")));
     }
     if r.skipped_ts_extensions > 0 {
         lines.push(format!(
@@ -444,6 +465,11 @@ mod tests {
         );
         write(
             &pkg,
+            "themes/neon.json",
+            r##"{"name":"neon","colors":{"accent":"#ff00aa","text":"#ffffff"}}"##,
+        );
+        write(
+            &pkg,
             "package.json",
             r#"{"name":"demo","keywords":["pi-package"]}"#,
         );
@@ -453,9 +479,11 @@ mod tests {
         assert_eq!(report.record.skills, vec!["demo-skill".to_string()]);
         assert_eq!(report.record.commands, vec!["greet".to_string()]);
         assert_eq!(report.record.extensions, vec!["demo-echo".to_string()]);
+        assert_eq!(report.record.themes, vec!["neon".to_string()]);
         assert!(home.join("skills/demo-skill/SKILL.md").is_file());
         assert!(home.join("commands/greet.md").is_file());
         assert!(home.join("extensions/demo-echo.json").is_file());
+        assert!(home.join("themes/neon.json").is_file());
 
         let listed = list_installed(&o);
         assert_eq!(listed.len(), 1);

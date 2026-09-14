@@ -4,6 +4,7 @@
   "pi": {
     "skills": ["./skills"],
     "prompts": ["./prompts"],
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "themes": ["./themes"]
   }
 }

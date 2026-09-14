@@ -735,7 +735,13 @@ async fn run_loop(
     let mut reader = EventStream::new();
     let mut chrome = UiChrome::default();
     if let Some(s) = ctx.settings.as_ref() {
-        chrome.theme = Theme::resolve(s.theme());
+        chrome.theme = Theme::resolve_at(
+            s.theme(),
+            &ctx.settings_home,
+            &ctx.settings_cwd,
+            ctx.load_project,
+            s.themes.as_deref(),
+        );
     }
     chrome.footer.model = ctx.provider.name().to_string();
     let mut tree: Option<TreeNavigator> = None;
@@ -1228,7 +1234,13 @@ async fn run_loop(
                         ctx.agent.inbox.as_deref(),
                     ) {
                         if let Some(s) = ctx.settings.as_ref() {
-                            chrome.theme = Theme::from_name(s.theme());
+                            chrome.theme = Theme::resolve_at(
+                                s.theme(),
+                                &ctx.settings_home,
+                                &ctx.settings_cwd,
+                                ctx.load_project,
+                                s.themes.as_deref(),
+                            );
                             let filter =
                                 rupi_core::commands::PromptFilter::from_specs(s.prompts.as_deref());
                             ctx.command_dirs = commands::command_dirs_for(
@@ -1301,6 +1313,7 @@ async fn run_loop(
                                     ctx.settings.as_deref_mut(),
                                     &ctx.settings_home,
                                     &ctx.settings_cwd,
+                                    ctx.load_project,
                                     &mut chrome,
                                 ) {
                                     if !msg.is_empty() {
@@ -2221,15 +2234,22 @@ fn reload_theme_from_disk(
     settings: Option<&mut rupi_config::Settings>,
     home: &std::path::Path,
     cwd: &std::path::Path,
+    load_project: bool,
     chrome: &mut UiChrome,
 ) -> Option<String> {
     let fresh = rupi_config::Settings::load(home, cwd);
     let name = fresh.theme().to_string();
+    let extra = fresh.themes.clone();
     if let Some(s) = settings {
         s.theme = fresh.theme;
+        s.themes = fresh.themes;
+        s.packages = fresh.packages;
+        s.extensions = fresh.extensions;
+        s.skills = fresh.skills;
+        s.prompts = fresh.prompts;
     }
-    chrome.theme = Theme::from_name(&name);
-    Some(format!("[theme] {name}"))
+    chrome.theme = Theme::resolve_at(&name, home, cwd, load_project, extra.as_deref());
+    Some(format!("[theme] {}", chrome.theme.name))
 }
 
 fn handle_settings_cmd(
@@ -3797,10 +3817,24 @@ mod tests {
         std::fs::write(dir.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
         let mut loaded = rupi_config::Settings::default();
         let mut chrome = UiChrome::default();
-        let line = reload_theme_from_disk(Some(&mut loaded), &dir, &dir, &mut chrome).unwrap();
+        let line =
+            reload_theme_from_disk(Some(&mut loaded), &dir, &dir, true, &mut chrome).unwrap();
         assert!(line.contains("light"), "{line}");
         assert_eq!(chrome.theme.name, "light");
         assert_eq!(loaded.theme(), "light");
+
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(
+            dir.join("themes/neon.json"),
+            r##"{"name":"neon","colors":{"accent":"#ff00aa","user":"#00ffff"}}"##,
+        )
+        .unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"theme":"neon"}"#).unwrap();
+        let line =
+            reload_theme_from_disk(Some(&mut loaded), &dir, &dir, true, &mut chrome).unwrap();
+        assert!(line.contains("neon"), "{line}");
+        assert_eq!(chrome.theme.name, "neon");
+        assert_eq!(chrome.theme.accent, ratatui::style::Color::Rgb(255, 0, 170));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

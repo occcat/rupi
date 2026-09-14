@@ -258,6 +258,8 @@ pub struct ExtensionSet {
     rpc_hosts: HashMap<String, Arc<rpc::RpcHost>>,
     extra: Vec<PathBuf>,
     discover: bool,
+    denied: Vec<String>,
+    force: Vec<String>,
 }
 
 impl ExtensionSet {
@@ -268,7 +270,22 @@ impl ExtensionSet {
             rpc_hosts: HashMap::new(),
             extra: Vec::new(),
             discover: true,
+            denied: Vec::new(),
+            force: Vec::new(),
         }
+    }
+
+    /// `rupi config` 启停：`!name` 进 deny，`+name` 进 force。
+    pub fn set_name_filter(&mut self, deny: Vec<String>, force: Vec<String>) {
+        self.denied = deny;
+        self.force = force;
+    }
+
+    fn name_ok(&self, name: &str) -> bool {
+        if self.force.iter().any(|f| f == name) {
+            return true;
+        }
+        !self.denied.iter().any(|d| d == name)
     }
 
     pub fn set_discover(&mut self, yes: bool) {
@@ -420,9 +437,12 @@ impl ExtensionSet {
         let mut manifests = vec![];
         for (key, path, mtime) in self.manifests() {
             match load_one(&path) {
-                Ok(m) => {
+                Ok(m) if self.name_ok(&m.name) => {
                     self.snapshot.insert(key, (mtime, m.name.clone()));
                     manifests.push(m);
+                }
+                Ok(m) => {
+                    tracing::debug!("skip disabled extension {}", m.name);
                 }
                 Err(e) => tracing::warn!("skip extension {}: {e:#}", path.display()),
             }
@@ -450,7 +470,7 @@ impl ExtensionSet {
                 continue;
             }
             match load_one(path) {
-                Ok(m) => {
+                Ok(m) if self.name_ok(&m.name) => {
                     // 改名：旧工具名必须注销，否则 registry 里永远残留
                     if let Some((_, old_name)) = self.snapshot.get(key) {
                         if *old_name != m.name {
@@ -459,6 +479,12 @@ impl ExtensionSet {
                     }
                     self.snapshot.insert(key.clone(), (*mtime, m.name.clone()));
                     changed.push(m);
+                }
+                Ok(m) => {
+                    tracing::debug!("skip disabled extension {}", m.name);
+                    if let Some((_, old_name)) = self.snapshot.remove(key) {
+                        removed_later.push(old_name);
+                    }
                 }
                 Err(e) => tracing::warn!("skip extension {}: {e:#}", path.display()),
             }
