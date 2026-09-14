@@ -22,14 +22,40 @@ use rupi_skills::SkillRegistry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// SSE 出站有界队列。慢客户端满则丢事件，不 `send().await`，以免占着 run 租约。
+const SSE_EVENT_CAP: usize = 256;
+/// AgentLoop → mapper 有界队列。`on_event` 是同步回调，满则丢，不能无限撑内存。
+const AGENT_EVENT_CAP: usize = 256;
+
 pub enum Preflight {
     Stream(mpsc::Receiver<AguiEvent>, rupi_core::CancelFlag),
     Status { code: u16, body: serde_json::Value },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    Sent,
+    Full,
+    Closed,
+}
+
+fn try_offer<T>(tx: &mpsc::Sender<T>, ev: T) -> Offer {
+    match tx.try_send(ev) {
+        Ok(()) => Offer::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => Offer::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => Offer::Closed,
+    }
+}
+
 fn emit(tx: &mpsc::Sender<AguiEvent>, ev: AguiEvent) {
-    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(ev) {
+    if try_offer(tx, ev) == Offer::Full {
         tracing::warn!("ag-ui sse backlog full; dropping event");
+    }
+}
+
+fn offer_agent_event(tx: &mpsc::Sender<rupi_core::AgentEvent>, ev: rupi_core::AgentEvent) {
+    if try_offer(tx, ev) == Offer::Full {
+        tracing::warn!("ag-ui agent event backlog full; dropping event");
     }
 }
 
@@ -132,7 +158,7 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
         };
     }
 
-    let (tx, rx) = mpsc::channel::<AguiEvent>(256);
+    let (tx, rx) = mpsc::channel::<AguiEvent>(SSE_EVENT_CAP);
     let cancel = CancelFlag::new();
     let cancel_drive = cancel.clone();
     let err_thread = input.thread_id.clone();
@@ -308,7 +334,7 @@ async fn drive(
     );
 
     let mut mapper = EventMapper::new(input.thread_id.clone(), input.run_id.clone());
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<rupi_core::AgentEvent>();
+    let (ev_tx, mut ev_rx) = mpsc::channel::<rupi_core::AgentEvent>(AGENT_EVENT_CAP);
     let map_tx = tx.clone();
     let bump_pool = app.pool.clone();
     let bump_tenant = tenant.id.clone();
@@ -335,7 +361,7 @@ async fn drive(
     });
 
     let on_event = move |e: rupi_core::AgentEvent| {
-        let _ = ev_tx.send(e);
+        offer_agent_event(&ev_tx, e);
     };
 
     let mut agent = AgentLoop::new(12)
@@ -1059,5 +1085,50 @@ mod tests {
         let b = resolve_byok(&t);
         assert_eq!(b.provider, "anthropic");
         assert!(b.api_key.is_none());
+    }
+
+    fn drain_agui(rx: &mut mpsc::Receiver<AguiEvent>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn sse_emit_drops_when_backlog_full() {
+        let (tx, mut rx) = mpsc::channel::<AguiEvent>(SSE_EVENT_CAP);
+        for i in 0..(SSE_EVENT_CAP + 32) {
+            emit(&tx, agui::run_started("t", &format!("r{i}"), None));
+        }
+        assert_eq!(drain_agui(&mut rx), SSE_EVENT_CAP);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn agent_event_offer_drops_when_backlog_full() {
+        let (tx, mut rx) = mpsc::channel::<rupi_core::AgentEvent>(AGENT_EVENT_CAP);
+        for i in 0..(AGENT_EVENT_CAP + 32) {
+            offer_agent_event(
+                &tx,
+                rupi_core::AgentEvent::TextDelta {
+                    delta: i.to_string(),
+                },
+            );
+        }
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, AGENT_EVENT_CAP);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn try_offer_reports_closed_without_growing() {
+        let (tx, rx) = mpsc::channel::<u8>(1);
+        drop(rx);
+        assert_eq!(try_offer(&tx, 1), Offer::Closed);
+        assert_eq!(try_offer(&tx, 2), Offer::Closed);
     }
 }
