@@ -125,11 +125,7 @@ impl App {
 
     pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
         let t = token.into();
-        self.admin_token = if t.trim().is_empty() {
-            None
-        } else {
-            Some(t)
-        };
+        self.admin_token = if t.trim().is_empty() { None } else { Some(t) };
         self
     }
 
@@ -220,7 +216,12 @@ fn validate_executor_endpoints(cfg: &CloudConfig) -> anyhow::Result<()> {
 }
 
 fn build_object_store(cfg: &CloudConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
-    if let Some(uri) = cfg.snapshot_uri.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(uri) = cfg
+        .snapshot_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if uri == "memory:" || uri == "memory" {
             return Ok(Arc::new(MemoryObjectStore::new()));
         }
@@ -301,7 +302,10 @@ pub async fn serve(cfg: CloudConfig) -> anyhow::Result<()> {
 pub async fn spawn(
     app: App,
     bind: &str,
-) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     let listener = TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!(

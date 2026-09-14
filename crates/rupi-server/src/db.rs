@@ -101,7 +101,9 @@ fn pg_manager(database_url: &str) -> anyhow::Result<Manager> {
 }
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    Ok(Pool::builder(pg_manager(database_url)?).max_size(32).build()?)
+    Ok(Pool::builder(pg_manager(database_url)?)
+        .max_size(32)
+        .build()?)
 }
 
 pub async fn connect_with_size(database_url: &str, max_size: usize) -> anyhow::Result<PgPool> {
@@ -213,7 +215,9 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
              ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_qps INT NOT NULL DEFAULT 8;",
         )
         .await;
-    let _ = c.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;").await;
+    let _ = c
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+        .await;
     let _ = c
         .batch_execute(
             "CREATE INDEX IF NOT EXISTS memories_trgm ON memories USING gin (content gin_trgm_ops);
@@ -521,7 +525,11 @@ pub async fn list_tenant_ids(pool: &PgPool) -> anyhow::Result<Vec<String>> {
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
-pub async fn update_settings(pool: &PgPool, tenant_id: &str, settings: &Value) -> anyhow::Result<()> {
+pub async fn update_settings(
+    pool: &PgPool,
+    tenant_id: &str,
+    settings: &Value,
+) -> anyhow::Result<()> {
     let c = pool.get().await?;
     c.execute(
         "UPDATE tenants SET settings = $2 WHERE id = $1",
@@ -1059,9 +1067,8 @@ pub async fn load_tree(
         let blocks: Option<Value> = r.get(4);
         let created_at: DateTime<Utc> = r.get(5);
         let message = if let Some(Value::Object(_)) = &blocks {
-            serde_json::from_value::<Message>(blocks.unwrap()).unwrap_or_else(|_| {
-                Message::text(parse_role(&role_s), content)
-            })
+            serde_json::from_value::<Message>(blocks.unwrap())
+                .unwrap_or_else(|_| Message::text(parse_role(&role_s), content))
         } else {
             Message::text(parse_role(&role_s), content)
         };
@@ -1189,8 +1196,10 @@ pub async fn delete_tenant(pool: &PgPool, tenant_id: &str) -> anyhow::Result<u64
             &[&tenant_id],
         )
         .await;
-    Ok(c.execute("DELETE FROM tenants WHERE id = $1", &[&tenant_id])
-        .await?)
+    Ok(
+        c.execute("DELETE FROM tenants WHERE id = $1", &[&tenant_id])
+            .await?,
+    )
 }
 
 pub async fn insert_admin_audit(
@@ -1960,9 +1969,11 @@ mod tests {
             db_wire_mode_with("postgresql://rupi:rupi@localhost:5432/rupi", false).unwrap(),
             DbWireMode::PlaintextLoopback
         );
-        assert!(!db_wire_mode_with("postgres://rupi:rupi@127.0.0.1:5432/rupi", false)
-            .unwrap()
-            .uses_tls());
+        assert!(
+            !db_wire_mode_with("postgres://rupi:rupi@127.0.0.1:5432/rupi", false)
+                .unwrap()
+                .uses_tls()
+        );
 
         let remote_plain =
             db_wire_mode_with("postgres://rupi:rupi@db.example.com:5432/rupi", false).unwrap();

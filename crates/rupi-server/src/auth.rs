@@ -9,14 +9,16 @@ pub fn hash_key(raw: &str) -> String {
 pub fn generate_key() -> String {
     format!(
         "rupi_{}",
-        hex::encode(uuid::Uuid::new_v4().as_bytes()) + &hex::encode(uuid::Uuid::new_v4().as_bytes())
+        hex::encode(uuid::Uuid::new_v4().as_bytes())
+            + &hex::encode(uuid::Uuid::new_v4().as_bytes())
     )
 }
 
 pub fn generate_admin_key() -> String {
     format!(
         "rupi_admin_{}",
-        hex::encode(uuid::Uuid::new_v4().as_bytes()) + &hex::encode(uuid::Uuid::new_v4().as_bytes())
+        hex::encode(uuid::Uuid::new_v4().as_bytes())
+            + &hex::encode(uuid::Uuid::new_v4().as_bytes())
     )
 }
 

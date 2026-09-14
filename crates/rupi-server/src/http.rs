@@ -67,7 +67,10 @@ async fn ready(State(app): State<App>) -> Json<Value> {
 async fn metrics(State(app): State<App>) -> impl IntoResponse {
     let nodes = app.executor.node_stats().await;
     let runs = app.metrics.runs.load(std::sync::atomic::Ordering::Relaxed);
-    let r429 = app.metrics.reject_429.load(std::sync::atomic::Ordering::Relaxed);
+    let r429 = app
+        .metrics
+        .reject_429
+        .load(std::sync::atomic::Ordering::Relaxed);
     let used: u64 = nodes.iter().map(|n| n.used as u64).sum();
     let cap: u64 = nodes.iter().map(|n| n.capacity as u64).sum();
     let body = format!(
@@ -99,17 +102,25 @@ async fn tenant_of(app: &App, headers: &HeaderMap) -> Result<Tenant, Response> {
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let Some(key) = auth::extract_bearer(raw) else {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response());
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response());
     };
     let hash = auth::hash_key(key);
     match db::tenant_by_key_hash(&app.pool, &hash).await {
         Ok(Some(t)) => Ok(t),
-        Ok(None) => {
-            Err((StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response())
-        }
-        Err(e) => {
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response())
-        }
+        Ok(None) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()),
     }
 }
 
@@ -122,9 +133,11 @@ async fn session_guard(app: &App, tenant: &Tenant, id: &str) -> Result<db::Sessi
             }
             _ => Err((StatusCode::NOT_FOUND, Json(json!({"error":"not found"}))).into_response()),
         },
-        Err(e) => {
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response())
-        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()),
     }
 }
 
@@ -150,7 +163,12 @@ async fn get_settings(State(app): State<App>, headers: HeaderMap) -> Result<Json
     let t = tenant_of(&app, &headers).await?;
     let mut s = t.settings;
     if let Some(obj) = s.as_object_mut() {
-        for k in ["openai_api_key", "api_key", "anthropic_api_key", "gemini_api_key"] {
+        for k in [
+            "openai_api_key",
+            "api_key",
+            "anthropic_api_key",
+            "gemini_api_key",
+        ] {
             if obj.contains_key(k) {
                 obj.insert(k.into(), json!("***"));
             }
@@ -175,13 +193,16 @@ async fn patch_settings(
                 .into_response());
         }
     }
-    let merged = crate::admin::merge_allowed_settings(t.settings, &body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
-    })?;
+    let merged = crate::admin::merge_allowed_settings(t.settings, &body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response())?;
     db::update_settings(&app.pool, &t.id, &merged)
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         })?;
     Ok(Json(json!({"ok": true})))
 }
@@ -245,10 +266,18 @@ async fn create_session(
     )
     .await
     .map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     if reserved.is_none() {
-        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error":"handle quota"})),
+        )
+            .into_response());
     }
     let wh = match alloc_workspace(&app, &t.id, &id, Some(&region), backend_kind).await {
         Ok(h) => h,
@@ -261,7 +290,11 @@ async fn create_session(
                 )
                     .into_response());
             }
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response());
         }
     };
     let _ = db::set_runtime(&app.pool, &t.id, &id, &wh.backend, &wh.id).await;
@@ -279,16 +312,13 @@ async fn create_session(
     let boot = match body.bootstrap.as_deref() {
         Some("git") => BootstrapKind::Git {
             url: body.git_url.unwrap_or_default(),
-            token: body
-                .git_token
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    t.settings
-                        .get("git_token")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                }),
+            token: body.git_token.filter(|s| !s.is_empty()).or_else(|| {
+                t.settings
+                    .get("git_token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            }),
             hosts: body.git_hosts.unwrap_or_else(|| {
                 t.settings
                     .get("git_hosts")
@@ -309,16 +339,27 @@ async fn create_session(
         .ok()
         .flatten()
         .ok_or_else(|| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"session vanished"})),
+            )
+                .into_response()
         })?;
     cache_session_meta(&app, &row).await;
     Ok((StatusCode::CREATED, Json(session_json(&row, None))))
 }
 
-async fn list_sessions(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, Response> {
+async fn list_sessions(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
     let t = tenant_of(&app, &headers).await?;
     let rows = db::list_sessions(app.reader(), &t.id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     Ok(Json(json!({
         "sessions": rows.iter().map(|r| session_json(r, None)).collect::<Vec<_>>()
@@ -336,7 +377,8 @@ async fn get_session(
     let tree = db::load_tree(&app.pool, &t.id, &id).await.ok();
     Ok(Json(session_json(
         &row,
-        tree.as_ref().map(|tr| json!({"nodes": tr.nodes.len(), "tokens": tr.history_tokens()})),
+        tree.as_ref()
+            .map(|tr| json!({"nodes": tr.nodes.len(), "tokens": tr.history_tokens()})),
     )))
 }
 
@@ -404,11 +446,19 @@ async fn duplicate(
     let t = tenant_of(app, headers).await?;
     let src = session_guard(app, &t, id).await?;
     let mut tree = db::load_tree(&app.pool, &t.id, id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     if let Some(eid) = entry_id {
         if !tree.rewind_to(eid) && !tree.goto_node(eid) {
-            return Err((StatusCode::BAD_REQUEST, Json(json!({"error":"unknown entryId"}))).into_response());
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"unknown entryId"})),
+            )
+                .into_response());
         }
     }
     let new_tree = remap_tree(&tree, path_only);
@@ -417,10 +467,7 @@ async fn duplicate(
         .region
         .clone()
         .unwrap_or_else(|| resolve_region(app, &t, None));
-    let kind = src
-        .runtime_kind
-        .as_deref()
-        .and_then(BackendKind::parse);
+    let kind = src.runtime_kind.as_deref().and_then(BackendKind::parse);
     let reserved = db::insert_session_if_under_cap(
         &app.pool,
         &t.id,
@@ -435,10 +482,18 @@ async fn duplicate(
     )
     .await
     .map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     if reserved.is_none() {
-        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"handle quota"}))).into_response());
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error":"handle quota"})),
+        )
+            .into_response());
     }
     let wh = match alloc_workspace(app, &t.id, &new_id, Some(&region), kind).await {
         Ok(h) => h,
@@ -451,7 +506,11 @@ async fn duplicate(
                 )
                     .into_response());
             }
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": e.to_string()}))).into_response());
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response());
         }
     };
     let _ = db::mark_hot(
@@ -471,14 +530,22 @@ async fn duplicate(
     db::persist_tree(&app.pool, &t.id, &new_id, &new_tree)
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         })?;
     let row = db::get_session(&app.pool, &t.id, &new_id)
         .await
         .ok()
         .flatten()
         .ok_or_else(|| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"session vanished"})),
+            )
+                .into_response()
         })?;
     cache_session_meta(app, &row).await;
     Ok(Json(session_json(&row, None)))
@@ -499,17 +566,23 @@ async fn export_session(
     let t = tenant_of(&app, &headers).await?;
     let row = session_guard(&app, &t, &id).await?;
     let tree = db::load_tree(&app.pool, &t.id, &id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     if q.format.as_deref() == Some("html") {
         let html = export_tree_html(&tree, row.name.as_deref().unwrap_or("session"));
         return Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response());
     }
-    let cwd = row
-        .runtime_handle
-        .as_deref()
-        .unwrap_or("executor");
-    let jsonl = export_tree_jsonl(&tree, cwd, row.name.as_deref(), row.parent_session.as_deref());
+    let cwd = row.runtime_handle.as_deref().unwrap_or("executor");
+    let jsonl = export_tree_jsonl(
+        &tree,
+        cwd,
+        row.name.as_deref(),
+        row.parent_session.as_deref(),
+    );
     Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], jsonl).into_response())
 }
 
@@ -522,14 +595,22 @@ async fn import_session(
     let t = tenant_of(&app, &headers).await?;
     let _ = session_guard(&app, &t, &id).await?;
     let imported = import_jsonl(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
     })?;
     let mut tree = remap_tree(&imported.tree, false);
     tree.id = id.clone();
     db::persist_tree(&app.pool, &t.id, &id, &tree)
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         })?;
     app.cache.invalidate_session(&t.id, &id).await;
     Ok(Json(json!({"ok": true, "sessionId": id})))
@@ -547,13 +628,9 @@ async fn agent_run(
             Ok((st, Json(body)).into_response())
         }
         Preflight::Stream(rx, cancel) => {
-            let inner = tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
-                Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
-            });
-            let stream = CancelOnDrop {
-                inner,
-                cancel,
-            };
+            let inner = tokio_stream::wrappers::ReceiverStream::new(rx)
+                .map(|ev| Ok::<_, Infallible>(Event::default().data(ev.to_sse_data())));
+            let stream = CancelOnDrop { inner, cancel };
             Ok(Sse::new(stream)
                 .keep_alive(axum::response::sse::KeepAlive::default())
                 .into_response())

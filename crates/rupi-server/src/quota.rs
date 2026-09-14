@@ -52,11 +52,7 @@ pub async fn admit_run(cache: &Cache, pool: &PgPool, tenant: &Tenant) -> Admit {
             .unwrap_or(max + 1);
         if n < pg_active {
             let _ = cache
-                .set_ex(
-                    &Cache::rl_conc_key(&tenant.id),
-                    &pg_active.to_string(),
-                    600,
-                )
+                .set_ex(&Cache::rl_conc_key(&tenant.id), &pg_active.to_string(), 600)
                 .await;
             if pg_active >= max {
                 cache.decr(&Cache::rl_conc_key(&tenant.id)).await;

@@ -14,7 +14,10 @@ fn env_truthy(name: &str) -> bool {
 }
 
 #[derive(Parser)]
-#[command(name = "rupi-server", about = "Cloud control plane: AG-UI + REST, Postgres, external Executor")]
+#[command(
+    name = "rupi-server",
+    about = "Cloud control plane: AG-UI + REST, Postgres, external Executor"
+)]
 struct Cli {
     #[arg(long, env = "RUPI_LISTEN", default_value = "127.0.0.1:8080")]
     listen: String,
@@ -120,7 +123,10 @@ async fn main() -> anyhow::Result<()> {
         if cli.bootstrap_admin {
             let key = auth::generate_admin_key();
             let row = db::create_admin_key(&pool, &key).await?;
-            println!("admin_key_id={} key={key} prefix={}", row.id, row.key_prefix);
+            println!(
+                "admin_key_id={} key={key} prefix={}",
+                row.id, row.key_prefix
+            );
         }
         if let Some(name) = cli.bootstrap_tenant {
             let key = auth::generate_key();

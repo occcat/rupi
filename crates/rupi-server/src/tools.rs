@@ -37,10 +37,7 @@ pub fn cloud_tools(exec: Arc<dyn Executor>, handle: WorkspaceHandle) -> ToolRegi
         handle: handle.clone(),
         kind: FsKind::Grep,
     }));
-    r.register(Arc::new(ExecBashTool {
-        exec,
-        handle,
-    }));
+    r.register(Arc::new(ExecBashTool { exec, handle }));
     r.register(Arc::new(rupi_tools::ThinkTool));
     r
 }
@@ -103,7 +100,9 @@ impl Tool for ExecFsTool {
                     },
                     "required": ["path"]
                 }),
-                prompt_snippet: Some("edit(path, old_string, new_string): patch remote file".into()),
+                prompt_snippet: Some(
+                    "edit(path, old_string, new_string): patch remote file".into(),
+                ),
             },
             FsKind::Glob => ToolDefinition {
                 name: "glob".into(),
@@ -303,8 +302,5 @@ impl Tool for ExecBashTool {
 }
 
 fn arg_str(v: &serde_json::Value, k: &str) -> String {
-    v.get(k)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }

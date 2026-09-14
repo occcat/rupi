@@ -235,9 +235,7 @@ impl Engine {
         let timeout = timeout_secs.unwrap_or(30).clamp(1, 300);
         let mut cmd = jail::command(&dir, command, self.cfg.isolation)
             .map_err(|e| EngineError::Other(e.to_string()))?;
-        let child = cmd
-            .spawn()
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let child = cmd.spawn().map_err(|e| EngineError::Other(e.to_string()))?;
         if let Some(pid) = child.id() {
             if let Some(s) = self.leased.lock().await.get_mut(handle) {
                 s.children.push(pid);
@@ -360,11 +358,7 @@ impl Engine {
             Some(t) => self.require_tenant(handle, t).await?,
             None => self.dir(handle).await?,
         };
-        let tmp = self
-            .cfg
-            .root
-            .join("_snap")
-            .join(format!("{handle}.tgz"));
+        let tmp = self.cfg.root.join("_snap").join(format!("{handle}.tgz"));
         if let Some(p) = tmp.parent() {
             tokio::fs::create_dir_all(p)
                 .await
@@ -533,7 +527,10 @@ mod tests {
             return;
         };
         let err = eng.restore(&h.id, &blob).await.unwrap_err();
-        assert!(format!("{err}").contains("unsafe") || format!("{err}").contains("tar"), "{err}");
+        assert!(
+            format!("{err}").contains("unsafe") || format!("{err}").contains("tar"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

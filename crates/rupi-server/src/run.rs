@@ -11,9 +11,7 @@ use crate::quota;
 use crate::reclaim;
 use crate::tools::cloud_tools;
 use crate::App;
-use rupi_agent::{
-    AgentLoop, AskAction, RulePolicy,
-};
+use rupi_agent::{AgentLoop, AskAction, RulePolicy};
 use rupi_core::{CancelFlag, ContentBlock, Message, Role, SessionTree};
 use rupi_llm::{LlmProvider, MockProvider, ThinkingLevel};
 use rupi_memory::{FrozenMemory, MemoryManager, MemoryStore};
@@ -131,15 +129,19 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
 
     match quota::admit_run(&app.cache, &app.pool, &tenant).await {
         crate::quota::Admit::TooMany => {
-            app.metrics.reject_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            app.metrics
+                .reject_429
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Preflight::Status {
                 code: 429,
                 body: serde_json::json!({"error": "quota"}),
-            }
+            };
         }
         crate::quota::Admit::Ok => {}
     }
-    app.metrics.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    app.metrics
+        .runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if !quota::acquire_lease(
         &app.cache,
@@ -164,16 +166,7 @@ pub async fn start_run(app: App, tenant: Tenant, input: RunAgentInput) -> Prefli
     let err_thread = input.thread_id.clone();
     let err_run = input.run_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = drive(
-            app.clone(),
-            tenant,
-            sess,
-            input,
-            tx.clone(),
-            cancel_drive,
-        )
-        .await
-        {
+        if let Err(e) = drive(app.clone(), tenant, sess, input, tx.clone(), cancel_drive).await {
             emit(
                 &tx,
                 agui::run_error(&e.to_string(), None, Some(&err_thread), Some(&err_run)),
@@ -283,9 +276,17 @@ async fn drive(
     let frozen = if let Some(raw) = app.cache.get(&frozen_key).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             FrozenMemory {
-                memory: v.get("memory").and_then(|x| x.as_str()).unwrap_or("").into(),
+                memory: v
+                    .get("memory")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
                 user: v.get("user").and_then(|x| x.as_str()).unwrap_or("").into(),
-                failures: v.get("failures").and_then(|x| x.as_str()).unwrap_or("").into(),
+                failures: v
+                    .get("failures")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
             }
         } else {
             pgmem.frozen().await
@@ -295,14 +296,12 @@ async fn drive(
         let blob = serde_json::json!({
             "memory": f.memory, "user": f.user, "failures": f.failures
         });
-        let _ = app
-            .cache
-            .set_ex(&frozen_key, &blob.to_string(), 300)
-            .await;
+        let _ = app.cache.set_ex(&frozen_key, &blob.to_string(), 300).await;
         f
     };
 
-    let mut store = MemoryStore::new(std::env::temp_dir().join(format!("rupi-cloud-{}", tenant.id)));
+    let mut store =
+        MemoryStore::new(std::env::temp_dir().join(format!("rupi-cloud-{}", tenant.id)));
     store.memory_enabled = false;
     store.user_profile_enabled = false;
     let mut mem = MemoryManager::new(store);
@@ -315,10 +314,7 @@ async fn drive(
 
     let pending = db::pending_interrupts(&app.pool, &tenant.id, &input.thread_id).await?;
     let pending_ids: Vec<String> = pending.iter().map(|p| p.id.clone()).collect();
-    emit(
-        &tx,
-        agui::messages_snapshot(tree_to_agui_messages(&tree)),
-    );
+    emit(&tx, agui::messages_snapshot(tree_to_agui_messages(&tree)));
     emit(
         &tx,
         agui::state_snapshot(cloud_state(
@@ -387,19 +383,8 @@ async fn drive(
 
     let result = if !input.resume.is_empty() {
         resume_and_continue(
-            &app,
-            &tenant,
-            &input,
-            &mut tree,
-            &handle,
-            &tools,
-            &mem,
-            &frozen,
-            &skills,
-            &*provider,
-            &agent,
-            &on_event,
-            &cancel,
+            &app, &tenant, &input, &mut tree, &handle, &tools, &mem, &frozen, &skills, &*provider,
+            &agent, &on_event, &cancel,
         )
         .await
     } else {
@@ -438,7 +423,12 @@ async fn drive(
         Err(e) => {
             emit(
                 &tx,
-                agui::run_error(&e.to_string(), None, Some(&input.thread_id), Some(&input.run_id)),
+                agui::run_error(
+                    &e.to_string(),
+                    None,
+                    Some(&input.thread_id),
+                    Some(&input.run_id),
+                ),
             );
             finish(&app, &tenant, &input.thread_id, &input.run_id, &tree).await;
             hb.abort();
@@ -463,10 +453,7 @@ async fn drive(
             .invalidate_session(&tenant.id, &input.thread_id)
             .await;
         let snap = db::load_tree(&app.pool, &tenant.id, &input.thread_id).await?;
-        emit(
-            &tx,
-            agui::messages_snapshot(tree_to_agui_messages(&snap)),
-        );
+        emit(&tx, agui::messages_snapshot(tree_to_agui_messages(&snap)));
         emit(
             &tx,
             agui::state_snapshot(cloud_state(
@@ -774,27 +761,20 @@ pub fn cached_mock(tenant: &Tenant) -> Option<Arc<MockProvider>> {
             return Some(Arc::new(MockProvider::new(resps)));
         }
     }
-    if tenant
-        .settings
-        .get("provider")
-        .and_then(|v| v.as_str())
-        == Some("mock")
+    if tenant.settings.get("provider").and_then(|v| v.as_str()) == Some("mock")
         || std::env::var("RUPI_CLOUD_MOCK").ok().as_deref() == Some("1")
     {
         if let Ok(path) = std::env::var("RUPI_MOCK_SCRIPT") {
             if let Ok(raw) = std::fs::read_to_string(path) {
                 if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
-                    let script = items
-                        .into_iter()
-                        .map(script_item_to_response)
-                        .collect();
+                    let script = items.into_iter().map(script_item_to_response).collect();
                     return Some(Arc::new(MockProvider::new(script)));
                 }
             }
         }
-        return Some(Arc::new(MockProvider::new(vec![MockProvider::text_response(
-            "hello from rupi-server (mock)",
-        )])));
+        return Some(Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("hello from rupi-server (mock)"),
+        ])));
     }
     None
 }
@@ -823,17 +803,15 @@ pub fn resolve_byok(tenant: &Tenant) -> Byok {
         .filter(|s| !s.is_empty() && *s != "mock")
         .map(|s| s.to_ascii_lowercase());
     let spec = rupi_llm::parse_model_spec(&model);
-    let provider = forced
-        .or(spec.provider.clone())
-        .unwrap_or_else(|| {
-            if model.starts_with("claude-") {
-                "anthropic".into()
-            } else if model.starts_with("gemini-") {
-                "gemini".into()
-            } else {
-                "openai".into()
-            }
-        });
+    let provider = forced.or(spec.provider.clone()).unwrap_or_else(|| {
+        if model.starts_with("claude-") {
+            "anthropic".into()
+        } else if model.starts_with("gemini-") {
+            "gemini".into()
+        } else {
+            "openai".into()
+        }
+    });
     let key = match provider.as_str() {
         "anthropic" => tenant
             .settings
@@ -1015,10 +993,7 @@ fn script_item_to_response(v: serde_json::Value) -> rupi_llm::ChatResponse {
             stop_reason: "tool_calls".into(),
         };
     }
-    let text = v
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("ok");
+    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("ok");
     MockProvider::text_response(text)
 }
 

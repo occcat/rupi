@@ -222,7 +222,10 @@ impl MemoryObjectStore {
 impl ObjectStore for MemoryObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
         crate::store::LocalObjectStore::new("/tmp").path_for_check(key)?;
-        self.inner.lock().await.insert(key.to_string(), bytes.to_vec());
+        self.inner
+            .lock()
+            .await
+            .insert(key.to_string(), bytes.to_vec());
         Ok(())
     }
     async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {

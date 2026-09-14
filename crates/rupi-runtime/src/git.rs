@@ -43,7 +43,13 @@ pub fn parse_git_url(url: &str) -> Result<GitSpec, String> {
         return Err("file:// git urls are not allowed".into());
     }
     if let Some(rest) = url.strip_prefix("https://") {
-        let host = rest.split('/').next().unwrap_or("").split('@').next_back().unwrap_or("");
+        let host = rest
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split('@')
+            .next_back()
+            .unwrap_or("");
         let host = host.split(':').next().unwrap_or(host);
         if host.is_empty() {
             return Err("https git url missing host".into());
@@ -101,9 +107,7 @@ pub async fn clone_into_with(
         return run_clone(dir, &spec.url, None).await;
     }
     if !spec.https {
-        return Err(
-            "anonymous git@ clone is not allowed; use https:// + tenant token".into(),
-        );
+        return Err("anonymous git@ clone is not allowed; use https:// + tenant token".into());
     }
     let tok = token.map(str::trim).filter(|s| !s.is_empty());
     if tok.is_none() && !allow_anon {
@@ -126,13 +130,13 @@ async fn run_clone(dir: &Path, url: &str, token: Option<&str>) -> Result<ToolTex
     if let Some(tok) = token {
         cmd.env("GIT_CONFIG_COUNT", "1");
         cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
-        cmd.env(
-            "GIT_CONFIG_VALUE_0",
-            format!("Authorization: Bearer {tok}"),
-        );
+        cmd.env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {tok}"));
     }
     cmd.arg(url);
-    cmd.arg(".").current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg(".")
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let out = cmd.output().await.map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(ToolText::ok(format!("cloned {url}")))

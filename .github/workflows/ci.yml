@@ -46,11 +46,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
-      # Current tree is not rustfmt-clean. Keep the check visible on every
-      # matrix cell, but do not gate CI — a full rustfmt would collide with
-      # sibling bash/TUI PRs. Make this required after those land.
       - name: rustfmt
-        continue-on-error: true
         run: cargo fmt --all -- --check
 
       - name: clippy

@@ -62,9 +62,13 @@ impl Harness {
         let t = db::create_tenant(&pool, "ops-alpha", &tenant_key)
             .await
             .ok()?;
-        db::update_settings(&pool, &t.id, &json!({"provider": "mock", "model": "gpt-4o-mini"}))
-            .await
-            .ok()?;
+        db::update_settings(
+            &pool,
+            &t.id,
+            &json!({"provider": "mock", "model": "gpt-4o-mini"}),
+        )
+        .await
+        .ok()?;
 
         let root = std::env::temp_dir().join(format!("rupi-admin-execd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -119,7 +123,12 @@ impl Harness {
             .unwrap()
     }
 
-    async fn admin_json(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+    async fn admin_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let mut req = self
             .client()
             .request(method, format!("{}{path}", self.base))
@@ -143,7 +152,12 @@ async fn admin_auth_and_static_ui() {
     let Some(h) = Harness::start().await else {
         return;
     };
-    let html = h.client().get(format!("{}/admin", h.base)).send().await.unwrap();
+    let html = h
+        .client()
+        .get(format!("{}/admin", h.base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(html.status().as_u16(), 200);
     let body = html.text().await.unwrap();
     assert!(body.contains("Rupi 管理面"), "{body}");
@@ -204,7 +218,9 @@ async fn admin_tenants_keys_quota_settings() {
     assert!(once.starts_with("rupi_"), "{once}");
     assert_eq!(created["tenant"]["quota"]["maxHandles"], 4);
 
-    let (c2, listed) = h.admin_json(reqwest::Method::GET, "/admin/api/tenants", None).await;
+    let (c2, listed) = h
+        .admin_json(reqwest::Method::GET, "/admin/api/tenants", None)
+        .await;
     assert_eq!(c2, 200);
     assert!(listed["total"].as_i64().unwrap() >= 2);
 
@@ -229,7 +245,11 @@ async fn admin_tenants_keys_quota_settings() {
     assert_eq!(me.status().as_u16(), 200);
 
     let (c4, _) = h
-        .admin_json(reqwest::Method::POST, &format!("/admin/api/keys/{kid}/revoke"), None)
+        .admin_json(
+            reqwest::Method::POST,
+            &format!("/admin/api/keys/{kid}/revoke"),
+            None,
+        )
         .await;
     assert_eq!(c4, 200);
     let me2 = h
@@ -347,7 +367,12 @@ async fn admin_sessions_executors_and_admin_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(created.status().as_u16(), 201, "{}", created.text().await.unwrap());
+    assert_eq!(
+        created.status().as_u16(),
+        201,
+        "{}",
+        created.text().await.unwrap()
+    );
     let sess: Value = created.json().await.unwrap();
     let sid = sess["id"].as_str().unwrap().to_string();
 
@@ -368,22 +393,32 @@ async fn admin_sessions_executors_and_admin_keys() {
     assert!(found, "{catalog}");
 
     let (c2, detail) = h
-        .admin_json(reqwest::Method::GET, &format!("/admin/api/sessions/{sid}"), None)
+        .admin_json(
+            reqwest::Method::GET,
+            &format!("/admin/api/sessions/{sid}"),
+            None,
+        )
         .await;
     assert_eq!(c2, 200, "{detail}");
     assert_eq!(detail["tenantId"], h.tenant_id);
     assert!(detail["openHint"]["path"].as_str() == Some("/v1/agent"));
 
-    let (c3, exec) = h.admin_json(reqwest::Method::GET, "/admin/api/executors", None).await;
+    let (c3, exec) = h
+        .admin_json(reqwest::Method::GET, "/admin/api/executors", None)
+        .await;
     assert_eq!(c3, 200, "{exec}");
     assert!(exec["nodes"].as_array().is_some());
     assert!(exec["handles"].as_array().is_some());
 
-    let (c4, regions) = h.admin_json(reqwest::Method::GET, "/admin/api/regions", None).await;
+    let (c4, regions) = h
+        .admin_json(reqwest::Method::GET, "/admin/api/regions", None)
+        .await;
     assert_eq!(c4, 200, "{regions}");
     assert_eq!(regions["controlPlane"], "local");
 
-    let (c5, ak) = h.admin_json(reqwest::Method::POST, "/admin/api/admin-keys", None).await;
+    let (c5, ak) = h
+        .admin_json(reqwest::Method::POST, "/admin/api/admin-keys", None)
+        .await;
     assert_eq!(c5, 201, "{ak}");
     let admin_key = ak["key"].as_str().unwrap().to_string();
     assert!(admin_key.starts_with("rupi_admin_"));

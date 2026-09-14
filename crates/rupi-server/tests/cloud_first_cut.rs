@@ -79,13 +79,9 @@ impl Harness {
         )
         .await
         .ok()?;
-        db::update_settings(
-            &pool,
-            &tb.id,
-            &json!({"provider": "mock"}),
-        )
-        .await
-        .ok()?;
+        db::update_settings(&pool, &tb.id, &json!({"provider": "mock"}))
+            .await
+            .ok()?;
 
         let root = std::env::temp_dir().join(format!("rupi-execd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -344,7 +340,10 @@ async fn two_tenants_isolated_and_agui_interrupt() {
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
         .collect();
     assert!(types.contains(&"TOOL_CALL_RESULT"), "{types:?}\n{body}");
-    assert!(!types.contains(&"TOOL_CALL_START"), "resume must not re-emit start");
+    assert!(
+        !types.contains(&"TOOL_CALL_START"),
+        "resume must not re-emit start"
+    );
     let fin = evs.iter().find(|e| e["type"] == "RUN_FINISHED").unwrap();
     assert_eq!(fin["outcome"]["type"], "success");
 
@@ -388,13 +387,18 @@ async fn two_tenants_isolated_and_agui_interrupt() {
         .as_str()
         .unwrap()
         .to_string();
-    let hits_b = db::search_memories(&h.pool, &{
-        let t = db::tenant_by_key_hash(&h.pool, &auth::hash_key(&h.key_b))
-            .await
-            .unwrap()
-            .unwrap();
-        t.id
-    }, "cloud-tea", 10)
+    let hits_b = db::search_memories(
+        &h.pool,
+        &{
+            let t = db::tenant_by_key_hash(&h.pool, &auth::hash_key(&h.key_b))
+                .await
+                .unwrap()
+                .unwrap();
+            t.id
+        },
+        "cloud-tea",
+        10,
+    )
     .await
     .unwrap();
     assert!(hits_b.is_empty(), "{hits_b:?}");
@@ -416,7 +420,10 @@ async fn two_tenants_isolated_and_agui_interrupt() {
         .unwrap();
     assert_eq!(exp.status(), 200);
     let jsonl = exp.text().await.unwrap();
-    assert!(jsonl.contains("\"type\":\"session\"") || jsonl.contains("message"), "{jsonl}");
+    assert!(
+        jsonl.contains("\"type\":\"session\"") || jsonl.contains("message"),
+        "{jsonl}"
+    );
 
     // 句柄配额
     {
@@ -697,8 +704,7 @@ fn process_cmdline_tree(pid: u32) -> Vec<String> {
 
 #[test]
 fn local_rpc_binary_still_works() {
-    let rupi = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/rupi");
+    let rupi = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/rupi");
     if !rupi.exists() {
         eprintln!("skip rpc check: rupi binary not built yet");
         return;
@@ -726,6 +732,13 @@ fn local_rpc_binary_still_works() {
     }
     let o = child.wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
-    assert!(o.status.success(), "{out}\n{}", String::from_utf8_lossy(&o.stderr));
-    assert!(out.contains("get_state") || out.contains("success"), "{out}");
+    assert!(
+        o.status.success(),
+        "{out}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        out.contains("get_state") || out.contains("success"),
+        "{out}"
+    );
 }

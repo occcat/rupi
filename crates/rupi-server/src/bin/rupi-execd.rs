@@ -4,7 +4,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "rupi-execd", about = "Remote workspace/bash backend for rupi-server")]
+#[command(
+    name = "rupi-execd",
+    about = "Remote workspace/bash backend for rupi-server"
+)]
 struct Cli {
     #[arg(long, default_value = "127.0.0.1:8090")]
     listen: String,

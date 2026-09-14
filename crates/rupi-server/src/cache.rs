@@ -439,9 +439,11 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cache = Cache::disabled();
-            assert!(!cache
-                .put_session_meta("t", "s", "{\"id\":\"s\"}", SESS_META_TTL_SECS)
-                .await);
+            assert!(
+                !cache
+                    .put_session_meta("t", "s", "{\"id\":\"s\"}", SESS_META_TTL_SECS)
+                    .await
+            );
             assert!(cache.get_session_meta("t", "s").await.is_none());
         });
     }

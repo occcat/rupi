@@ -210,7 +210,12 @@ async fn control_plane_stateless_exec_pinned_by_region() {
         .send()
         .await
         .unwrap();
-    assert_eq!(created_eu.status(), 201, "{}", created_eu.text().await.unwrap());
+    assert_eq!(
+        created_eu.status(),
+        201,
+        "{}",
+        created_eu.text().await.unwrap()
+    );
     let eu_sess: Value = created_eu.json().await.unwrap();
     assert_eq!(eu_sess["region"], "eu-west");
     assert_eq!(eu_sess["runtime"]["kind"], "sandbox");
@@ -246,10 +251,16 @@ async fn control_plane_stateless_exec_pinned_by_region() {
             .send()
             .await
             .unwrap();
-        (resp.status().as_u16(), resp.text().await.unwrap_or_default())
+        (
+            resp.status().as_u16(),
+            resp.text().await.unwrap_or_default(),
+        )
     };
     assert_eq!(st, 200, "{body}");
-    assert!(body.contains("from-us") || body.contains("RUN_FINISHED"), "{body}");
+    assert!(
+        body.contains("from-us") || body.contains("RUN_FINISHED"),
+        "{body}"
+    );
 
     let tenant_id = db::session_owner(&h.pool, &us_id).await.unwrap().unwrap();
     let row = db::get_session(&h.pool, &tenant_id, &us_id)
