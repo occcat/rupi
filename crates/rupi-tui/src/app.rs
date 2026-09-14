@@ -1187,17 +1187,15 @@ async fn run_loop(
                                     &policy,
                                 )
                             }
-                            "edit" => {
-                                match FileEditor::from_hint(&ctx.settings_cwd, args) {
-                                    Ok(ed) => {
-                                        tree = None;
-                                        sessions = None;
-                                        editor = Some(ed);
-                                        String::new()
-                                    }
-                                    Err(e) => format!("[edit] {e}"),
+                            "edit" => match FileEditor::from_hint(&ctx.settings_cwd, args) {
+                                Ok(ed) => {
+                                    tree = None;
+                                    sessions = None;
+                                    editor = Some(ed);
+                                    String::new()
                                 }
-                            }
+                                Err(e) => format!("[edit] {e}"),
+                            },
                             _ => String::new(),
                         };
                         if !msg.is_empty() {
@@ -2102,7 +2100,12 @@ fn draw<B: Backend>(
             }
         })
         .context("draw TUI")?;
-    if inline_images && !view.inline_images().is_empty() && editor.is_none() && tree.is_none() && sessions.is_none() {
+    if inline_images
+        && !view.inline_images().is_empty()
+        && editor.is_none()
+        && tree.is_none()
+        && sessions.is_none()
+    {
         let size = terminal.size().unwrap_or_default();
         let area = Rect {
             x: 0,
@@ -2641,11 +2644,8 @@ mod tests {
     #[test]
     fn draw_inprocess_editor_shows_file() {
         use ratatui::{backend::TestBackend, Terminal};
-        let root = std::env::temp_dir().join(format!(
-            "rupi-edit-draw-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rupi-edit-draw-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("shown.rs"), "fn shown() {}\n").unwrap();

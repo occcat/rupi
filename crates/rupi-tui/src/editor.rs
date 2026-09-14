@@ -90,7 +90,11 @@ impl FileEditor {
             }
             let text = String::from_utf8(raw).map_err(|_| format!("{rel} is not UTF-8"))?;
             let crlf = text.contains("\r\n");
-            (split_lines(&text), crlf, format!("{rel} — Ctrl+S save, Esc close"))
+            (
+                split_lines(&text),
+                crlf,
+                format!("{rel} — Ctrl+S save, Esc close"),
+            )
         };
         Ok(Self {
             root,
@@ -165,7 +169,10 @@ impl FileEditor {
         }
         let body = self.text();
         if body.len() as u64 > MAX_BYTES {
-            return Err(format!("buffer is {} bytes (limit {MAX_BYTES})", body.len()));
+            return Err(format!(
+                "buffer is {} bytes (limit {MAX_BYTES})",
+                body.len()
+            ));
         }
         std::fs::write(&self.abs, body).map_err(|e| format!("write {}: {e}", self.rel))?;
         self.dirty = false;
@@ -668,7 +675,9 @@ mod tests {
         assert!(resolve_workspace_path(&root, "/etc/passwd").is_err());
         assert!(FileEditor::open(&root, "..").is_err());
         std::fs::write(root.join("bin.dat"), [b'a', 0, b'b']).unwrap();
-        assert!(FileEditor::open(&root, "bin.dat").unwrap_err().contains("binary"));
+        assert!(FileEditor::open(&root, "bin.dat")
+            .unwrap_err()
+            .contains("binary"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -729,7 +738,10 @@ mod tests {
             path_hint_from_input("看 @foo/bar.rs 后面"),
             Some("foo/bar.rs".into())
         );
-        assert_eq!(path_hint_from_input("@foo/bar.rs"), Some("foo/bar.rs".into()));
+        assert_eq!(
+            path_hint_from_input("@foo/bar.rs"),
+            Some("foo/bar.rs".into())
+        );
         assert_eq!(path_hint_from_input("联系 foo@bar.com"), None);
         assert_eq!(path_hint_from_input("lib.rs"), Some("lib.rs".into()));
         assert_eq!(path_hint_from_input("/tree"), None);
@@ -757,7 +769,10 @@ mod tests {
         ed.move_end();
         ed.insert_char('!');
         ed.save().unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("w.txt")).unwrap(), "a!\r\nb\r\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("w.txt")).unwrap(),
+            "a!\r\nb\r\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
