@@ -63,7 +63,9 @@ pub async fn run(url: &str, api_key: &str, action: Action) -> anyhow::Result<()>
             let sid = match session {
                 Some(id) => id,
                 None => {
-                    let created = client.create_session(name.as_deref(), region.as_deref(), backend.as_deref()).await?;
+                    let created = client
+                        .create_session(name.as_deref(), region.as_deref(), backend.as_deref())
+                        .await?;
                     created
                         .get("id")
                         .and_then(|v| v.as_str())

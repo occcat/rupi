@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use rupi_core::{ContentBlock, Message, Role};
 use rupi_llm::{ChatRequest, ChatResponse, LlmProvider, MockProvider, StreamEvent};
+use rupi_memory::MemoryProvider;
 use rupi_runtime::execd::{self, ExecdConfig};
 use rupi_runtime::MemoryObjectStore;
 use rupi_runtime::ObjectStore;
-use rupi_memory::MemoryProvider;
 use rupi_server::auth;
 use rupi_server::db;
 use rupi_server::memory::PostgresMemory;
@@ -175,16 +175,17 @@ impl Harness {
         assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
         let v: Value = resp.json().await.unwrap();
         let id = v["id"].as_str().unwrap().to_string();
-        let handle = v["runtime"]["handle"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let handle = v["runtime"]["handle"].as_str().unwrap_or("").to_string();
         assert!(!handle.is_empty(), "{v}");
         (id, handle)
     }
 
     fn workspace_path(&self, session: &str, handle: &str, rel: &str) -> PathBuf {
-        self.exec_root.join(&self.tenant).join(session).join(handle).join(rel)
+        self.exec_root
+            .join(&self.tenant)
+            .join(session)
+            .join(handle)
+            .join(rel)
     }
 
     async fn exec_write(&self, handle: &str, path: &str, content: &str) {
@@ -201,11 +202,7 @@ impl Harness {
             .send()
             .await
             .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "{}",
-            resp.text().await.unwrap()
-        );
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
     }
 }
 
@@ -294,9 +291,7 @@ async fn daily_token_quota_returns_429() {
     db::patch_tenant_quota(&h.pool, &h.tenant, None, None, None, Some(1), None)
         .await
         .unwrap();
-    db::bump_quota_tokens(&h.pool, &h.tenant, 1)
-        .await
-        .unwrap();
+    db::bump_quota_tokens(&h.pool, &h.tenant, 1).await.unwrap();
     let resp = h
         .client()
         .post(format!("{}/v1/agent", h.base))
@@ -319,10 +314,7 @@ async fn daily_token_quota_returns_429() {
         .text()
         .await
         .unwrap();
-    assert!(
-        metrics.contains("rupi_rejects_429_total"),
-        "{metrics}"
-    );
+    assert!(metrics.contains("rupi_rejects_429_total"), "{metrics}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -331,7 +323,12 @@ async fn memory_replace_and_remove_mutate_rows() {
         return;
     };
     let sid = h.create_session().await;
-    let mem = PostgresMemory::new(h.pool.clone(), h.tenant.clone(), sid.clone(), h.cache.clone());
+    let mem = PostgresMemory::new(
+        h.pool.clone(),
+        h.tenant.clone(),
+        sid.clone(),
+        h.cache.clone(),
+    );
     mem.handle_tool_call(
         "memory",
         json!({"op":"add","entry":"alpha-fact","scope":"tenant"}),
@@ -625,9 +622,7 @@ async fn cloud_loop_reads_agents_and_skills_via_executor() {
         "saw-workspace",
     )]));
     let mock_c = mock.clone();
-    let Some(h) = Harness::start_with_factory(Arc::new(move |_t| mock_c.clone()))
-        .await
-    else {
+    let Some(h) = Harness::start_with_factory(Arc::new(move |_t| mock_c.clone())).await else {
         return;
     };
     let (sid, handle) = h.create_session_ready().await;

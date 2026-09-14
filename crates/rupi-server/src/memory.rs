@@ -152,7 +152,8 @@ impl MemoryProvider for PostgresMemory {
                 }
                 _ => anyhow::bail!("unknown memory op: {op}"),
             }
-            let rows = db::list_memories(&self.pool, &self.tenant_id, Some(&self.session_id)).await?;
+            let rows =
+                db::list_memories(&self.pool, &self.tenant_id, Some(&self.session_id)).await?;
             let live: String = rows
                 .into_iter()
                 .map(|(_, _, c)| c)

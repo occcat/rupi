@@ -52,8 +52,7 @@ async fn rupi_cloud_talks_agui_http() {
     };
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://rupi:rupi@127.0.0.1:5432/rupi".into());
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     if db::connect(&db_url).await.is_err() {
         return;
     }

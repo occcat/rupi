@@ -53,7 +53,10 @@ pub async fn serve(cfg: ExecdConfig) -> anyhow::Result<()> {
 /// 绑定并在后台跑；测试与控制面拉起时用。
 pub async fn spawn(
     cfg: ExecdConfig,
-) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     validate_listen_token(&cfg.bind, &cfg.token, cfg.insecure).map_err(|e| anyhow::anyhow!(e))?;
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
@@ -391,7 +394,8 @@ async fn glob(
         .await
         .map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
-    args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
+    args["path"] =
+        serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     Ok(Json(
         state
             .engine
@@ -427,7 +431,8 @@ async fn grep(
         .await
         .map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
-    args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
+    args["path"] =
+        serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     if let Some(inc) = body.include {
         args["include"] = inc.into();
     }

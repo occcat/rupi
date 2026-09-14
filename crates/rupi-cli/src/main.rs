@@ -938,9 +938,7 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .or_else(|| std::env::var("RUPI_CLOUD_KEY").ok())
                 .or_else(|| std::env::var("RUPI_API_KEY").ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cloud 需要 --api-key 或环境变量 RUPI_CLOUD_KEY")
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("cloud 需要 --api-key 或环境变量 RUPI_CLOUD_KEY"))?;
             cloud::run(&url, &key, action).await?;
         }
         Some(Cmd::McpList { command, args, url }) => {

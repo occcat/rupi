@@ -62,7 +62,10 @@ pub async fn serve(cfg: SandboxdConfig) -> anyhow::Result<()> {
 
 pub async fn spawn(
     cfg: SandboxdConfig,
-) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     validate_listen_token(&cfg.bind, &cfg.token, cfg.insecure).map_err(|e| anyhow::anyhow!(e))?;
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
@@ -174,7 +177,11 @@ async fn create(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    if body.image.as_deref().is_some_and(|s| !s.is_empty() && s != "default") {
+    if body
+        .image
+        .as_deref()
+        .is_some_and(|s| !s.is_empty() && s != "default")
+    {
         tracing::info!(
             "sandbox image={} ignored (jail backend, not a micro-VM)",
             body.image.as_deref().unwrap_or("")
@@ -214,11 +221,7 @@ async fn destroy(
         return Err(deny());
     }
     let t = tenant_of(body.tenant_id.as_deref())?;
-    state
-        .engine
-        .require_tenant(&id, t)
-        .await
-        .map_err(map_err)?;
+    state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     state.engine.destroy(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -233,11 +236,7 @@ async fn release(
         return Err(deny());
     }
     let t = tenant_of(body.tenant_id.as_deref())?;
-    state
-        .engine
-        .require_tenant(&id, t)
-        .await
-        .map_err(map_err)?;
+    state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     state.engine.release(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -279,11 +278,7 @@ async fn abort(
         return Err(deny());
     }
     let t = tenant_of(body.tenant_id.as_deref())?;
-    state
-        .engine
-        .require_tenant(&id, t)
-        .await
-        .map_err(map_err)?;
+    state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     state.engine.abort(&id).await;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -406,7 +401,8 @@ async fn glob(
     let t = tenant_of(body.tenant_id.as_deref())?;
     let dir = state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
-    args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
+    args["path"] =
+        serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     Ok(Json(
         state
             .engine
@@ -438,7 +434,8 @@ async fn grep(
     let t = tenant_of(body.tenant_id.as_deref())?;
     let dir = state.engine.require_tenant(&id, t).await.map_err(map_err)?;
     let mut args = serde_json::json!({"pattern": body.pattern});
-    args["path"] = serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
+    args["path"] =
+        serde_json::Value::String(body.path.unwrap_or_else(|| dir.display().to_string()));
     if let Some(inc) = body.include {
         args["include"] = inc.into();
     }
@@ -597,7 +594,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(miss.status().as_u16(), 404, "sandboxd must not speak execd /v1/alloc");
+        assert_eq!(
+            miss.status().as_u16(),
+            404,
+            "sandboxd must not speak execd /v1/alloc"
+        );
         exec.destroy(&h).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

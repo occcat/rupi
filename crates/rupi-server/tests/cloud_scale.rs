@@ -104,14 +104,9 @@ impl Dual {
         ));
         let factory: rupi_server::ProviderFactory =
             Arc::new(|ten| rupi_server::run::default_provider(ten));
-        let app_a = App::new(
-            pool.clone(),
-            cache.clone(),
-            exec.clone(),
-            factory.clone(),
-        )
-        .with_instance_id("replica-a")
-        .with_object_store(store.clone());
+        let app_a = App::new(pool.clone(), cache.clone(), exec.clone(), factory.clone())
+            .with_instance_id("replica-a")
+            .with_object_store(store.clone());
         let app_b = App::new(pool.clone(), cache.clone(), exec, factory)
             .with_instance_id("replica-b")
             .with_object_store(store);
@@ -169,7 +164,10 @@ async fn post_agent(h: &Dual, base: &str, body: Value) -> (u16, String) {
         .send()
         .await
         .unwrap();
-    (resp.status().as_u16(), resp.text().await.unwrap_or_default())
+    (
+        resp.status().as_u16(),
+        resp.text().await.unwrap_or_default(),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -202,17 +200,7 @@ async fn two_replicas_lease_hydrate_and_ready() {
 
     let sid = create_session(&h, &h.a).await;
 
-    assert!(
-        quota::acquire_lease(
-            &h.cache,
-            &h.pool,
-            &h.tenant,
-            &sid,
-            "held",
-            "replica-a",
-        )
-        .await
-    );
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &sid, "held", "replica-a",).await);
     let (st, body) = post_agent(
         &h,
         &h.b,
@@ -224,15 +212,7 @@ async fn two_replicas_lease_hydrate_and_ready() {
     )
     .await;
     assert_eq!(st, 409, "{body}");
-    quota::release_lease(
-        &h.cache,
-        &h.pool,
-        &h.tenant,
-        &sid,
-        "held",
-        "replica-a",
-    )
-    .await;
+    quota::release_lease(&h.cache, &h.pool, &h.tenant, &sid, "held", "replica-a").await;
 
     let (st, body) = post_agent(
         &h,
@@ -245,7 +225,10 @@ async fn two_replicas_lease_hydrate_and_ready() {
     )
     .await;
     assert_eq!(st, 200, "{body}");
-    assert!(body.contains("RUN_FINISHED") || body.contains("replica-hello"), "{body}");
+    assert!(
+        body.contains("RUN_FINISHED") || body.contains("replica-hello"),
+        "{body}"
+    );
 
     let got = h
         .client()
@@ -277,9 +260,7 @@ async fn pool_exhaust_active_run_is_429() {
         return;
     };
     let s1 = create_session(&h, &h.a).await;
-    assert!(
-        quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s1, "busy", "replica-a").await
-    );
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s1, "busy", "replica-a").await);
     let resp = h
         .client()
         .post(format!("{}/v1/sessions", h.a))
@@ -298,7 +279,10 @@ async fn idle_snapshot_releases_and_restores() {
         return;
     };
     let sid = create_session(&h, &h.a).await;
-    let row = db::get_session(&h.pool, &h.tenant, &sid).await.unwrap().unwrap();
+    let row = db::get_session(&h.pool, &h.tenant, &sid)
+        .await
+        .unwrap()
+        .unwrap();
     let handle = rupi_runtime::WorkspaceHandle {
         id: row.runtime_handle.clone().unwrap(),
         backend: row.runtime_backend.clone().unwrap(),
@@ -330,12 +314,17 @@ async fn idle_snapshot_releases_and_restores() {
 
     let n = reclaim::reclaim_once(&h.app_a).await;
     assert!(n >= 1, "expected snapshot, got {n}");
-    let after = db::get_session(&h.pool, &h.tenant, &sid).await.unwrap().unwrap();
+    let after = db::get_session(&h.pool, &h.tenant, &sid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(after.workspace_state.as_deref(), Some("snapshotted"));
     assert!(after.runtime_handle.is_none());
     assert!(walk_named(&h.execd_root, "keep.txt").is_empty());
 
-    let hot = reclaim::ensure_hot(&h.app_b, &h.tenant, &after).await.unwrap();
+    let hot = reclaim::ensure_hot(&h.app_b, &h.tenant, &after)
+        .await
+        .unwrap();
     let got = h
         .app_b
         .executor
@@ -432,9 +421,7 @@ async fn redis_kill_degrades_and_tightens() {
     .await;
     assert_eq!(st, 200, "{body}");
 
-    assert!(
-        quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &sid, "held", "x").await
-    );
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &sid, "held", "x").await);
     let tenant = db::load_tenant(&h.pool, &h.tenant).await.unwrap().unwrap();
     match quota::admit_run(&h.cache, &h.pool, &tenant).await {
         quota::Admit::TooMany => {}
@@ -472,9 +459,7 @@ async fn quota_reconcile_and_stale_run_reap() {
     let reaped = db::reap_stale_runs(&h.pool, 60).await.unwrap();
     assert!(reaped >= 1);
     assert_eq!(db::count_active_runs(&h.pool, &h.tenant).await.unwrap(), 0);
-    assert!(
-        quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &sid, "fresh", "replica-b").await
-    );
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &sid, "fresh", "replica-b").await);
     quota::release_lease(&h.cache, &h.pool, &h.tenant, &sid, "fresh", "replica-b").await;
 }
 
@@ -557,12 +542,8 @@ async fn multi_instance_conc_cap_is_shared() {
     let s2 = create_session(&h, &h.a).await;
     let s3 = create_session(&h, &h.b).await;
     let s4 = create_session(&h, &h.b).await;
-    assert!(
-        quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s1, "c1", "replica-a").await
-    );
-    assert!(
-        quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s2, "c2", "replica-b").await
-    );
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s1, "c1", "replica-a").await);
+    assert!(quota::acquire_lease(&h.cache, &h.pool, &h.tenant, &s2, "c2", "replica-b").await);
     let a = post_agent(
         &h,
         &h.a,

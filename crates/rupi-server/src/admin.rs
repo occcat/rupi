@@ -85,10 +85,7 @@ pub fn router() -> Router<App> {
             "/admin/api/sessions/{id}",
             get(get_session).delete(delete_session),
         )
-        .route(
-            "/admin/api/sessions/{id}/debug-run",
-            post(debug_run),
-        )
+        .route("/admin/api/sessions/{id}/debug-run", post(debug_run))
         .route("/admin/api/executors", get(executors))
         .route("/admin/api/regions", get(regions))
         .route(
@@ -123,7 +120,10 @@ async fn ui_css() -> impl IntoResponse {
 async fn ui_js() -> impl IntoResponse {
     (
         [
-            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
             (header::CACHE_CONTROL, "public, max-age=120"),
         ],
         include_str!("../static/admin.js"),
@@ -131,7 +131,11 @@ async fn ui_js() -> impl IntoResponse {
 }
 
 fn unauth() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 fn not_found() -> Response {
@@ -151,8 +155,8 @@ fn internal(e: impl ToString) -> Response {
 }
 
 async fn write_audit(app: &App, action: &str, target_type: &str, target_id: &str, detail: Value) {
-    let _ = db::insert_admin_audit(&app.pool, "admin", action, target_type, target_id, &detail)
-        .await;
+    let _ =
+        db::insert_admin_audit(&app.pool, "admin", action, target_type, target_id, &detail).await;
 }
 
 async fn require_admin(app: &App, headers: &HeaderMap) -> Result<(), Response> {
@@ -477,7 +481,11 @@ async fn patch_tenant(
         .await
         .map_err(internal)?
         .ok_or_else(not_found)?;
-    let name = body.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let n = db::patch_tenant_meta(
         &app.pool,
         &t.id,
@@ -510,7 +518,9 @@ async fn delete_tenant(
         .await
         .map_err(internal)?
         .ok_or_else(not_found)?;
-    let sessions = db::list_sessions(&app.pool, &t.id).await.map_err(internal)?;
+    let sessions = db::list_sessions(&app.pool, &t.id)
+        .await
+        .map_err(internal)?;
     for row in sessions {
         teardown_session(&app, &row).await;
     }
@@ -545,7 +555,9 @@ async fn list_keys(
     let keys = db::list_api_keys(app.reader(), &id)
         .await
         .map_err(internal)?;
-    Ok(Json(json!({"keys": keys.iter().map(key_json).collect::<Vec<_>>()})))
+    Ok(Json(
+        json!({"keys": keys.iter().map(key_json).collect::<Vec<_>>()}),
+    ))
 }
 
 async fn create_key(
@@ -739,14 +751,7 @@ async fn patch_settings(
         .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
-    write_audit(
-        &app,
-        "patch_settings",
-        "tenant",
-        &id,
-        json!({"keys": keys}),
-    )
-    .await;
+    write_audit(&app, "patch_settings", "tenant", &id, json!({"keys": keys})).await;
     Ok(Json(json!({
         "ok": true,
         "settings": mask_settings(merged)
@@ -915,9 +920,8 @@ async fn debug_run(
             Ok((st, Json(body)).into_response())
         }
         Preflight::Stream(rx, cancel) => {
-            let inner = tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
-                Ok::<_, Infallible>(Event::default().data(ev.to_sse_data()))
-            });
+            let inner = tokio_stream::wrappers::ReceiverStream::new(rx)
+                .map(|ev| Ok::<_, Infallible>(Event::default().data(ev.to_sse_data())));
             let stream = http::CancelOnDrop { inner, cancel };
             Ok(Sse::new(stream)
                 .keep_alive(axum::response::sse::KeepAlive::default())

@@ -244,14 +244,17 @@ impl SkillRegistry {
         } else {
             name
         };
-        let dir = std::env::temp_dir().join("rupi-remote-skills").join(format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        )).join(&name);
+        let dir = std::env::temp_dir()
+            .join("rupi-remote-skills")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))
+            .join(&name);
         std::fs::create_dir_all(&dir)?;
         let raw = if body.trim_start().starts_with("---") {
             body.to_string()

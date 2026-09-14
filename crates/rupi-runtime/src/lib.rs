@@ -27,7 +27,9 @@ pub use pool::{is_pool_exhausted, parse_endpoint_list, PoolExhausted, PoolNode, 
 pub use s3::{MemoryObjectStore, S3Config, S3ObjectStore};
 pub use sandbox_http::SandboxExecutor;
 pub use store::{LocalObjectStore, ObjectStore};
-pub use token::{is_loopback_bind, is_loopback_url, tokens_eq, validate_executor_url, validate_listen_token};
+pub use token::{
+    is_loopback_bind, is_loopback_url, tokens_eq, validate_executor_url, validate_listen_token,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

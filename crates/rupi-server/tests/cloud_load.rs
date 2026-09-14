@@ -78,8 +78,12 @@ impl Load {
         )
         .await
         .ok()?;
-        db::set_tenant_caps_ex(&pool, &ta.id, 512, 2000, 100000, 2000).await.ok()?;
-        db::set_tenant_caps_ex(&pool, &tb.id, 4, 16, 100000, 2000).await.ok()?;
+        db::set_tenant_caps_ex(&pool, &ta.id, 512, 2000, 100000, 2000)
+            .await
+            .ok()?;
+        db::set_tenant_caps_ex(&pool, &tb.id, 4, 16, 100000, 2000)
+            .await
+            .ok()?;
 
         let root = std::env::temp_dir().join(format!("rupi-load-exec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -197,15 +201,15 @@ async fn thousand_sessions_and_quota_hold() {
     }
     let create_elapsed = t0.elapsed();
     create_ms.sort_unstable();
-    let p50 = create_ms
-        .get(create_ms.len() / 2)
-        .copied()
-        .unwrap_or(0);
+    let p50 = create_ms.get(create_ms.len() / 2).copied().unwrap_or(0);
     eprintln!(
         "LOAD sessions n={SESSION_N} ok={create_ok} err={create_err} p50_ms={p50} elapsed_ms={}",
         create_elapsed.as_millis()
     );
-    assert_eq!(create_ok, SESSION_N, "expected {SESSION_N} sessions, err={create_err}");
+    assert_eq!(
+        create_ok, SESSION_N,
+        "expected {SESSION_N} sessions, err={create_err}"
+    );
     assert_eq!(ids.len(), SESSION_N);
 
     let run_n = RUN_N.min(ids.len());
@@ -251,7 +255,10 @@ async fn thousand_sessions_and_quota_hold() {
             } else {
                 run_err += 1;
                 if run_err <= 3 {
-                    eprintln!("LOAD run fail status={st} body={}", &body[..body.len().min(200)]);
+                    eprintln!(
+                        "LOAD run fail status={st} body={}",
+                        &body[..body.len().min(200)]
+                    );
                 }
             }
         }

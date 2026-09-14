@@ -25,9 +25,7 @@ pub struct JailedChild {
 
 /// 构造已 jail 的 `sh -c`。
 pub fn command(root: &Path, script: &str, isolation: Isolation) -> anyhow::Result<Command> {
-    let root = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if which("bwrap") {
         return Ok(bwrap_command(&root, script, isolation));
     }
@@ -143,7 +141,11 @@ fn bwrap_command(root: &Path, script: &str, isolation: Isolation) -> Command {
 
 #[cfg(target_os = "macos")]
 fn macos_sandbox_command(root: &Path, script: &str) -> Command {
-    let root_s = root.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+    let root_s = root
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     // GH macOS runner 上 (deny default) 会掐死 echo。改为 allow default，
     // 再 deny 邻居可能在的树，并 require-not 放行句柄根。
     let profile = format!(
@@ -305,8 +307,12 @@ fn landlock_restrict(root: &Path) -> std::io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let fd =
-            unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            )
+        };
         if fd < 0 {
             return Ok(());
         }

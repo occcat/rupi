@@ -22,29 +22,23 @@ fn sha256_hex(s: &str) -> String {
 pub fn is_loopback_bind(bind: &str) -> bool {
     let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-    matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1"
-    )
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1")
 }
 
 /// HTTP(S) URL 的 host 是否本机。
 pub fn is_loopback_url(url: &str) -> bool {
-    let rest = url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(url);
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let host = rest.split('/').next().unwrap_or(rest);
     let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
     let host = if host.starts_with('[') {
-        host.split(']').next().unwrap_or(host).trim_start_matches('[')
+        host.split(']')
+            .next()
+            .unwrap_or(host)
+            .trim_start_matches('[')
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1"
-    )
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1")
 }
 
 /// 非回环监听必须有 token；空 token 仅 `127.0.0.1`/`::1` 且 `--insecure`。
@@ -56,9 +50,7 @@ pub fn validate_listen_token(bind: &str, token: &str, insecure: bool) -> Result<
         return Ok(());
     }
     if is_loopback_bind(bind) {
-        return Err(
-            "empty token on loopback requires --insecure (or RUPI_EXEC_INSECURE=1)".into(),
-        );
+        return Err("empty token on loopback requires --insecure (or RUPI_EXEC_INSECURE=1)".into());
     }
     Err("non-loopback listen requires --token / RUPI_EXEC_TOKEN".into())
 }

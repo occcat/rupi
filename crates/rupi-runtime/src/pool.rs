@@ -65,8 +65,7 @@ pub fn parse_endpoint_list(raw: &str, default_region: &str) -> Vec<(String, Stri
             if let Some((region, url)) = item.split_once('=') {
                 let region = region.trim();
                 let url = url.trim();
-                if !region.is_empty()
-                    && (url.starts_with("http://") || url.starts_with("https://"))
+                if !region.is_empty() && (url.starts_with("http://") || url.starts_with("https://"))
                 {
                     return (region.to_string(), url.to_string());
                 }

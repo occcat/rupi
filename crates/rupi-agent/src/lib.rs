@@ -2863,7 +2863,10 @@ mod tests {
                     prompt_snippet: Some("write".into()),
                 }
             }
-            async fn execute(&self, _a: serde_json::Value) -> anyhow::Result<rupi_tools::ToolOutput> {
+            async fn execute(
+                &self,
+                _a: serde_json::Value,
+            ) -> anyhow::Result<rupi_tools::ToolOutput> {
                 self.0.store(true, Ordering::SeqCst);
                 Ok(rupi_tools::ToolOutput::ok("should not run"))
             }
