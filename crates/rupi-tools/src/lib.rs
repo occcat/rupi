@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod optional;
+mod shell;
 mod truncate;
 mod utf8;
 pub use optional::{optional_builtins_requested, FindTool, LsTool, OPTIONAL_BUILTIN_NAMES};
@@ -830,7 +831,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Execute a shell command (bounded output; default 30s timeout). Inherits RUPI_SESSION_ID / RUPI_SESSION_FILE / RUPI_PROVIDER / RUPI_MODEL / RUPI_REASONING_LEVEL (Pi: PI_SESSION_ID / PI_SESSION_FILE / PI_PROVIDER / PI_MODEL / PI_REASONING_LEVEL).".into(),
+            description: "Execute a shell command (bounded output; default 30s timeout). Unix: sh -c. Windows: PowerShell (pwsh.exe if present, else powershell.exe) with -NoProfile -NonInteractive -ExecutionPolicy Bypass; commands are not translated from bash. Inherits RUPI_SESSION_ID / RUPI_SESSION_FILE / RUPI_PROVIDER / RUPI_MODEL / RUPI_REASONING_LEVEL (Pi: PI_SESSION_ID / PI_SESSION_FILE / PI_PROVIDER / PI_MODEL / PI_REASONING_LEVEL).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -839,7 +840,9 @@ impl Tool for BashTool {
                 },
                 "required": ["command"]
             }),
-            prompt_snippet: Some("bash(command, timeout_secs?): run shell command".into()),
+            prompt_snippet: Some(
+                "bash(command, timeout_secs?): run shell command (PowerShell on Windows)".into(),
+            ),
         }
     }
     async fn execute(&self, arguments: serde_json::Value) -> anyhow::Result<ToolOutput> {
@@ -858,15 +861,15 @@ impl Tool for BashTool {
         cancel: &CancelFlag,
     ) -> anyhow::Result<ToolOutput> {
         let (command, timeout_secs) = Self::parse_args(&arguments);
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(command);
+        let spec = crate::shell::ShellSpec::current(command);
+        let mut cmd = tokio::process::Command::new(&spec.program);
+        cmd.args(&spec.args);
         for (k, v) in current_session_env() {
             cmd.env(k, v);
         }
-        // 自成进程组（setsid）：取消/超时杀整组，sh -c fork 出的孙进程不留孤儿。
-        // BashTool 本就调 sh，Unix 假设与既有用例一致。
-        use std::os::unix::process::CommandExt as _;
-        cmd.as_std_mut().process_group(0);
+        // Unix：自成进程组，取消/超时 killpg。Windows：CREATE_NEW_PROCESS_GROUP
+        // + CREATE_NO_WINDOW，杀树走 taskkill /T。
+        crate::shell::configure_isolation(cmd.as_std_mut());
         let mut child = match cmd
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
@@ -967,18 +970,10 @@ impl BashTool {
         (command, timeout_secs)
     }
 
-    /// 杀整组进程树：先 killpg 发 SIGKILL（组长即直接子进程 pid，setsid 保证），
-    /// 再补一次定向 kill 兜底，最后 wait 回收僵尸。killpg 失败一律忽略
-    /// （组已空/进程已死的 ESRCH 等），wait 保证无僵尸。
+    /// 杀整组进程树。Unix：killpg + 定向 kill；Windows：taskkill /F /T。
+    /// 失败一律忽略（组已空/进程已死），wait 保证无僵尸。
     async fn kill_tree(child: &mut tokio::process::Child) {
-        if let Some(pid) = child.id() {
-            // SAFETY: killpg 仅向进程组发信号，不涉及内存，参数为刚取到的存活 pid。
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        crate::shell::kill_tree(child).await;
     }
 
     /// 并发排空一条管道，只保留最后 `max_bytes`（对标 bash 50KB 尾部）。
@@ -1774,6 +1769,18 @@ mod tests {
             .unwrap();
         assert!(slow.is_error);
         assert!(slow.content.contains("timed out after 1s"));
+    }
+
+    #[test]
+    fn bash_definition_documents_windows_powershell() {
+        let d = BashTool.definition();
+        assert!(d.description.contains("sh -c"), "{}", d.description);
+        assert!(d.description.contains("PowerShell"), "{}", d.description);
+        assert!(
+            d.description.contains("not translated"),
+            "{}",
+            d.description
+        );
     }
 
     #[tokio::test]
