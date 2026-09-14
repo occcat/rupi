@@ -104,7 +104,7 @@ pub fn router(cfg: SandboxdConfig) -> Router {
         .route("/v1/sandboxes/{id}/bootstrap", post(bootstrap))
         .route("/v1/sandboxes/{id}/snapshot", post(snapshot))
         .route("/v1/sandboxes/{id}/restore", post(restore))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(crate::access_trace_layer())
         .with_state(state)
 }
 

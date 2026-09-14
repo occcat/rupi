@@ -37,7 +37,7 @@ pub fn router(app: App) -> Router {
         .route("/v1/sessions/{id}/import", post(import_session))
         .route("/v1/agent", post(agent_run))
         .merge(crate::admin::router())
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(rupi_runtime::access_trace_layer())
         .with_state(app)
 }
 
