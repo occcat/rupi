@@ -363,4 +363,36 @@ mod tests {
         );
         assert!(s.contains("rupi-data/snapshots"), "{s}");
     }
+
+    #[test]
+    fn control_plane_forbids_user_shell_and_local_docker() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        walk_rs(&src, &mut |f, t| {
+            assert!(
+                !t.contains("Command::new(\"sh\")"),
+                "{} must not spawn user sh -c",
+                f.display()
+            );
+            assert!(
+                !t.contains("Command::new(\"docker\")"),
+                "{} must not default to local Docker",
+                f.display()
+            );
+        });
+        assert!(rupi_runtime::BackendKind::parse("docker").is_none());
+    }
+
+    fn walk_rs(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path, &str)) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    walk_rs(&p, f);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let t = std::fs::read_to_string(&p).unwrap();
+                    f(&p, &t);
+                }
+            }
+        }
+    }
 }

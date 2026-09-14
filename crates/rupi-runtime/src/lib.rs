@@ -22,7 +22,7 @@ pub mod tar;
 pub mod token;
 
 pub use access_log::access_trace_layer;
-pub use jail::Isolation;
+pub use jail::{macos_sandbox_profile, parse_sandbox_image, Isolation, SandboxImage};
 pub use pool::{is_pool_exhausted, parse_endpoint_list, PoolExhausted, PoolNode, PoolScheduler};
 pub use s3::{MemoryObjectStore, S3Config, S3ObjectStore};
 pub use sandbox_http::SandboxExecutor;
@@ -53,6 +53,8 @@ impl BackendKind {
         match s.trim() {
             "remote-http" | "execd" | "remote" => Some(Self::RemoteHttp),
             "sandbox" | "sandbox-cluster" => Some(Self::Sandbox),
+            // 本机 Docker / K8s 不是执行面，也不能当默认 backend。
+            "docker" | "k8s" | "kubernetes" | "local-docker" => None,
             _ => None,
         }
     }
@@ -328,5 +330,45 @@ mod tests {
             serde_json::from_str(r#"{"id":"x","backend":"remote-http"}"#).unwrap();
         assert_eq!(old.id, "x");
         assert!(old.region.is_none());
+    }
+
+    #[test]
+    fn backend_kind_rejects_local_docker() {
+        assert!(BackendKind::parse("docker").is_none());
+        assert!(BackendKind::parse("local-docker").is_none());
+        assert!(BackendKind::parse("k8s").is_none());
+        assert_eq!(BackendKind::parse("sandbox"), Some(BackendKind::Sandbox));
+        assert_eq!(
+            BackendKind::parse("remote-http"),
+            Some(BackendKind::RemoteHttp)
+        );
+    }
+
+    #[test]
+    fn execution_plane_src_has_no_docker_default() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for f in rust_sources(&src) {
+            let t = std::fs::read_to_string(&f).unwrap();
+            assert!(
+                !t.contains("Command::new(\"docker\")"),
+                "{} must not spawn docker as an execution plane",
+                f.display()
+            );
+        }
+    }
+
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    out.extend(rust_sources(&p));
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 }

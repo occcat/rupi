@@ -1,9 +1,11 @@
-//! `rupi-sandboxd`：Linux jail 工作区后端（landlock + 尽量断网），不是微 VM / 容器集群。
+//! `rupi-sandboxd`：每槽独立根隔离（bwrap + user ns / landlock / macOS deny-default）。
 //!
-//! 与 `rupi-execd` 协议并列、可插拔。控制面只认 HTTP；本进程才碰工作区与命令。
+//! `CreateIn.image` 必须能被隔离后端兑现：`default`/`jail` 走内建 jail；本地 rootfs
+//! 走 bwrap；Docker/OCI 引用或不认识的镜像 **失败关闭**，不能静默丢掉。
+//! 不是微 VM，也不是本机 Docker。控制面只认 HTTP；本进程才碰工作区与命令。
 
 use crate::engine::{Engine, EngineConfig, EngineError};
-use crate::jail::Isolation;
+use crate::jail::{self, Isolation};
 use crate::token::{tokens_eq, validate_listen_token};
 use crate::{store, BootstrapKind, ExecResult, ExecutorStats, ToolText};
 use axum::extract::{Path, State};
@@ -52,6 +54,7 @@ struct SandboxCreated {
     kind: String,
     region: String,
     tenant_id: String,
+    image: String,
 }
 
 pub async fn serve(cfg: SandboxdConfig) -> anyhow::Result<()> {
@@ -184,21 +187,22 @@ async fn create(
     if !auth_ok(&state, &headers) {
         return Err(deny());
     }
-    if body
-        .image
-        .as_deref()
-        .is_some_and(|s| !s.is_empty() && s != "default")
-    {
-        tracing::info!(
-            "sandbox image={} ignored (jail backend, not a micro-VM)",
-            body.image.as_deref().unwrap_or("")
-        );
+    let spec = match jail::parse_sandbox_image(body.image.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+    };
+    if let Err(e) = spec.require_backend() {
+        return Err((StatusCode::BAD_REQUEST, e));
     }
-    let lease = state
+    let image_label = spec.as_label();
+    let lease = match state
         .engine
-        .alloc(&body.tenant_id, &body.session_id)
+        .alloc_with(&body.tenant_id, &body.session_id, spec)
         .await
-        .map_err(map_err)?;
+    {
+        Ok(l) => l,
+        Err(e) => return Err(map_err(e)),
+    };
     let refill = state.clone();
     tokio::spawn(async move {
         refill.engine.refill_warm().await;
@@ -209,6 +213,7 @@ async fn create(
         kind: "sandbox".into(),
         region: state.cfg.region.clone(),
         tenant_id: body.tenant_id,
+        image: image_label,
     }))
 }
 
@@ -606,6 +611,109 @@ mod tests {
             404,
             "sandboxd must not speak execd /v1/alloc"
         );
+        exec.destroy(&h).await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unsupported_image_and_does_not_alloc() {
+        let root = std::env::temp_dir().join(format!("rupi-sb-img-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (addr, _h) = spawn(SandboxdConfig {
+            bind: "127.0.0.1:0".into(),
+            root: root.clone(),
+            token: "sb".into(),
+            max_sandboxes: 2,
+            warm_pool: 0,
+            region: "eu-west".into(),
+            insecure: false,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let client = reqwest::Client::new();
+        for image in ["ubuntu:22.04", "docker://alpine", "oci:foo", "not-an-image"] {
+            let resp = client
+                .post(format!("http://{addr}/v1/sandboxes"))
+                .bearer_auth("sb")
+                .json(&serde_json::json!({
+                    "tenant_id": "ten",
+                    "session_id": "s1",
+                    "image": image
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "image {image} must fail create, not be dropped"
+            );
+            let body = resp.text().await.unwrap_or_default();
+            assert!(body.contains("unsupported"), "image {image} body={body}");
+        }
+        let st = client
+            .get(format!("http://{addr}/v1/cluster"))
+            .bearer_auth("sb")
+            .send()
+            .await
+            .unwrap()
+            .json::<crate::ExecutorStats>()
+            .await
+            .unwrap();
+        assert_eq!(st.used, 0, "failed image must not leave a sandbox open");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn create_default_image_uses_isolated_backend() {
+        let root = std::env::temp_dir().join(format!("rupi-sb-def-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (addr, _h) = spawn(SandboxdConfig {
+            bind: "127.0.0.1:0".into(),
+            root: root.clone(),
+            token: "sb".into(),
+            max_sandboxes: 2,
+            warm_pool: 0,
+            region: "local".into(),
+            insecure: false,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let exec = SandboxExecutor::new(format!("http://{addr}"), "sb");
+        let h = exec
+            .alloc_pref(&AllocRequest::new("ten", "s1").with_kind(BackendKind::Sandbox))
+            .await
+            .unwrap();
+        let created = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/sandboxes"))
+            .bearer_auth("sb")
+            .json(&serde_json::json!({
+                "tenant_id": "ten",
+                "session_id": "s2",
+                "image": "default"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "default image must use isolated jail, status={}",
+            created.status()
+        );
+        let v: serde_json::Value = created.json().await.unwrap();
+        assert_eq!(v["image"], "default");
+        assert_eq!(v["kind"], "sandbox");
+        let id = v["id"].as_str().expect("id");
+        let _ = reqwest::Client::new()
+            .delete(format!("http://{addr}/v1/sandboxes/{id}"))
+            .bearer_auth("sb")
+            .json(&serde_json::json!({"tenant_id": "ten"}))
+            .send()
+            .await;
         exec.destroy(&h).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

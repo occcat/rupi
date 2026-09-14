@@ -12,7 +12,7 @@
 4. `rupi-server`：无状态控制面，可多副本
 5. `/admin`：`RUPI_ADMIN_TOKEN` 或库内 `rupi_admin_*` Key
 
-控制面进程里不跑用户 `sh -c`。`sandboxd` 是句柄根 jail（bwrap / landlock / chroot 尽力），**不是**微 VM。
+控制面进程里不跑用户 `sh -c`，也不把本机 Docker 当默认执行面。`sandboxd` 是每槽独立根隔离（bwrap + user ns / landlock / macOS `(deny default)`），**不是**微 VM。`CreateIn.image` 必须能被隔离后端兑现（`default`/`jail` 或本地 rootfs）；Docker/OCI 或不支持的镜像 create 失败并关闭，不会静默丢掉。
 
 ## 真实开关
 
