@@ -1387,10 +1387,7 @@ fn session_dir_cli_export_exit_share_and_prompts_toggle() {
     .output()
     .unwrap();
     let (out, err) = out_text(&o);
-    assert!(
-        o.status.success(),
-        "--session-dir run 失败:\n{out}\n{err}"
-    );
+    assert!(o.status.success(), "--session-dir run 失败:\n{out}\n{err}");
     assert!(
         sess.join("sessions.db").is_file(),
         "sessions.db 应落在 --session-dir"
@@ -1426,13 +1423,16 @@ fn session_dir_cli_export_exit_share_and_prompts_toggle() {
     .unwrap();
     let (out, err) = out_text(&o);
     assert!(o.status.success(), "--export 失败:\n{out}\n{err}");
-    assert!(
-        out.contains("Exported to:"),
-        "缺导出确认:\n{out}\n{err}"
-    );
+    assert!(out.contains("Exported to:"), "缺导出确认:\n{out}\n{err}");
     assert!(dest.is_file(), "HTML 未写出: {dest:?}");
     let html = std::fs::read_to_string(&dest).unwrap();
-    assert!(html.contains("<html") || html.contains("<!DOCTYPE") || html.contains("hello-session-dir") || html.contains("session"), "{html}");
+    assert!(
+        html.contains("<html")
+            || html.contains("<!DOCTYPE")
+            || html.contains("hello-session-dir")
+            || html.contains("session"),
+        "{html}"
+    );
 
     let jsonl_out = home.join("exported.jsonl");
     let o = rupi(
@@ -1449,7 +1449,10 @@ fn session_dir_cli_export_exit_share_and_prompts_toggle() {
     .unwrap();
     assert!(o.status.success(), "--export jsonl 失败: {o:?}");
     let jsonl = std::fs::read_to_string(&jsonl_out).unwrap();
-    assert!(jsonl.contains("\"type\":\"session\"") || jsonl.contains("session"), "{jsonl}");
+    assert!(
+        jsonl.contains("\"type\":\"session\"") || jsonl.contains("session"),
+        "{jsonl}"
+    );
 
     std::fs::create_dir_all(home.join("prompts")).unwrap();
     std::fs::write(home.join("prompts").join("greet.md"), "Hello $ARGUMENTS\n").unwrap();

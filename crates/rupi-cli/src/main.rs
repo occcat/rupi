@@ -537,12 +537,8 @@ fn export_and_exit(cli: &Cli, home: &Path, src: &str, dest: Option<&str>) -> any
             .unwrap_or(&imported.tree.id)
             .to_string();
         let html = rupi_memory::export_tree_html(&imported.tree, &title);
-        let jsonl = rupi_memory::export_tree_jsonl(
-            &imported.tree,
-            &cwd,
-            imported.name.as_deref(),
-            None,
-        );
+        let jsonl =
+            rupi_memory::export_tree_jsonl(&imported.tree, &cwd, imported.name.as_deref(), None);
         (imported.tree.id, html, jsonl)
     } else {
         let id = rupi_memory::resolve_session_ref(&store, src)?;
@@ -1883,7 +1879,9 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(cli, home))?));
+    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
+        cli, home,
+    ))?));
     let (mut session, sid) = restore_or_new(cli, &sess_db.lock().unwrap(), false)?;
     // provider 在会话 id 落定后构造：亲和头荷载即 sessions.db 会话 id，
     // --resume 同 id 即同一下游（实例级随机 id 只保同进程粘滞）。
@@ -2152,7 +2150,9 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(cli, home))?));
+    let sess_db = Arc::new(Mutex::new(SessionStore::open(&session_store_home(
+        cli, home,
+    ))?));
     let (mut session, mut sid) = restore_or_new(cli, &sess_db.lock().unwrap(), false)?;
     // provider 与 reviewer 在会话 id 落定后装配：亲和头荷载即 sessions.db 会话 id
     let mut provider: Arc<dyn LlmProvider> =
@@ -2646,9 +2646,9 @@ async fn run_tui(cli: &Cli, home: &PathBuf, initial: Option<String>) -> anyhow::
     maybe_external_memory(cli, home, &mut mem_mgr).await?;
     let mem = Arc::new(mem_mgr);
     let skills = Arc::new(discover_skills(cli, home, load_project));
-    let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(&session_store_home(
-        cli, home,
-    ))?));
+    let sess_db = Arc::new(std::sync::Mutex::new(SessionStore::open(
+        &session_store_home(cli, home),
+    )?));
     let (mut session, sid) = {
         let db = sess_db.lock().unwrap();
         restore_or_new(cli, &db, cli.pick_session)?

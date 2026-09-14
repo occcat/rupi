@@ -436,11 +436,7 @@ fn eq_on(value: &str) -> bool {
 }
 
 /// `--session-dir` > `RUPI_SESSION_DIR` > `PI_CODING_AGENT_SESSION_DIR` > `settings.sessionDir` > fallback。
-pub fn resolve_session_dir(
-    cli: Option<&str>,
-    settings: Option<&str>,
-    fallback: &Path,
-) -> PathBuf {
+pub fn resolve_session_dir(cli: Option<&str>, settings: Option<&str>, fallback: &Path) -> PathBuf {
     if let Some(p) = nonempty(cli) {
         return expand_user_path(p);
     }
@@ -888,10 +884,7 @@ mod tests {
             std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
         }
         let fallback = PathBuf::from("/tmp/rupi-fallback");
-        assert_eq!(
-            resolve_session_dir(None, None, &fallback),
-            fallback
-        );
+        assert_eq!(resolve_session_dir(None, None, &fallback), fallback);
         assert_eq!(
             resolve_session_dir(None, Some("/from-settings"), &fallback),
             PathBuf::from("/from-settings")

@@ -414,7 +414,10 @@ mod tests {
         b.insert_str("one\r\ntwo\nthree");
         assert_eq!(b.text(), "one\ntwo\nthree");
         assert!(collapse_paste_preview(&b.text()).is_none());
-        let big = (0..12).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let big = (0..12)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview = collapse_paste_preview(&big).expect("should collapse");
         assert!(preview.contains("12 lines"), "{preview}");
         assert!(preview.contains("chars"), "{preview}");

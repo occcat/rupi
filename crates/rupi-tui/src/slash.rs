@@ -122,9 +122,7 @@ pub fn expand_slash_input(
     let Some((name, args)) = rupi_core::commands::split(text) else {
         return (text.to_string(), None);
     };
-    if let Some(expanded) =
-        rupi_core::commands::expand_filtered(command_dirs, name, args, filter)
-    {
+    if let Some(expanded) = rupi_core::commands::expand_filtered(command_dirs, name, args, filter) {
         return (expanded, Some(format!("[command /{name}]")));
     }
     if let Some(expanded) = skills.expand_as_command(name, args) {

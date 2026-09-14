@@ -26,11 +26,7 @@ pub fn viewer_url(gist_id: &str) -> String {
 pub fn default_share_path(sid: &str, ext: &str) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!(
-            "rupi-session-{}.{}",
-            &sid[..8.min(sid.len())],
-            ext
-        ))
+        .join(format!("rupi-session-{}.{}", &sid[..8.min(sid.len())], ext))
 }
 
 /// 测试或离线：`allow_upload=false` 只写本地，不调 `gh`。
@@ -112,10 +108,7 @@ mod tests {
             std::env::remove_var("RUPI_SHARE_VIEWER_URL");
             std::env::remove_var("PI_SHARE_VIEWER_URL");
         }
-        assert_eq!(
-            viewer_url("abc123"),
-            "https://pi.dev/session/#abc123"
-        );
+        assert_eq!(viewer_url("abc123"), "https://pi.dev/session/#abc123");
         unsafe { std::env::set_var("PI_SHARE_VIEWER_URL", "https://example.com/s") };
         assert_eq!(viewer_url("abc123"), "https://example.com/s/#abc123");
         unsafe { std::env::set_var("RUPI_SHARE_VIEWER_URL", "https://rupi.example/view/") };
@@ -132,11 +125,8 @@ mod tests {
 
     #[test]
     fn share_without_upload_writes_local_jsonl() {
-        let cwd = std::env::temp_dir().join(format!(
-            "rupi-share-cwd-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let cwd =
+            std::env::temp_dir().join(format!("rupi-share-cwd-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&cwd);
         std::fs::create_dir_all(&cwd).unwrap();
         let prev = std::env::current_dir().ok();
