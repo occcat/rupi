@@ -95,6 +95,9 @@ pub struct Settings {
     pub external_editor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_models: Vec<String>,
+    /// TUI 启动不打印帮助与已载 skill/ext/MCP。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet_startup: Option<bool>,
 }
 
 fn compaction_is_empty(c: &CompactionSettings) -> bool {
@@ -157,6 +160,10 @@ impl Settings {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+
+    pub fn quiet_startup(&self) -> bool {
+        self.quiet_startup.unwrap_or(false)
+    }
 }
 
 /// `/settings` 斜杠：列出或改一项。
@@ -201,7 +208,7 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
     };
     let editor = settings.external_editor().unwrap_or("(VISUAL/EDITOR)");
     format!(
-        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}",
+        "settings (write → {}):\n  steeringMode           {}\n  followUpMode           {}\n  defaultProjectTrust    {}\n  externalEditor         {editor}\n  enabledModels          {models}\n  model                  {}\n  thinking               {}\n  theme                  {}\n  quietStartup           {}",
         write_path.display(),
         settings.steering_mode_str(),
         settings.follow_up_mode_str(),
@@ -209,6 +216,7 @@ pub fn format_settings(settings: &Settings, write_path: &Path) -> String {
         settings.model.as_deref().unwrap_or("(unset)"),
         settings.thinking.as_deref().unwrap_or("(unset)"),
         settings.theme(),
+        settings.quiet_startup(),
     )
 }
 
@@ -224,6 +232,7 @@ pub fn is_core_key(key: &str) -> bool {
             | "model"
             | "thinking"
             | "theme"
+            | "quietstartup"
     )
 }
 
@@ -288,8 +297,13 @@ pub fn apply_setting(
             settings.theme = Some(v.to_string());
             Ok(("theme".into(), json!(v)))
         }
+        "quietstartup" => {
+            let v = parse_bool_flag(value)?;
+            settings.quiet_startup = Some(v);
+            Ok(("quietStartup".into(), json!(v)))
+        }
         _ => anyhow::bail!(
-            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels|theme)"
+            "unknown setting '{key}' (steeringMode|followUpMode|defaultProjectTrust|externalEditor|enabledModels|theme|quietStartup)"
         ),
     }
 }
@@ -321,6 +335,14 @@ pub fn persist_patch(path: &Path, key: &str, value: Value) -> anyhow::Result<()>
     let body = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, format!("{body}\n"))?;
     Ok(())
+}
+
+fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Ok(true),
+        "false" | "0" | "no" | "n" | "off" => Ok(false),
+        other => anyhow::bail!("must be true|false, got '{other}'"),
+    }
 }
 
 fn parse_theme(value: &str) -> anyhow::Result<&'static str> {
@@ -673,6 +695,11 @@ mod tests {
         assert_eq!(s.theme(), "light");
         assert_eq!(tv, json!("light"));
         assert!(apply_setting(&mut s, "theme", "neon").is_err());
+        let (qk, qv) = apply_setting(&mut s, "quietStartup", "true").unwrap();
+        assert_eq!(qk, "quietStartup");
+        assert_eq!(qv, json!(true));
+        assert!(s.quiet_startup());
+        assert!(apply_setting(&mut s, "quietStartup", "maybe").is_err());
         let dir = std::env::temp_dir().join(format!("rupi-cfg-write-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

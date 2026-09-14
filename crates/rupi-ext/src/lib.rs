@@ -287,6 +287,15 @@ impl ExtensionSet {
             .collect()
     }
 
+    /// 已载扩展名（manifest snapshot + 活着的 JSON-RPC host）。
+    pub fn loaded_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.snapshot.values().map(|(_, n)| n.clone()).collect();
+        names.extend(self.rpc_hosts.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn list_commands(&self) -> Vec<ExtensionCommand> {
         let mut out = Vec::new();
         for h in self.rpc_hosts.values() {

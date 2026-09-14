@@ -302,13 +302,20 @@ impl EventMapper {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
+                cache_read,
+                cache_write,
             } => {
                 out.push(AguiEvent::new(
                     "STATE_DELTA",
                     json!({"delta": [{
                         "op": "add",
                         "path": "/lastUsage",
-                        "value": {"inputTokens": input_tokens, "outputTokens": output_tokens}
+                        "value": {
+                            "inputTokens": input_tokens,
+                            "outputTokens": output_tokens,
+                            "cacheRead": cache_read,
+                            "cacheWrite": cache_write
+                        }
                     }]}),
                 ));
             }

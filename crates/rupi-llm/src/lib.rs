@@ -157,7 +157,74 @@ pub struct ChatResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
-    Usage { input: u64, output: u64 },
+    Usage {
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    },
+}
+
+/// 从 OpenAI / Anthropic / Gemini usage 对象抽出 in/out 与 cache R/W。
+pub fn parse_provider_usage(u: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let input = first_u64(
+        u,
+        &["prompt_tokens", "input_tokens", "promptTokenCount", "input"],
+    );
+    let output = first_u64(
+        u,
+        &[
+            "completion_tokens",
+            "output_tokens",
+            "candidatesTokenCount",
+            "output",
+        ],
+    );
+    let cache_read = first_u64_at(
+        u,
+        &[
+            "/prompt_tokens_details/cached_tokens",
+            "/cache_read_input_tokens",
+            "/cached_tokens",
+            "/cachedContentTokenCount",
+            "/cacheRead",
+            "/cache_read",
+        ],
+    );
+    let mut cache_write = first_u64_at(
+        u,
+        &[
+            "/cache_creation_input_tokens",
+            "/cache_write_tokens",
+            "/cacheWrite",
+            "/cache_write",
+        ],
+    );
+    if cache_write == 0 {
+        if let Some(cc) = u.get("cache_creation") {
+            cache_write = first_u64(cc, &["ephemeral_5m_input_tokens"])
+                .saturating_add(first_u64(cc, &["ephemeral_1h_input_tokens"]));
+        }
+    }
+    (input, output, cache_read, cache_write)
+}
+
+fn first_u64(obj: &serde_json::Value, keys: &[&str]) -> u64 {
+    for k in keys {
+        if let Some(n) = obj.get(*k).and_then(|x| x.as_u64()) {
+            return n;
+        }
+    }
+    0
+}
+
+fn first_u64_at(obj: &serde_json::Value, pointers: &[&str]) -> u64 {
+    for p in pointers {
+        if let Some(n) = obj.pointer(p).and_then(|x| x.as_u64()) {
+            return n;
+        }
+    }
+    0
 }
 
 #[async_trait]
@@ -606,13 +673,16 @@ impl SseAccumulator {
     ) {
         // usage 块（include_usage 时最后一个 chunk，choices 为空）：先于 delta 判定处理
         if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-            let input = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let output = u
-                .get("completion_tokens")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0);
-            if input > 0 || output > 0 {
-                let _ = tx.send(StreamEvent::Usage { input, output }).await;
+            let (input, output, cache_read, cache_write) = parse_provider_usage(u);
+            if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
+                let _ = tx
+                    .send(StreamEvent::Usage {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                    })
+                    .await;
             }
         }
         let delta = match v.pointer("/choices/0/delta") {
@@ -1527,8 +1597,54 @@ mod error_body_tests {
             rx.try_recv().unwrap(),
             StreamEvent::Usage {
                 input: 12,
-                output: 3
+                output: 3,
+                cache_read: 0,
+                cache_write: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn usage_chunk_parses_openai_cached_tokens() {
+        let mut acc = SseAccumulator::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        acc.apply_chunk(
+            &serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 8,
+                    "prompt_tokens_details": {"cached_tokens": 80}
+                }
+            }),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Usage {
+                input: 100,
+                output: 8,
+                cache_read: 80,
+                cache_write: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_provider_usage_anthropic_and_openai() {
+        let a = serde_json::json!({
+            "input_tokens": 120,
+            "output_tokens": 9,
+            "cache_read_input_tokens": 90,
+            "cache_creation_input_tokens": 12
+        });
+        assert_eq!(parse_provider_usage(&a), (120, 9, 90, 12));
+        let o = serde_json::json!({
+            "prompt_tokens": 50,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        });
+        assert_eq!(parse_provider_usage(&o), (50, 2, 40, 0));
     }
 }

@@ -128,6 +128,42 @@ pub struct TreeEntry {
     pub preview: String,
 }
 
+/// 单节点 / 单轮用量（对标 Pi JSONL `usage.input/output/cacheRead/cacheWrite`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+}
+
+impl TokenUsage {
+    pub fn new(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+
+    pub fn cache_hit_pct(&self) -> f64 {
+        if self.input == 0 {
+            return 0.0;
+        }
+        (self.cache_read as f64) * 100.0 / (self.input as f64)
+    }
+}
+
 /// 会话树节点：Pi sessions are trees —— 支持 branch / rewind / summary。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionNode {
@@ -148,6 +184,9 @@ pub struct SessionTree {
     /// 压缩摘要：覆盖 `summary_through` 之前全部历史；prompt 只带摘要 + 近期窗口
     pub summary: Option<String>,
     pub summary_through: Option<String>,
+    /// 助手节点用量（含 cache R/W）。不进 `Message`，避免全仓字面量；落盘时写入 blocks JSON。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub usage_by_node: HashMap<String, TokenUsage>,
 }
 
 impl SessionTree {
@@ -158,7 +197,18 @@ impl SessionTree {
             current_path: vec![],
             summary: None,
             summary_through: None,
+            usage_by_node: HashMap::new(),
         }
+    }
+
+    pub fn note_node_usage(&mut self, id: &str, usage: TokenUsage) {
+        if !usage.is_zero() {
+            self.usage_by_node.insert(id.to_string(), usage);
+        }
+    }
+
+    pub fn node_usage(&self, id: &str) -> TokenUsage {
+        self.usage_by_node.get(id).copied().unwrap_or_default()
     }
 
     /// 追加一条消息，返回新节点 id。
@@ -459,6 +509,10 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        cache_read: u64,
+        #[serde(default)]
+        cache_write: u64,
     },
     Error {
         message: String,

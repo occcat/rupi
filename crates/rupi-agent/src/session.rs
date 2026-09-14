@@ -300,6 +300,7 @@ impl AgentSession {
             if let AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
+                ..
             } = &e
             {
                 *usage.lock().unwrap() = Some((*input_tokens, *output_tokens));
