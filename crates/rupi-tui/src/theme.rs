@@ -17,6 +17,15 @@ pub struct Theme {
     pub heading: Color,
     pub code: Color,
     pub accent: Color,
+    pub syntax_comment: Color,
+    pub syntax_keyword: Color,
+    pub syntax_function: Color,
+    pub syntax_variable: Color,
+    pub syntax_string: Color,
+    pub syntax_number: Color,
+    pub syntax_type: Color,
+    pub syntax_operator: Color,
+    pub syntax_punctuation: Color,
 }
 
 impl Theme {
@@ -35,6 +44,15 @@ impl Theme {
             heading: Color::LightBlue,
             code: Color::LightGreen,
             accent: Color::LightYellow,
+            syntax_comment: Color::DarkGray,
+            syntax_keyword: Color::LightBlue,
+            syntax_function: Color::Cyan,
+            syntax_variable: Color::White,
+            syntax_string: Color::LightGreen,
+            syntax_number: Color::LightYellow,
+            syntax_type: Color::LightMagenta,
+            syntax_operator: Color::Gray,
+            syntax_punctuation: Color::DarkGray,
         }
     }
 
@@ -53,6 +71,15 @@ impl Theme {
             heading: Color::Blue,
             code: Color::Rgb(0, 100, 40),
             accent: Color::Rgb(140, 80, 0),
+            syntax_comment: Color::Gray,
+            syntax_keyword: Color::Blue,
+            syntax_function: Color::Rgb(0, 90, 140),
+            syntax_variable: Color::Black,
+            syntax_string: Color::Rgb(0, 100, 40),
+            syntax_number: Color::Rgb(140, 80, 0),
+            syntax_type: Color::Magenta,
+            syntax_operator: Color::DarkGray,
+            syntax_punctuation: Color::Gray,
         }
     }
 

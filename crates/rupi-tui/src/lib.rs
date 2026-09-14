@@ -3,8 +3,11 @@
 
 pub mod app;
 pub mod complete;
+pub mod highlight;
 pub mod keybindings;
+pub mod kitty;
 pub mod markdown;
+pub mod mermaid;
 pub mod session_nav;
 pub mod slash;
 pub mod theme;

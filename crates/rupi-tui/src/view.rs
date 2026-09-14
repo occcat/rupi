@@ -1,6 +1,7 @@
 //! 纯视图逻辑（可单测）：输入缓冲 + 事件折叠成渲染行 + 增量视觉缓存。
 
-use crate::markdown::render_markdown;
+use crate::kitty::InlineImage;
+use crate::markdown::{render_markdown_rows, MdRow};
 use crate::theme::Theme;
 use ratatui::style::Style;
 use ratatui::text::{Line as RLine, Span};
@@ -19,6 +20,11 @@ pub enum Line {
     },
     Thinking(String),
     System(String),
+    Image {
+        alt: String,
+        media_type: String,
+        data: String,
+    },
 }
 
 /// 输入框：字符缓冲 + 光标（字符级，支持中文）。
@@ -92,6 +98,7 @@ impl InputBuffer {
 struct VisualCache {
     key: u8,
     rows: Vec<RLine<'static>>,
+    images: Vec<InlineImage>,
     /// 每个逻辑行对应视觉行的起始下标。
     starts: Vec<usize>,
     items: usize,
@@ -229,37 +236,80 @@ impl ChatView {
         self.lines.push(Line::System(text));
     }
 
+    pub fn push_image(
+        &mut self,
+        alt: impl Into<String>,
+        media_type: impl Into<String>,
+        data: impl Into<String>,
+    ) {
+        self.lines.push(Line::Image {
+            alt: alt.into(),
+            media_type: media_type.into(),
+            data: data.into(),
+        });
+    }
+
+    pub fn inline_images(&self) -> &[InlineImage] {
+        &self.cache.images
+    }
+
     /// 只重绘脏逻辑行；调用方再切片可见窗口，避免每帧 clone 全部 `view.lines`。
     pub fn visual_lines(
         &mut self,
         theme: &Theme,
         tools_folded: bool,
         thinking_folded: bool,
+        inline_images: bool,
     ) -> &[RLine<'static>] {
-        let key = theme.id | ((tools_folded as u8) << 2) | ((thinking_folded as u8) << 3);
+        let key = theme.id
+            | ((tools_folded as u8) << 2)
+            | ((thinking_folded as u8) << 3)
+            | ((inline_images as u8) << 4);
         if self.cache.key != key {
-            self.rebuild(theme, tools_folded, thinking_folded);
+            self.rebuild(theme, tools_folded, thinking_folded, inline_images);
             return &self.cache.rows;
         }
         while self.cache.items < self.lines.len() {
-            self.append_item(self.cache.items, theme, tools_folded, thinking_folded);
+            self.append_item(
+                self.cache.items,
+                theme,
+                tools_folded,
+                thinking_folded,
+                inline_images,
+            );
         }
         if let Some(last) = self.lines.last() {
             let fp = line_fp(last);
             if fp != self.cache.last_fp && !self.lines.is_empty() {
-                self.rebuild_from(self.lines.len() - 1, theme, tools_folded, thinking_folded);
+                self.rebuild_from(
+                    self.lines.len() - 1,
+                    theme,
+                    tools_folded,
+                    thinking_folded,
+                    inline_images,
+                );
             }
         }
         &self.cache.rows
     }
 
-    fn rebuild(&mut self, theme: &Theme, tools_folded: bool, thinking_folded: bool) {
+    fn rebuild(
+        &mut self,
+        theme: &Theme,
+        tools_folded: bool,
+        thinking_folded: bool,
+        inline_images: bool,
+    ) {
         self.cache.rows.clear();
+        self.cache.images.clear();
         self.cache.starts.clear();
         self.cache.items = 0;
-        self.cache.key = theme.id | ((tools_folded as u8) << 2) | ((thinking_folded as u8) << 3);
+        self.cache.key = theme.id
+            | ((tools_folded as u8) << 2)
+            | ((thinking_folded as u8) << 3)
+            | ((inline_images as u8) << 4);
         for i in 0..self.lines.len() {
-            self.append_item(i, theme, tools_folded, thinking_folded);
+            self.append_item(i, theme, tools_folded, thinking_folded, inline_images);
         }
     }
 
@@ -269,6 +319,7 @@ impl ChatView {
         theme: &Theme,
         tools_folded: bool,
         thinking_folded: bool,
+        inline_images: bool,
     ) {
         let cut = *self
             .cache
@@ -276,10 +327,11 @@ impl ChatView {
             .get(from)
             .unwrap_or(&self.cache.rows.len());
         self.cache.rows.truncate(cut);
+        self.cache.images.retain(|img| img.row < cut);
         self.cache.starts.truncate(from);
         self.cache.items = from;
         for i in from..self.lines.len() {
-            self.append_item(i, theme, tools_folded, thinking_folded);
+            self.append_item(i, theme, tools_folded, thinking_folded, inline_images);
         }
     }
 
@@ -289,9 +341,21 @@ impl ChatView {
         theme: &Theme,
         tools_folded: bool,
         thinking_folded: bool,
+        inline_images: bool,
     ) {
         self.cache.starts.push(self.cache.rows.len());
-        let rows = render_item(&self.lines[idx], theme, tools_folded, thinking_folded);
+        let (rows, images) = render_item(
+            &self.lines[idx],
+            theme,
+            tools_folded,
+            thinking_folded,
+            inline_images,
+        );
+        let base = self.cache.rows.len();
+        for mut img in images {
+            img.row += base;
+            self.cache.images.push(img);
+        }
         self.cache.rows.extend(rows);
         self.cache.items = idx + 1;
         self.cache.last_fp = line_fp(&self.lines[idx]);
@@ -304,6 +368,15 @@ fn line_fp(l: &Line) -> u64 {
     match l {
         Line::User(s) | Line::AssistantText(s) | Line::Thinking(s) | Line::System(s) => {
             s.hash(&mut h)
+        }
+        Line::Image {
+            alt,
+            media_type,
+            data,
+        } => {
+            alt.hash(&mut h);
+            media_type.hash(&mut h);
+            data.hash(&mut h);
         }
         Line::Tool {
             name,
@@ -325,19 +398,26 @@ fn render_item(
     theme: &Theme,
     tools_folded: bool,
     thinking_folded: bool,
-) -> Vec<RLine<'static>> {
+    inline_images: bool,
+) -> (Vec<RLine<'static>>, Vec<InlineImage>) {
     match l {
-        Line::User(t) => vec![RLine::from(vec![
-            Span::styled("you: ", Style::default().fg(theme.user)),
-            Span::raw(t.clone()),
-        ])],
-        Line::AssistantText(t) => render_markdown(t, theme),
+        Line::User(t) => (
+            vec![RLine::from(vec![
+                Span::styled("you: ", Style::default().fg(theme.user)),
+                Span::raw(t.clone()),
+            ])],
+            Vec::new(),
+        ),
+        Line::AssistantText(t) => collect_md(render_markdown_rows(t, theme, inline_images), theme),
         Line::Tool { summary, full, .. } => {
             if tools_folded || full.is_empty() || full == summary {
-                vec![RLine::from(Span::styled(
-                    summary.clone(),
-                    Style::default().fg(theme.tool),
-                ))]
+                (
+                    vec![RLine::from(Span::styled(
+                        summary.clone(),
+                        Style::default().fg(theme.tool),
+                    ))],
+                    Vec::new(),
+                )
             } else {
                 let mut rows = vec![RLine::from(Span::styled(
                     format!("{summary}  [Ctrl+O 折叠]"),
@@ -349,16 +429,19 @@ fn render_item(
                         Style::default().fg(theme.tool),
                     )));
                 }
-                rows
+                (rows, Vec::new())
             }
         }
         Line::Thinking(t) => {
             if thinking_folded {
                 let n = t.chars().count();
-                vec![RLine::from(Span::styled(
-                    format!("▸ thinking ({n} chars, Ctrl+T)"),
-                    Style::default().fg(theme.thinking),
-                ))]
+                (
+                    vec![RLine::from(Span::styled(
+                        format!("▸ thinking ({n} chars, Ctrl+T)"),
+                        Style::default().fg(theme.thinking),
+                    ))],
+                    Vec::new(),
+                )
             } else {
                 let mut rows = vec![RLine::from(Span::styled(
                     "▾ thinking",
@@ -370,14 +453,44 @@ fn render_item(
                         Style::default().fg(theme.thinking),
                     )));
                 }
-                rows
+                (rows, Vec::new())
             }
         }
-        Line::System(t) => vec![RLine::from(vec![Span::styled(
-            t.clone(),
-            Style::default().fg(theme.system),
-        )])],
+        Line::System(t) => (
+            vec![RLine::from(vec![Span::styled(
+                t.clone(),
+                Style::default().fg(theme.system),
+            )])],
+            Vec::new(),
+        ),
+        Line::Image {
+            alt,
+            media_type,
+            data,
+        } => collect_md(
+            crate::markdown::image_preview(alt, media_type, data, theme, inline_images),
+            theme,
+        ),
     }
+}
+
+fn collect_md(rows: Vec<MdRow>, theme: &Theme) -> (Vec<RLine<'static>>, Vec<InlineImage>) {
+    let mut lines = Vec::new();
+    let mut images = Vec::new();
+    for row in rows {
+        match row {
+            MdRow::Line(l) => lines.push(l),
+            MdRow::Image(img) => {
+                let px = crate::kitty::dimensions(&img.media_type, &img.data);
+                lines.push(RLine::from(Span::styled(
+                    crate::kitty::caption(&img.alt, &img.media_type, px),
+                    Style::default().fg(theme.system),
+                )));
+                images.push(img);
+            }
+        }
+    }
+    (lines, images)
 }
 
 #[cfg(test)]
@@ -462,12 +575,12 @@ mod tests {
         let theme = Theme::dark();
         let mut v = ChatView::default();
         v.push_user("a".into());
-        let n1 = v.visual_lines(&theme, true, true).len();
+        let n1 = v.visual_lines(&theme, true, true, false).len();
         v.push_event(&AgentEvent::TextDelta { delta: "x".into() });
-        let n2 = v.visual_lines(&theme, true, true).len();
+        let n2 = v.visual_lines(&theme, true, true, false).len();
         assert!(n2 >= n1);
         v.push_event(&AgentEvent::TextDelta { delta: "y".into() });
-        let rows = v.visual_lines(&theme, true, true);
+        let rows = v.visual_lines(&theme, true, true, false);
         let text: String = rows
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -489,19 +602,40 @@ mod tests {
             content: "line1\nline2\nline3".into(),
             is_error: false,
         });
-        let folded = v.visual_lines(&theme, true, true);
+        let folded = v.visual_lines(&theme, true, true, false);
         let ft: String = folded
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(ft.contains("thinking"), "{ft}");
         assert!(!ft.contains("line2"), "{ft}");
-        let open = v.visual_lines(&theme, false, false);
+        let open = v.visual_lines(&theme, false, false, false);
         let ot: String = open
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(ot.contains("line2"), "{ot}");
         assert!(ot.contains("secret plan"), "{ot}");
+    }
+
+    #[test]
+    fn mermaid_and_image_rows_in_visual_cache() {
+        let theme = Theme::dark();
+        let mut v = ChatView::default();
+        v.push_event(&AgentEvent::TextDelta {
+            delta: "```mermaid\ngraph TD\n  A[Hello] --> B[World]\n```\n".into(),
+        });
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        v.push_image("dot", "image/png", png);
+        let rows = v.visual_lines(&theme, true, true, true);
+        let text: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("Hello"), "{text}");
+        assert!(text.contains("┌"), "{text}");
+        assert!(text.contains("image"), "{text}");
+        assert_eq!(v.inline_images().len(), 1);
+        assert_eq!(v.inline_images()[0].media_type, "image/png");
     }
 }
