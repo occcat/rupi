@@ -451,6 +451,9 @@ impl SessionTree {
 }
 
 /// Agent 事件流：对标 Pi 的 event streaming，UI/TUI 订阅此流渲染。
+///
+/// 字段 JSON 用 Pi `rpc.md` 的 camelCase（`toolCallId` / `isError` / `cacheRead`…），
+/// `alias` 仍接受旧 snake_case。RPC stdout 再走 [`agent_event_to_rpc_json`] 补类型名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -461,23 +464,31 @@ pub enum AgentEvent {
         delta: String,
     },
     ToolStart {
+        #[serde(rename = "toolCallId", alias = "tool_call_id")]
         tool_call_id: String,
+        #[serde(rename = "toolName", alias = "name")]
         name: String,
+        #[serde(rename = "args", alias = "arguments")]
         arguments: serde_json::Value,
     },
     ToolEnd {
+        #[serde(rename = "toolCallId", alias = "tool_call_id")]
         tool_call_id: String,
+        #[serde(rename = "toolName", alias = "name")]
         name: String,
         content: String,
+        #[serde(rename = "isError", alias = "is_error")]
         is_error: bool,
     },
     TurnEnd {
         turn: u32,
+        #[serde(rename = "stopReason", alias = "stop_reason")]
         stop_reason: StopReason,
     },
     /// 整轮结束（对标上游 `agent_end`）：终止屏障，扩展订阅者被 await，可做落盘/通知等收尾。
     /// TurnEnd 是每回合的；RunEnd 整轮只发一次（Done / MaxTurns 两出口）。
     RunEnd {
+        #[serde(rename = "stopReason", alias = "stop_reason")]
         stop_reason: StopReason,
     },
     /// 审批问询开始（对标上游 `ui_prompt_start`）：主循环即将阻塞等人工裁决。
@@ -507,11 +518,13 @@ pub enum AgentEvent {
     },
     /// 本回合模型用量（provider 在流末尾给出；未给则不发射）。对标 pi-ai usage。
     Usage {
+        #[serde(rename = "inputTokens", alias = "input_tokens", alias = "input")]
         input_tokens: u64,
+        #[serde(rename = "outputTokens", alias = "output_tokens", alias = "output")]
         output_tokens: u64,
-        #[serde(default)]
+        #[serde(default, rename = "cacheRead", alias = "cache_read")]
         cache_read: u64,
-        #[serde(default)]
+        #[serde(default, rename = "cacheWrite", alias = "cache_write")]
         cache_write: u64,
     },
     Error {
@@ -523,6 +536,44 @@ pub enum AgentEvent {
         source: String,
         kind: String,
         message: String,
+    },
+    /// 扩展 UI dialog（对标 Pi `extension_ui_request`）。不是进程内 TS widget。
+    ExtensionUiRequest {
+        id: String,
+        method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefill: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "notifyType", alias = "notify_type")]
+        notify_type: Option<String>,
+    },
+    /// 瞬时错误自动重试开始（对标 Pi `auto_retry_start`）。
+    AutoRetryStart {
+        attempt: u32,
+        #[serde(rename = "maxAttempts", alias = "max_attempts")]
+        max_attempts: u32,
+        #[serde(rename = "delayMs", alias = "delay_ms")]
+        delay_ms: u64,
+        #[serde(rename = "errorMessage", alias = "error_message")]
+        error_message: String,
+    },
+    /// 自动重试结束（对标 Pi `auto_retry_end`）。
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "finalError", alias = "final_error")]
+        final_error: Option<String>,
     },
     /// 助手思考块（Anthropic thinking 等）：流结束后整段透出，供 TUI 折叠。
     Thinking {
@@ -538,6 +589,65 @@ pub enum AgentEvent {
         provider: String,
         model: String,
     },
+}
+
+/// RPC / `--json` 出站：Pi `rpc.md` 类型名 + 字段别名（camelCase 与旧 snake_case）。
+pub fn agent_event_to_rpc_json(event: &AgentEvent) -> serde_json::Value {
+    let mut v = serde_json::to_value(event).unwrap_or_else(
+        |_| serde_json::json!({"type": "error", "message": "serialize AgentEvent"}),
+    );
+    match event {
+        AgentEvent::ToolStart {
+            tool_call_id,
+            name,
+            arguments,
+        } => {
+            v["type"] = serde_json::json!("tool_execution_start");
+            v["tool_call_id"] = serde_json::json!(tool_call_id);
+            v["name"] = serde_json::json!(name);
+            v["arguments"] = arguments.clone();
+        }
+        AgentEvent::ToolEnd {
+            tool_call_id,
+            name,
+            content,
+            is_error,
+        } => {
+            v["type"] = serde_json::json!("tool_execution_end");
+            v["tool_call_id"] = serde_json::json!(tool_call_id);
+            v["name"] = serde_json::json!(name);
+            v["is_error"] = serde_json::json!(is_error);
+            v["result"] = serde_json::json!({
+                "content": [{"type": "text", "text": content}]
+            });
+        }
+        AgentEvent::TurnEnd { stop_reason, .. } => {
+            v["stop_reason"] = serde_json::to_value(stop_reason).unwrap_or_default();
+        }
+        AgentEvent::RunEnd { stop_reason } => {
+            v["type"] = serde_json::json!("agent_end");
+            v["stop_reason"] = serde_json::to_value(stop_reason).unwrap_or_default();
+            v["willRetry"] = serde_json::json!(false);
+        }
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_write,
+        } => {
+            v["input"] = serde_json::json!(input_tokens);
+            v["output"] = serde_json::json!(output_tokens);
+            v["input_tokens"] = serde_json::json!(input_tokens);
+            v["output_tokens"] = serde_json::json!(output_tokens);
+            v["cache_read"] = serde_json::json!(cache_read);
+            v["cache_write"] = serde_json::json!(cache_write);
+        }
+        AgentEvent::ExtensionUiRequest { .. } => {
+            v["type"] = serde_json::json!("extension_ui_request");
+        }
+        _ => {}
+    }
+    v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +773,14 @@ pub trait Extension: Send + Sync {
     }
     async fn on_event(&self, _event: &AgentEvent) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// 扩展 UI dialog 出站（对标 Pi `extension_ui_request`）。默认无。
+    fn poll_ui_requests(&self) -> Vec<AgentEvent> {
+        vec![]
+    }
+    /// 宿主回 `extension_ui_response`。命中返回 true。
+    fn complete_ui_request(&self, _id: &str, _reply: serde_json::Value) -> bool {
+        false
     }
 }
 
@@ -863,5 +981,97 @@ mod tests {
             image_data_url("image/png", "abc"),
             "data:image/png;base64,abc"
         );
+    }
+
+    #[test]
+    fn agent_event_rpc_fields_match_pi() {
+        let start = AgentEvent::ToolStart {
+            tool_call_id: "call_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        };
+        let v = agent_event_to_rpc_json(&start);
+        assert_eq!(v["type"], "tool_execution_start");
+        assert_eq!(v["toolCallId"], "call_1");
+        assert_eq!(v["toolName"], "bash");
+        assert_eq!(v["args"]["command"], "ls");
+        assert_eq!(v["tool_call_id"], "call_1");
+        assert_eq!(v["name"], "bash");
+
+        let end = AgentEvent::ToolEnd {
+            tool_call_id: "call_1".into(),
+            name: "bash".into(),
+            content: "ok".into(),
+            is_error: false,
+        };
+        let v = agent_event_to_rpc_json(&end);
+        assert_eq!(v["type"], "tool_execution_end");
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["result"]["content"][0]["text"], "ok");
+
+        let usage = AgentEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read: 3,
+            cache_write: 1,
+        };
+        let v = agent_event_to_rpc_json(&usage);
+        assert_eq!(v["inputTokens"], 10);
+        assert_eq!(v["cacheRead"], 3);
+        assert_eq!(v["input"], 10);
+        assert_eq!(v["output"], 2);
+
+        let run = AgentEvent::RunEnd {
+            stop_reason: StopReason::Done,
+        };
+        let v = agent_event_to_rpc_json(&run);
+        assert_eq!(v["type"], "agent_end");
+        assert_eq!(v["willRetry"], false);
+        assert_eq!(v["stopReason"], "done");
+
+        let ui = AgentEvent::ExtensionUiRequest {
+            id: "uuid-1".into(),
+            method: "select".into(),
+            title: Some("Allow?".into()),
+            message: None,
+            options: vec!["Allow".into(), "Block".into()],
+            timeout: Some(10_000),
+            placeholder: None,
+            prefill: None,
+            notify_type: None,
+        };
+        let v = agent_event_to_rpc_json(&ui);
+        assert_eq!(v["type"], "extension_ui_request");
+        assert_eq!(v["method"], "select");
+        assert_eq!(v["options"][0], "Allow");
+
+        let retry = AgentEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "overloaded".into(),
+        };
+        let v = serde_json::to_value(&retry).unwrap();
+        assert_eq!(v["type"], "auto_retry_start");
+        assert_eq!(v["maxAttempts"], 3);
+        assert_eq!(v["delayMs"], 2000);
+        assert_eq!(v["errorMessage"], "overloaded");
+
+        let old = serde_json::json!({
+            "type": "tool_start",
+            "tool_call_id": "x",
+            "name": "read",
+            "arguments": {"path": "a"}
+        });
+        let back: AgentEvent = serde_json::from_value(old).unwrap();
+        match back {
+            AgentEvent::ToolStart {
+                tool_call_id, name, ..
+            } => {
+                assert_eq!(tool_call_id, "x");
+                assert_eq!(name, "read");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

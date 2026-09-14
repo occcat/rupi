@@ -24,6 +24,7 @@ pub fn create_agent_session(provider: Arc<dyn LlmProvider>) -> AgentSession {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSessionState {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +36,7 @@ pub struct AgentSessionState {
     pub message_count: usize,
     pub pending_message_count: usize,
     pub auto_compaction_enabled: bool,
+    pub auto_retry_enabled: bool,
 }
 
 pub struct AgentSessionBuilder {
@@ -162,6 +164,7 @@ impl AgentSessionBuilder {
             persist: false,
             command_dirs: Vec::new(),
             provider_opts: ProviderOptions::default(),
+            auto_retry_enabled: Arc::new(AtomicBool::new(true)),
         })
     }
 }
@@ -186,6 +189,8 @@ pub struct AgentSession {
     pub persist: bool,
     pub command_dirs: Vec<std::path::PathBuf>,
     pub provider_opts: ProviderOptions,
+    /// Pi RPC `set_auto_retry`：瞬时错误（429/5xx）是否自动重试。默认开。
+    pub auto_retry_enabled: Arc<AtomicBool>,
 }
 
 impl AgentSession {
@@ -229,6 +234,7 @@ impl AgentSession {
             persist: false,
             command_dirs: Vec::new(),
             provider_opts: ProviderOptions::default(),
+            auto_retry_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -275,7 +281,30 @@ impl AgentSession {
             message_count: self.session.history().len(),
             pending_message_count: self.inbox.pending_count(),
             auto_compaction_enabled: self.agent.compaction_enabled,
+            auto_retry_enabled: self.auto_retry(),
         }
+    }
+
+    pub fn auto_retry(&self) -> bool {
+        self.auto_retry_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_auto_retry(&self, enabled: bool) {
+        self.auto_retry_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn poll_extension_ui(&self) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        for e in &self.extensions {
+            out.extend(e.poll_ui_requests());
+        }
+        out
+    }
+
+    pub fn complete_extension_ui(&self, id: &str, reply: serde_json::Value) -> bool {
+        self.extensions
+            .iter()
+            .any(|e| e.complete_ui_request(id, reply.clone()))
     }
 
     /// 发送一条用户消息并跑到停；整轮结束后按 `followUpMode` 继续跟进。

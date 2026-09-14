@@ -201,6 +201,23 @@ impl ChatView {
                 self.lines
                     .push(Line::System(format!("[model {provider}/{model}]")));
             }
+            AgentEvent::ExtensionUiRequest { method, title, .. } => {
+                self.lines.push(Line::System(format!(
+                    "[ui {method}] {}",
+                    title.as_deref().unwrap_or("")
+                )));
+            }
+            AgentEvent::AutoRetryStart { attempt, .. } => {
+                self.lines.push(Line::System(format!("[retry {attempt}]")));
+            }
+            AgentEvent::AutoRetryEnd {
+                success, attempt, ..
+            } => {
+                self.lines.push(Line::System(format!(
+                    "[retry {attempt} {}]",
+                    if *success { "ok" } else { "fail" }
+                )));
+            }
         }
     }
 

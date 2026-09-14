@@ -2,11 +2,12 @@
 //! 扩展可 `initialize` 注册命令、订阅事件、在 `tools/call` 结果里带 UI 提示。
 
 use crate::{block_on_async, effective_timeout_secs, ExtensionManifest};
-use rupi_core::{AgentEvent, Extension, ExtensionCommand, ToolDefinition};
+use rupi_core::{agent_event_to_rpc_json, AgentEvent, Extension, ExtensionCommand, ToolDefinition};
 use rupi_mcp::{Incoming, StdioRpc};
 use rupi_tools::{Tool, ToolOutput, UiHint};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::oneshot;
 
 pub struct RpcHost {
     pub manifest: ExtensionManifest,
@@ -14,6 +15,8 @@ pub struct RpcHost {
     commands: Mutex<Vec<ExtensionCommand>>,
     subscribe: Mutex<HashSet<String>>,
     hints: Mutex<Vec<UiHint>>,
+    ui_out: Mutex<Vec<AgentEvent>>,
+    ui_wait: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
 }
 
 impl RpcHost {
@@ -33,6 +36,8 @@ impl RpcHost {
             commands: Mutex::new(manifest.commands.clone()),
             subscribe: Mutex::new(manifest.subscribe.iter().cloned().collect()),
             hints: Mutex::new(Vec::new()),
+            ui_out: Mutex::new(Vec::new()),
+            ui_wait: Mutex::new(HashMap::new()),
             manifest,
             rpc,
         });
@@ -118,6 +123,8 @@ impl RpcHost {
             Incoming::Notification { method, params } => {
                 if method == "ui/hint" || method == "notifications/ui" {
                     self.push_hint(&params);
+                } else if is_ui_dialog_method(&method) {
+                    let _ = self.push_dialog(&method, &params, false);
                 }
             }
             Incoming::Request { id, method, params } => match method.as_str() {
@@ -172,6 +179,26 @@ impl RpcHost {
                     self.push_hint(&params);
                     let _ = self.rpc.respond(id, serde_json::json!({"ok": true})).await;
                 }
+                other if is_ui_dialog_method(other) => {
+                    let wait = self.push_dialog(other, &params, true);
+                    let reply = match wait {
+                        Some(rx) => {
+                            let ms = params
+                                .get("timeout")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(30_000)
+                                .clamp(1, 300_000);
+                            match tokio::time::timeout(std::time::Duration::from_millis(ms), rx)
+                                .await
+                            {
+                                Ok(Ok(v)) => v,
+                                _ => dialog_timeout_reply(&ui_method_name(other, &params)),
+                            }
+                        }
+                        None => serde_json::json!({"ok": true}),
+                    };
+                    let _ = self.rpc.respond(id, reply).await;
+                }
                 _ => {
                     let _ = self
                         .rpc
@@ -203,6 +230,44 @@ impl RpcHost {
 
     pub fn drain_hints(&self) -> Vec<UiHint> {
         self.hints.lock().unwrap().drain(..).collect()
+    }
+
+    /// 排队一条扩展 UI dialog，并可选地等宿主 `extension_ui_response`。
+    fn push_dialog(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        wait: bool,
+    ) -> Option<oneshot::Receiver<serde_json::Value>> {
+        let ev = dialog_event(&self.manifest.name, method, params);
+        let id = match &ev {
+            AgentEvent::ExtensionUiRequest { id, .. } => id.clone(),
+            _ => return None,
+        };
+        if ev_is_notify(&ev) {
+            if let AgentEvent::ExtensionUiRequest {
+                message: Some(msg),
+                notify_type,
+                ..
+            } = &ev
+            {
+                self.hints.lock().unwrap().push(UiHint {
+                    kind: notify_type.clone().unwrap_or_else(|| "notify".into()),
+                    message: msg.clone(),
+                });
+            }
+            self.ui_out.lock().unwrap().push(ev);
+            return None;
+        }
+        let rx = if wait {
+            let (tx, rx) = oneshot::channel();
+            self.ui_wait.lock().unwrap().insert(id, tx);
+            Some(rx)
+        } else {
+            None
+        };
+        self.ui_out.lock().unwrap().push(ev);
+        rx
     }
 
     pub fn command_list(&self) -> Vec<ExtensionCommand> {
@@ -261,9 +326,111 @@ fn event_tags(event: &AgentEvent) -> Vec<&'static str> {
         }
         AgentEvent::RunEnd { .. } => vec!["run_end", "session_end"],
         AgentEvent::UiHint { .. } => vec!["ui_hint"],
+        AgentEvent::ExtensionUiRequest { .. } => vec!["extension_ui", "ui_dialog"],
+        AgentEvent::AutoRetryStart { .. } | AgentEvent::AutoRetryEnd { .. } => {
+            vec!["auto_retry"]
+        }
         AgentEvent::ModelChange { .. } => vec!["model_change"],
         _ => vec![],
     }
+}
+
+fn is_ui_dialog_method(method: &str) -> bool {
+    matches!(
+        method,
+        "ui/dialog"
+            | "ui/select"
+            | "ui/confirm"
+            | "ui/input"
+            | "ui/editor"
+            | "ui/notify"
+            | "extension_ui_request"
+            | "select"
+            | "confirm"
+            | "input"
+            | "editor"
+            | "notify"
+    )
+}
+
+fn ui_method_name(method: &str, params: &serde_json::Value) -> String {
+    if let Some(m) = params.get("method").and_then(|m| m.as_str()) {
+        if !m.is_empty() {
+            return m.to_string();
+        }
+    }
+    method.rsplit('/').next().unwrap_or(method).to_string()
+}
+
+fn ev_is_notify(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::ExtensionUiRequest { method, .. }
+            if matches!(method.as_str(), "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text")
+    )
+}
+
+fn dialog_timeout_reply(method: &str) -> serde_json::Value {
+    if method == "confirm" {
+        serde_json::json!({"confirmed": false, "cancelled": true})
+    } else {
+        serde_json::json!({"cancelled": true})
+    }
+}
+
+fn dialog_event(source: &str, method: &str, params: &serde_json::Value) -> AgentEvent {
+    let method = ui_method_name(method, params);
+    let id = params
+        .get("id")
+        .and_then(|i| i.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("ui-{}-{source}", next_ui_seq()));
+    let options = params
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let message = params
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    let _ = source;
+    AgentEvent::ExtensionUiRequest {
+        id,
+        method,
+        title: params
+            .get("title")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+        message,
+        options,
+        timeout: params.get("timeout").and_then(|t| t.as_u64()),
+        placeholder: params
+            .get("placeholder")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        prefill: params
+            .get("prefill")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        notify_type: params
+            .get("notifyType")
+            .or_else(|| params.get("notify_type"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn next_ui_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
 fn register_provider_params(params: &serde_json::Value) -> anyhow::Result<rupi_llm::ExtraProvider> {
@@ -385,7 +552,7 @@ impl Extension for RpcHost {
         if !wants(&sub, &tags) {
             return Ok(());
         }
-        let payload = serde_json::to_value(event).unwrap_or(serde_json::json!({}));
+        let payload = agent_event_to_rpc_json(event);
         let _ = self
             .rpc
             .notify(
@@ -394,6 +561,19 @@ impl Extension for RpcHost {
             )
             .await;
         Ok(())
+    }
+
+    fn poll_ui_requests(&self) -> Vec<AgentEvent> {
+        self.ui_out.lock().unwrap().drain(..).collect()
+    }
+
+    fn complete_ui_request(&self, id: &str, reply: serde_json::Value) -> bool {
+        if let Some(tx) = self.ui_wait.lock().unwrap().remove(id) {
+            let _ = tx.send(reply);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -496,5 +676,26 @@ mod tests {
             model: "gpt-4o-mini".into(),
         });
         assert_eq!(model, vec!["model_change"]);
+    }
+
+    #[test]
+    fn dialog_event_matches_pi_extension_ui_request() {
+        let ev = dialog_event(
+            "demo",
+            "ui/select",
+            &serde_json::json!({
+                "id": "uuid-1",
+                "title": "Allow dangerous command?",
+                "options": ["Allow", "Block"],
+                "timeout": 10000
+            }),
+        );
+        let v = agent_event_to_rpc_json(&ev);
+        assert_eq!(v["type"], "extension_ui_request");
+        assert_eq!(v["id"], "uuid-1");
+        assert_eq!(v["method"], "select");
+        assert_eq!(v["options"][1], "Block");
+        assert_eq!(v["timeout"], 10000);
+        assert_eq!(event_tags(&ev), vec!["extension_ui", "ui_dialog"]);
     }
 }

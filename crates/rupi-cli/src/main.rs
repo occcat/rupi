@@ -1882,7 +1882,7 @@ async fn run_once(cli: &Cli, home: &PathBuf, prompt: &str, json: bool) -> anyhow
     use std::io::Write as _;
     // --json：stdout 只走 JSONL 事件（AgentEvent 的 serde 形状，`type` 区分），人读诊断仍走 stderr
     let emit_json = |e: &rupi_core::AgentEvent| {
-        if let Ok(line) = serde_json::to_string(e) {
+        if let Ok(line) = serde_json::to_string(&rupi_core::agent_event_to_rpc_json(e)) {
             println!("{line}");
             let _ = std::io::stdout().flush();
         }
