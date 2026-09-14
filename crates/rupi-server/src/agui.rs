@@ -93,11 +93,7 @@ pub fn run_finished_success(thread: &str, run: &str) -> AguiEvent {
     )
 }
 
-pub fn run_finished_interrupt(
-    thread: &str,
-    run: &str,
-    interrupts: Vec<Value>,
-) -> AguiEvent {
+pub fn run_finished_interrupt(thread: &str, run: &str, interrupts: Vec<Value>) -> AguiEvent {
     AguiEvent::new(
         "RUN_FINISHED",
         json!({
@@ -135,6 +131,31 @@ pub fn messages_snapshot(messages: Vec<Value>) -> AguiEvent {
     AguiEvent::new("MESSAGES_SNAPSHOT", json!({"messages": messages}))
 }
 
+/// `TOOL_CALL_ARGS.delta` / `REASONING_MESSAGE_CONTENT.delta` 按字符切。
+/// 按字节 `chunks` 会切开多字节 UTF-8，客户端拼接会得到 U+FFFD。
+const TOOL_CALL_ARGS_DELTA_CHARS: usize = 16;
+const REASONING_DELTA_CHARS: usize = 16;
+
+fn utf8_deltas(s: &str, max_chars: usize) -> Vec<&str> {
+    let max_chars = max_chars.max(1);
+    let mut out = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut end = rest.len();
+        let mut n = 0;
+        for (i, _) in rest.char_indices() {
+            if n == max_chars {
+                end = i;
+                break;
+            }
+            n += 1;
+        }
+        out.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    out
+}
+
 /// 把本机 [`AgentEvent`] 映射为官方事件。不发射 CUSTOM/RAW。
 pub struct EventMapper {
     thread_id: String,
@@ -155,15 +176,16 @@ impl EventMapper {
 
     fn close_text(&mut self, out: &mut Vec<AguiEvent>) {
         if let Some(id) = self.text_id.take() {
-            out.push(AguiEvent::new(
-                "TEXT_MESSAGE_END",
-                json!({"messageId": id}),
-            ));
+            out.push(AguiEvent::new("TEXT_MESSAGE_END", json!({"messageId": id})));
         }
     }
 
     fn close_reason(&mut self, out: &mut Vec<AguiEvent>) {
         if let Some(id) = self.reasoning_id.take() {
+            out.push(AguiEvent::new(
+                "REASONING_MESSAGE_END",
+                json!({"messageId": id}),
+            ));
             out.push(AguiEvent::new("REASONING_END", json!({"messageId": id})));
         }
     }
@@ -201,12 +223,12 @@ impl EventMapper {
                     }),
                 ));
                 let raw = arguments.to_string();
-                for chunk in raw.as_bytes().chunks(32) {
+                for delta in utf8_deltas(&raw, TOOL_CALL_ARGS_DELTA_CHARS) {
                     out.push(AguiEvent::new(
                         "TOOL_CALL_ARGS",
                         json!({
                             "toolCallId": tool_call_id,
-                            "delta": String::from_utf8_lossy(chunk)
+                            "delta": delta
                         }),
                     ));
                 }
@@ -235,18 +257,21 @@ impl EventMapper {
             }
             AgentEvent::Thinking { text } if !text.is_empty() => {
                 self.close_text(&mut out);
+                self.close_reason(&mut out);
                 let id = uuid::Uuid::new_v4().to_string();
+                out.push(AguiEvent::new("REASONING_START", json!({"messageId": id})));
                 out.push(AguiEvent::new(
-                    "REASONING_START",
-                    json!({"messageId": id}),
+                    "REASONING_MESSAGE_START",
+                    json!({"messageId": id, "role": "reasoning"}),
                 ));
-                for chunk in text.as_bytes().chunks(24) {
+                self.reasoning_id = Some(id.clone());
+                for delta in utf8_deltas(text, REASONING_DELTA_CHARS) {
                     out.push(AguiEvent::new(
                         "REASONING_MESSAGE_CONTENT",
-                        json!({"messageId": id, "delta": String::from_utf8_lossy(chunk)}),
+                        json!({"messageId": id, "delta": delta}),
                     ));
                 }
-                out.push(AguiEvent::new("REASONING_END", json!({"messageId": id})));
+                self.close_reason(&mut out);
             }
             AgentEvent::TurnStart { turn } => {
                 out.push(AguiEvent::new(
@@ -334,7 +359,10 @@ pub async fn agui_user_to_message_async(m: &AguiMessage) -> Message {
             if src.get("type").and_then(|t| t.as_str()) != Some("url") {
                 continue;
             }
-            let Some(url) = src.get("value").or_else(|| src.get("url")).and_then(|v| v.as_str())
+            let Some(url) = src
+                .get("value")
+                .or_else(|| src.get("url"))
+                .and_then(|v| v.as_str())
             else {
                 continue;
             };
@@ -383,10 +411,9 @@ async fn fetch_image_url(url: &str) -> anyhow::Result<(String, String)> {
 }
 
 fn blocks_to_user_message(m: &AguiMessage, extra: Vec<ContentBlock>) -> Message {
-    let id = m
-        .id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let id =
+        m.id.clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut blocks = Vec::new();
     match &m.content {
         Some(Value::String(s)) => {
@@ -486,7 +513,10 @@ fn message_to_agui(m: &Message) -> Value {
             _ => None,
         })
         .collect();
-    let content = if parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text")) {
+    let content = if parts
+        .iter()
+        .any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"))
+    {
         json!(parts)
     } else {
         json!(parts
@@ -503,7 +533,10 @@ fn message_to_agui(m: &Message) -> Value {
         tool_call_id,
         content,
         ..
-    }) = m.blocks.iter().find(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    }) = m
+        .blocks
+        .iter()
+        .find(|b| matches!(b, ContentBlock::ToolResult { .. }))
     {
         v["toolCallId"] = json!(tool_call_id);
         v["content"] = json!(content);
@@ -544,9 +577,7 @@ mod tests {
     #[test]
     fn maps_text_delta_triad() {
         let mut m = EventMapper::new("t".into(), "r".into());
-        let evs = m.map(&AgentEvent::TextDelta {
-            delta: "hi".into(),
-        });
+        let evs = m.map(&AgentEvent::TextDelta { delta: "hi".into() });
         assert_eq!(evs[0].typ, "TEXT_MESSAGE_START");
         assert_eq!(evs[1].typ, "TEXT_MESSAGE_CONTENT");
         assert!(!evs.iter().any(|e| e.typ == "CUSTOM" || e.typ == "RAW"));
@@ -566,15 +597,96 @@ mod tests {
         assert_eq!(types.last().copied(), Some("TOOL_CALL_END"));
     }
 
+    fn deltas_of<'a>(evs: &'a [AguiEvent], typ: &str) -> Vec<&'a str> {
+        evs.iter()
+            .filter(|e| e.typ == typ)
+            .filter_map(|e| e.fields.get("delta").and_then(|v| v.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn utf8_deltas_split_on_chars_not_bytes() {
+        let parts = utf8_deltas("一二三四五六七八九十", 3);
+        assert_eq!(parts, ["一二三", "四五六", "七八九", "十"]);
+        assert_eq!(parts.concat(), "一二三四五六七八九十");
+        assert!(parts.iter().all(|p| !p.contains('\u{FFFD}')));
+    }
+
+    #[test]
+    fn tool_call_args_emits_incremental_deltas() {
+        let mut m = EventMapper::new("t".into(), "r".into());
+        let args = json!({
+            "path": "docs/very-long-example-path.txt",
+            "content": "一段足够长的中文内容用来验证增量 delta 不会切开 UTF-8"
+        });
+        let raw = args.to_string();
+        assert!(raw.chars().count() > TOOL_CALL_ARGS_DELTA_CHARS);
+        let evs = m.map(&AgentEvent::ToolStart {
+            tool_call_id: "c1".into(),
+            name: "write".into(),
+            arguments: args,
+        });
+        let types: Vec<_> = evs.iter().map(|e| e.typ.as_str()).collect();
+        assert_eq!(types.first().copied(), Some("TOOL_CALL_START"));
+        assert_eq!(types.last().copied(), Some("TOOL_CALL_END"));
+        let deltas = deltas_of(&evs, "TOOL_CALL_ARGS");
+        assert!(deltas.len() > 1, "{deltas:?}");
+        assert_eq!(deltas.concat(), raw);
+        assert!(deltas
+            .iter()
+            .all(|d| d.chars().count() <= TOOL_CALL_ARGS_DELTA_CHARS));
+        assert!(deltas.iter().all(|d| !d.contains('\u{FFFD}')));
+        assert!(deltas.iter().all(|d| *d != raw.as_str()));
+        for e in evs.iter().filter(|e| e.typ == "TOOL_CALL_ARGS") {
+            assert_eq!(e.fields["toolCallId"], "c1");
+            assert!(e.fields.get("delta").and_then(|v| v.as_str()).is_some());
+            assert!(e.fields.get("args").is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_emits_incremental_content_deltas() {
+        let mut m = EventMapper::new("t".into(), "r".into());
+        let text = "思考过程需要分成多段增量，并且中文码点不能被按字节切开。".repeat(2);
+        assert!(text.chars().count() > REASONING_DELTA_CHARS);
+        let evs = m.map(&AgentEvent::Thinking { text: text.clone() });
+        let types: Vec<_> = evs.iter().map(|e| e.typ.as_str()).collect();
+        assert_eq!(types.first().copied(), Some("REASONING_START"));
+        assert_eq!(types.get(1).copied(), Some("REASONING_MESSAGE_START"));
+        assert_eq!(
+            types.get(types.len() - 2).copied(),
+            Some("REASONING_MESSAGE_END")
+        );
+        assert_eq!(types.last().copied(), Some("REASONING_END"));
+        let deltas = deltas_of(&evs, "REASONING_MESSAGE_CONTENT");
+        assert!(deltas.len() > 1, "{deltas:?}");
+        assert_eq!(deltas.concat(), text);
+        assert!(deltas
+            .iter()
+            .all(|d| d.chars().count() <= REASONING_DELTA_CHARS));
+        assert!(deltas.iter().all(|d| !d.contains('\u{FFFD}')));
+        let start = evs
+            .iter()
+            .find(|e| e.typ == "REASONING_MESSAGE_START")
+            .unwrap();
+        assert_eq!(start.fields["role"], "reasoning");
+        let id = start.fields["messageId"].as_str().unwrap();
+        assert!(evs.iter().all(|e| {
+            if e.typ.starts_with("REASONING_") {
+                e.fields["messageId"] == id
+            } else {
+                true
+            }
+        }));
+    }
+
     #[test]
     fn snapshot_keeps_images() {
         let mut tree = SessionTree::new();
         tree.push(Message::from_blocks(
             Role::User,
             vec![
-                ContentBlock::Text {
-                    text: "see".into(),
-                },
+                ContentBlock::Text { text: "see".into() },
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: "aaa".into(),
