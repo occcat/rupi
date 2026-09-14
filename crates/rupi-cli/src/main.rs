@@ -2288,6 +2288,7 @@ async fn run_chat(cli: &Cli, home: &PathBuf) -> anyhow::Result<()> {
                         settings.project_trust().as_str(),
                     )
                 ),
+                "edit" => println!("[edit] TUI only — run `rupi` then /edit <path> or Ctrl+E"),
                 _ => {}
             }
             continue;

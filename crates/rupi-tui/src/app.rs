@@ -3,6 +3,7 @@
 //! 排空事件 channel、响应滚动/退出——流式 delta 到达即渲染。
 
 use crate::complete;
+use crate::editor::{path_hint_from_input, FileEditor};
 use crate::keybindings::KeyTable;
 use crate::session_nav::SessionNavigator;
 use crate::slash;
@@ -256,6 +257,7 @@ enum Builtin {
     },
     TreeNav,
     SessionNav,
+    Editor(String),
     Pass,
 }
 
@@ -355,6 +357,10 @@ fn dispatch_builtin(
     }
     if t == "/trust" || t.starts_with("/trust ") {
         return Builtin::Done("[trust]".into());
+    }
+    if t == "/edit" || t.starts_with("/edit ") {
+        let path = t.strip_prefix("/edit").unwrap_or("").trim().to_string();
+        return Builtin::Editor(path);
     }
     if t == "/skills" {
         // 空注册表给提示（与 CLI skills-list 同文案），不推空行进视图
@@ -675,7 +681,7 @@ enum Control {
     Quit,
 }
 
-const TUI_HELP: &str = "rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+G 编辑，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /share /fork /clone /name，鼠标滚轮，/quit 退出";
+const TUI_HELP: &str = "rupi TUI. Enter 发送，Shift+Enter 换行，运行中 Enter 转向 / Alt+Enter 跟进，Esc 中止，Ctrl+L/P 模型，Shift+Tab 思考，Ctrl+O/T 折叠，Ctrl+V 贴图，Ctrl+E /edit 文件，Ctrl+G 外编，!cmd / !!cmd，/settings，/tree 导航，/sessions /session /new /resume /export /import /share /fork /clone /name，鼠标滚轮，/quit 退出";
 
 /// 启动 banner：`quietStartup` 全静音；否则帮助行 + 已载 skill/ext/MCP。
 pub fn startup_banner_lines(
@@ -733,6 +739,7 @@ async fn run_loop(
     }
     chrome.footer.model = ctx.provider.name().to_string();
     let mut tree: Option<TreeNavigator> = None;
+    let mut editor: Option<FileEditor> = None;
     let keys = KeyTable::load(&ctx.settings_home);
     let mut pending_images: Vec<ContentBlock> = Vec::new();
     let mut sessions: Option<SessionNavigator> = if ctx.start_session_picker {
@@ -791,6 +798,7 @@ async fn run_loop(
             &chrome,
             tree.as_ref(),
             sessions.as_ref(),
+            editor.as_mut(),
         )?;
         let ev = if sessions.is_none() {
             if let Some(text) = injected.take() {
@@ -810,14 +818,28 @@ async fn run_loop(
         };
         if let Event::Mouse(m) = ev {
             match m.kind {
-                MouseEventKind::ScrollUp => scroll = scroll.saturating_add(3),
-                MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
+                MouseEventKind::ScrollUp => {
+                    if let Some(ed) = editor.as_mut() {
+                        ed.scroll_by(-3, 20);
+                    } else {
+                        scroll = scroll.saturating_add(3);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(ed) = editor.as_mut() {
+                        ed.scroll_by(3, 20);
+                    } else {
+                        scroll = scroll.saturating_sub(3);
+                    }
+                }
                 _ => {}
             }
             continue;
         }
         if let Event::Paste(s) = ev {
-            if tree.is_none() && sessions.is_none() {
+            if let Some(ed) = editor.as_mut() {
+                ed.insert_str(&s);
+            } else if tree.is_none() && sessions.is_none() {
                 if let Some(note) = collapse_paste_preview(&s) {
                     view.push_system(note);
                 }
@@ -968,6 +990,15 @@ async fn run_loop(
                 _ => {}
             }
         }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
+        }
+        if let Some(ed) = editor.as_mut() {
+            if ed.handle_key(&key) == crate::editor::EditorAction::Close {
+                editor = None;
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
             _ if keys.fold.matches(&key) => {
@@ -1044,12 +1075,23 @@ async fn run_loop(
                 rupi_tools::export_reasoning_level(next.as_str());
                 view.push_system(format!("[thinking {}]", next.as_str()));
             }
+            _ if keys.editor.matches(&key) => {
+                let hint = path_hint_from_input(&input.text()).unwrap_or_default();
+                match FileEditor::from_hint(&ctx.settings_cwd, &hint) {
+                    Ok(ed) => {
+                        tree = None;
+                        sessions = None;
+                        editor = Some(ed);
+                    }
+                    Err(e) => view.push_system(format!("[edit] {e}")),
+                }
+            }
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let editor = ctx
+                let ext = ctx
                     .settings
                     .as_ref()
                     .and_then(|s| s.external_editor().map(|e| e.to_string()));
-                match open_external_editor(&input.text(), editor.as_deref()) {
+                match open_external_editor(&input.text(), ext.as_deref()) {
                     Ok(s) => input.set_text(&s),
                     Err(e) => view.push_system(format!("[editor] {e:#}")),
                 }
@@ -1145,9 +1187,20 @@ async fn run_loop(
                                     &policy,
                                 )
                             }
+                            "edit" => match FileEditor::from_hint(&ctx.settings_cwd, args) {
+                                Ok(ed) => {
+                                    tree = None;
+                                    sessions = None;
+                                    editor = Some(ed);
+                                    String::new()
+                                }
+                                Err(e) => format!("[edit] {e}"),
+                            },
                             _ => String::new(),
                         };
-                        view.push_system(msg);
+                        if !msg.is_empty() {
+                            view.push_system(msg);
+                        }
                         continue;
                     }
                     if text.trim() == "/commands" {
@@ -1215,6 +1268,17 @@ async fn run_loop(
                                 &ctx.settings_home,
                                 &sid,
                             ));
+                            continue;
+                        }
+                        Builtin::Editor(path) => {
+                            match FileEditor::from_hint(&ctx.settings_cwd, &path) {
+                                Ok(ed) => {
+                                    tree = None;
+                                    sessions = None;
+                                    editor = Some(ed);
+                                }
+                                Err(e) => view.push_system(format!("[edit] {e}")),
+                            }
                             continue;
                         }
                         Builtin::SessionNav => {
@@ -1762,6 +1826,7 @@ fn paint_busy<B: Backend>(
         chrome,
         None,
         None,
+        None,
     )
 }
 
@@ -1820,7 +1885,7 @@ fn footer_text(busy: bool, queued: usize, chrome: &UiChrome) -> String {
             format!("… thinking (Esc 中断本轮 · Ctrl-C 退出){model}{usage}")
         }
     } else {
-        format!("ready{model}{usage} │ Ctrl+O/T 折叠 · Ctrl+G 编辑 · !cmd")
+        format!("ready{model}{usage} │ Ctrl+O/T 折叠 · Ctrl+E /edit · Ctrl+G 外编 · !cmd")
     }
 }
 
@@ -1895,6 +1960,7 @@ fn draw<B: Backend>(
     chrome: &UiChrome,
     tree: Option<&TreeNavigator>,
     sessions: Option<&SessionNavigator>,
+    mut editor: Option<&mut FileEditor>,
 ) -> anyhow::Result<()> {
     let inline_images = crate::kitty::supported();
     let lines = view
@@ -1920,7 +1986,11 @@ fn draw<B: Backend>(
                 .split(area);
             let total = lines.len() as u16;
             let start = total.saturating_sub(chunks[0].height.saturating_add(scroll)) as usize;
-            let title = if let Some(nav) = sessions {
+            let editing = editor.is_some();
+            let body_h = chunks[0].height.saturating_sub(2) as usize;
+            let title = if let Some(ed) = editor.as_ref() {
+                ed.title()
+            } else if let Some(nav) = sessions {
                 format!(
                     "rupi /sessions  {}/{}",
                     nav.selected + 1,
@@ -1935,25 +2005,37 @@ fn draw<B: Backend>(
             } else {
                 "rupi".into()
             };
-            let body = if let Some(nav) = sessions {
+            let body = if let Some(ed) = editor.as_mut() {
+                editor_lines(ed, body_h, &theme)
+            } else if let Some(nav) = sessions {
                 session_lines(nav, &theme)
             } else if let Some(nav) = tree {
                 tree_lines(nav, &theme)
             } else {
                 lines.get(start..).unwrap_or(&[]).to_vec()
             };
-            let msgs = Paragraph::new(body)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.border))
-                        .title(title),
-                )
-                .wrap(Wrap { trim: false });
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border))
+                .title(title);
+            let msgs = if editing {
+                Paragraph::new(body).block(block)
+            } else {
+                Paragraph::new(body).block(block).wrap(Wrap { trim: false })
+            };
             f.render_widget(msgs, chunks[0]);
-            let (pre, post) = input.split_for_render();
+            let (pre, post, prompt_mark) = if let Some(ed) = editor.as_ref() {
+                if ed.is_prompt() {
+                    (ed.prompt_draft().to_string(), String::new(), "> ")
+                } else {
+                    (ed.status().to_string(), String::new(), "  ")
+                }
+            } else {
+                let (a, b) = input.split_for_render();
+                (a, b, "> ")
+            };
             let prompt = Paragraph::new(RLine::from(vec![
-                Span::styled("> ", Style::default().fg(theme.prompt)),
+                Span::styled(prompt_mark, Style::default().fg(theme.prompt)),
                 Span::raw(pre.clone()),
                 Span::raw(post),
             ]))
@@ -1963,7 +2045,7 @@ fn draw<B: Backend>(
                     .border_style(Style::default().fg(theme.border)),
             );
             f.render_widget(prompt, chunks[1]);
-            if !completion.is_empty() && tree.is_none() && sessions.is_none() {
+            if !completion.is_empty() && tree.is_none() && sessions.is_none() && !editing {
                 let shown: Vec<RLine> = completion
                     .iter()
                     .take(8)
@@ -1997,13 +2079,33 @@ fn draw<B: Backend>(
                 Paragraph::new(footer).style(Style::default().fg(theme.footer)),
                 chunks[2],
             );
-            f.set_cursor_position((
-                chunks[1].x + 3 + pre.chars().count() as u16,
-                chunks[1].y + 1,
-            ));
+            if let Some(ed) = editor.as_mut() {
+                if ed.is_prompt() {
+                    f.set_cursor_position((
+                        chunks[1].x + 3 + ed.prompt_draft().chars().count() as u16,
+                        chunks[1].y + 1,
+                    ));
+                } else {
+                    let (cx, cy) = ed.cursor_in_inner(body_h);
+                    f.set_cursor_position((
+                        chunks[0].x.saturating_add(1).saturating_add(cx),
+                        chunks[0].y.saturating_add(1).saturating_add(cy),
+                    ));
+                }
+            } else {
+                f.set_cursor_position((
+                    chunks[1].x + 3 + pre.chars().count() as u16,
+                    chunks[1].y + 1,
+                ));
+            }
         })
         .context("draw TUI")?;
-    if inline_images && !view.inline_images().is_empty() {
+    if inline_images
+        && !view.inline_images().is_empty()
+        && editor.is_none()
+        && tree.is_none()
+        && sessions.is_none()
+    {
         let size = terminal.size().unwrap_or_default();
         let area = Rect {
             x: 0,
@@ -2030,6 +2132,32 @@ fn draw<B: Backend>(
         let _ = crate::kitty::paint_visible(std::io::stdout(), view.inline_images(), start, inner);
     }
     Ok(())
+}
+
+fn editor_lines(ed: &mut FileEditor, height: usize, theme: &Theme) -> Vec<RLine<'static>> {
+    if ed.is_prompt() {
+        return vec![RLine::from(Span::styled(
+            "Open a workspace file. Type a relative path and Enter.".to_string(),
+            Style::default().fg(theme.system),
+        ))];
+    }
+    let rows = ed.display_rows(height.max(1));
+    if rows.is_empty() {
+        return vec![RLine::from(Span::styled(
+            "(empty)".to_string(),
+            Style::default().fg(theme.system),
+        ))];
+    }
+    rows.into_iter()
+        .map(|(cur, text)| {
+            let style = if cur {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.assistant)
+            };
+            RLine::from(Span::styled(text, style))
+        })
+        .collect()
 }
 
 fn tree_lines(nav: &TreeNavigator, theme: &Theme) -> Vec<RLine<'static>> {
@@ -2371,6 +2499,7 @@ mod tests {
         assert!(line.contains("R150"), "{line}");
         assert!(line.contains("W8"), "{line}");
         assert!(line.contains("CH75%"), "{line}");
+        assert!(line.contains("/edit"), "{line}");
     }
 
     #[test]
@@ -2451,6 +2580,7 @@ mod tests {
             &chrome,
             None,
             None,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -2498,6 +2628,7 @@ mod tests {
             &chrome,
             None,
             None,
+            None,
         )
         .unwrap();
         let screen: String = terminal
@@ -2508,6 +2639,47 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(screen.contains("@src/main.rs"), "缺 @ 候选:\n{screen}");
+    }
+
+    #[test]
+    fn draw_inprocess_editor_shows_file() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let root =
+            std::env::temp_dir().join(format!("rupi-edit-draw-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shown.rs"), "fn shown() {}\n").unwrap();
+        let mut ed = FileEditor::open(&root, "shown.rs").unwrap();
+        let mut view = ChatView::default();
+        let input = InputBuffer::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let chrome = UiChrome::default();
+        draw(
+            &mut terminal,
+            &mut view,
+            &input,
+            0,
+            false,
+            0,
+            &[],
+            '/',
+            &chrome,
+            None,
+            None,
+            Some(&mut ed),
+        )
+        .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("/edit"), "缺标题:\n{screen}");
+        assert!(screen.contains("shown.rs"), "缺路径:\n{screen}");
+        assert!(screen.contains("fn shown"), "缺正文:\n{screen}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2528,6 +2700,7 @@ mod tests {
             &[],
             '/',
             &chrome,
+            None,
             None,
             None,
         )
@@ -2552,6 +2725,7 @@ mod tests {
             &[],
             '/',
             &chrome,
+            None,
             None,
             None,
         )
@@ -3307,6 +3481,38 @@ mod tests {
                 false,
             ),
             Builtin::TreeNav
+        ));
+        assert!(matches!(
+            dispatch_builtin(
+                "/edit src/lib.rs",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+                None,
+                false,
+            ),
+            Builtin::Editor(p) if p == "src/lib.rs"
+        ));
+        assert!(matches!(
+            dispatch_builtin(
+                "/edit",
+                &mut agent,
+                &mut session,
+                &mut provider,
+                &skills,
+                &[],
+                "t-sess",
+                &mut ToolRegistry::default(),
+                None,
+                None,
+                false,
+            ),
+            Builtin::Editor(p) if p.is_empty()
         ));
         session.push(Message::text(rupi_core::Role::User, "hi"));
         assert!(matches!(

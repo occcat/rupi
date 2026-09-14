@@ -10,9 +10,9 @@ use std::path::Path;
 
 /// 与 REPL 同构的内建斜杠命令（`/quit` 单独处理，此处仅用于提示）。
 pub const BUILTINS: &[&str] = &[
-    "clone", "commands", "compact", "copy", "export", "fork", "goto", "hotkeys", "import", "model",
-    "name", "new", "plan", "quit", "reload", "resume", "rewind", "session", "sessions", "settings",
-    "share", "skills", "thinking", "tree", "trust",
+    "clone", "commands", "compact", "copy", "edit", "export", "fork", "goto", "hotkeys", "import",
+    "model", "name", "new", "plan", "quit", "reload", "resume", "rewind", "session", "sessions",
+    "settings", "share", "skills", "thinking", "tree", "trust",
 ];
 
 /// 计算候选：`input` 以 `/` 开头且首 token 无空白时，按前缀过滤并排序去重；否则空。
@@ -210,6 +210,7 @@ mod tests {
             ]
         );
         assert_eq!(candidates("/hot", &[]), vec!["hotkeys".to_string()]);
+        assert_eq!(candidates("/ed", &[]), vec!["edit".to_string()]);
         assert_eq!(candidates("/tru", &[]), vec!["trust".to_string()]);
         assert_eq!(
             candidates("/sess", &[]),

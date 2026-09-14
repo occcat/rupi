@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod complete;
+pub mod editor;
 pub mod highlight;
 pub mod keybindings;
 pub mod kitty;
