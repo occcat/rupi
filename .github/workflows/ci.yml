@@ -99,6 +99,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # cloud_chaos 的 ten_thousand_streams 是 #[ignore]：这里只跑缩小规模的
+      # 池耗尽 / 杀副本，不会打满一万长连接。
       - name: cloud crates
         run: cargo test --locked -p rupi-runtime -p rupi-server -p rupi-agent -- --nocapture
 
