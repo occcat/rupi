@@ -56,10 +56,25 @@ impl Theme {
         }
     }
 
-    pub fn from_env() -> Self {
-        match std::env::var("RUPI_THEME").as_deref() {
-            Ok("light") | Ok("LIGHT") => Self::light(),
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "light" => Self::light(),
             _ => Self::dark(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        match std::env::var("RUPI_THEME") {
+            Ok(v) if !v.is_empty() => Self::from_name(&v),
+            _ => Self::dark(),
+        }
+    }
+
+    /// 启动用：`RUPI_THEME` 覆盖 `settings.theme`。
+    pub fn resolve(settings_theme: &str) -> Self {
+        match std::env::var("RUPI_THEME") {
+            Ok(v) if !v.trim().is_empty() => Self::from_name(&v),
+            _ => Self::from_name(settings_theme),
         }
     }
 }
@@ -77,5 +92,13 @@ mod tests {
     #[test]
     fn ids_differ() {
         assert_ne!(Theme::dark().id, Theme::light().id);
+    }
+
+    #[test]
+    fn from_name_light_and_unknown() {
+        assert_eq!(Theme::from_name("light").id, Theme::light().id);
+        assert_eq!(Theme::from_name("LIGHT").name, "light");
+        assert_eq!(Theme::from_name("nope").name, "dark");
+        assert_eq!(Theme::from_name("").name, "dark");
     }
 }
