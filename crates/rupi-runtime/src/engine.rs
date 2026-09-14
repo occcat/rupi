@@ -6,8 +6,8 @@ use crate::{store, tar, BootstrapKind, ExecResult, ToolText};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -36,6 +36,17 @@ pub struct EngineConfig {
     pub max_workspaces: u32,
     pub warm_pool: u32,
     pub isolation: Isolation,
+    /// 池满时 `alloc` 最多等这么久等别人 `release`。`0` 立刻 `Exhausted`。
+    pub alloc_queue: Duration,
+}
+
+/// `RUPI_EXEC_ALLOC_QUEUE_MS`：池满排队毫秒，未设或非法则为 0。
+pub fn alloc_queue_from_env() -> Duration {
+    std::env::var("RUPI_EXEC_ALLOC_QUEUE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
 }
 
 struct Slot {
@@ -49,6 +60,7 @@ pub struct Engine {
     cfg: EngineConfig,
     leased: Mutex<HashMap<String, Slot>>,
     warm: Mutex<Vec<PathBuf>>,
+    freed: Notify,
     cancel_seq: AtomicU32,
 }
 
@@ -64,6 +76,7 @@ impl Engine {
             cfg,
             leased: Mutex::new(HashMap::new()),
             warm: Mutex::new(Vec::new()),
+            freed: Notify::new(),
             cancel_seq: AtomicU32::new(1),
         }
     }
@@ -101,12 +114,47 @@ impl Engine {
         if tenant.is_empty() || tenant.contains("..") || tenant.contains('/') {
             return Err(EngineError::Other("invalid tenant".into()));
         }
-        let leased_n = self.leased.lock().await.len() as u32;
-        if leased_n >= self.cfg.max_workspaces.max(1) {
-            return Err(EngineError::Exhausted);
+        let cap = self.cfg.max_workspaces.max(1);
+        let deadline = Instant::now() + self.cfg.alloc_queue;
+        let (id, dest) = loop {
+            let mut leased = self.leased.lock().await;
+            if (leased.len() as u32) < cap {
+                let id = Uuid::new_v4().to_string();
+                let dest = self.cfg.root.join(tenant).join(session).join(&id);
+                leased.insert(
+                    id.clone(),
+                    Slot {
+                        dir: dest.clone(),
+                        tenant_id: tenant.to_string(),
+                        last_used: Instant::now(),
+                        children: Vec::new(),
+                    },
+                );
+                break (id, dest);
+            }
+            if self.cfg.alloc_queue.is_zero() || Instant::now() >= deadline {
+                return Err(EngineError::Exhausted);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            drop(leased);
+            tokio::select! {
+                _ = self.freed.notified() => {}
+                _ = tokio::time::sleep(left) => {}
+            }
+        };
+        if let Err(e) = self.materialize_dir(&dest).await {
+            self.leased.lock().await.remove(&id);
+            self.freed.notify_waiters();
+            return Err(e);
         }
-        let id = Uuid::new_v4().to_string();
-        let dest = self.cfg.root.join(tenant).join(session).join(&id);
+        Ok(Lease {
+            id,
+            dir: dest,
+            tenant_id: tenant.to_string(),
+        })
+    }
+
+    async fn materialize_dir(&self, dest: &Path) -> Result<(), EngineError> {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -114,31 +162,18 @@ impl Engine {
         }
         let warmed = self.warm.lock().await.pop();
         if let Some(src) = warmed {
-            if tokio::fs::rename(&src, &dest).await.is_err() {
-                tokio::fs::create_dir_all(&dest)
+            if tokio::fs::rename(&src, dest).await.is_err() {
+                tokio::fs::create_dir_all(dest)
                     .await
                     .map_err(|e| EngineError::Other(e.to_string()))?;
                 let _ = tokio::fs::remove_dir_all(src).await;
             }
         } else {
-            tokio::fs::create_dir_all(&dest)
+            tokio::fs::create_dir_all(dest)
                 .await
                 .map_err(|e| EngineError::Other(e.to_string()))?;
         }
-        self.leased.lock().await.insert(
-            id.clone(),
-            Slot {
-                dir: dest.clone(),
-                tenant_id: tenant.to_string(),
-                last_used: Instant::now(),
-                children: Vec::new(),
-            },
-        );
-        Ok(Lease {
-            id,
-            dir: dest,
-            tenant_id: tenant.to_string(),
-        })
+        Ok(())
     }
 
     /// 旧接口：不带 tenant。生产路径请用 [`dir_for`]。
@@ -184,6 +219,7 @@ impl Engine {
             } else {
                 let _ = tokio::fs::remove_dir_all(slot.dir).await;
             }
+            self.freed.notify_waiters();
         }
         Ok(())
     }
@@ -192,6 +228,7 @@ impl Engine {
         self.abort(handle).await;
         if let Some(slot) = self.leased.lock().await.remove(handle) {
             let _ = tokio::fs::remove_dir_all(slot.dir).await;
+            self.freed.notify_waiters();
         }
         Ok(())
     }
@@ -454,6 +491,17 @@ mod tests {
             max_workspaces: 8,
             warm_pool: 0,
             isolation: Isolation::Jail,
+            alloc_queue: Duration::ZERO,
+        }
+    }
+
+    fn cfg_cap(root: PathBuf, max_workspaces: u32, queue: Duration) -> EngineConfig {
+        EngineConfig {
+            root,
+            max_workspaces,
+            warm_pool: 0,
+            isolation: Isolation::Jail,
+            alloc_queue: queue,
         }
     }
 
@@ -511,6 +559,81 @@ mod tests {
             !out.stdout.contains("NEIGHBOR-SECRET"),
             "jail leaked neighbor: {}",
             out.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_alloc_never_exceeds_cap() {
+        let root = std::env::temp_dir().join(format!("rupi-eng-cap-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = std::sync::Arc::new(Engine::new(cfg_cap(root.clone(), 3, Duration::ZERO)));
+        let mut joins = Vec::new();
+        for i in 0..24 {
+            let eng = eng.clone();
+            joins.push(tokio::spawn(async move {
+                eng.alloc("ten", &format!("s{i}")).await
+            }));
+        }
+        let mut ok = 0usize;
+        let mut exhausted = 0usize;
+        for j in joins {
+            match j.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(EngineError::Exhausted) => exhausted += 1,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(ok, 3, "ok={ok} exhausted={exhausted}");
+        assert_eq!(exhausted, 21);
+        let (used, cap, _) = eng.stats().await;
+        assert_eq!(used, 3);
+        assert_eq!(cap, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alloc_queues_until_release() {
+        let root = std::env::temp_dir().join(format!("rupi-eng-q-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = std::sync::Arc::new(Engine::new(cfg_cap(
+            root.clone(),
+            1,
+            Duration::from_millis(400),
+        )));
+        let first = eng.alloc("ten", "held").await.unwrap();
+        let waiter = {
+            let eng = eng.clone();
+            tokio::spawn(async move { eng.alloc("ten", "queued").await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        eng.release(&first.id).await.unwrap();
+        let second = waiter.await.unwrap().expect("queued alloc should succeed");
+        assert_ne!(second.id, first.id);
+        let (used, _, _) = eng.stats().await;
+        assert_eq!(used, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alloc_queue_timeout_is_exhausted() {
+        let root = std::env::temp_dir().join(format!("rupi-eng-qt-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = Engine::new(cfg_cap(root.clone(), 1, Duration::from_millis(40)));
+        let _held = eng.alloc("ten", "held").await.unwrap();
+        let t0 = Instant::now();
+        let err = match eng.alloc("ten", "nope").await {
+            Err(e) => e,
+            Ok(_) => panic!("expected exhausted"),
+        };
+        assert!(matches!(err, EngineError::Exhausted), "{err}");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(30),
+            "queue should wait before 429, elapsed={:?}",
+            t0.elapsed()
         );
         let _ = std::fs::remove_dir_all(root);
     }

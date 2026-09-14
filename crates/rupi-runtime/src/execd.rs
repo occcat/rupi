@@ -76,6 +76,7 @@ pub fn router(cfg: ExecdConfig) -> Router {
         max_workspaces: cfg.max_workspaces,
         warm_pool: cfg.warm_pool,
         isolation: Isolation::Jail,
+        alloc_queue: crate::engine::alloc_queue_from_env(),
     });
     let state = Arc::new(Inner { cfg, engine });
     let warm_state = state.clone();

@@ -1,4 +1,5 @@
 //! 千级压测：并发建会话 + AG-UI 流 + 句柄配额。可复现，不是口头估算。
+//! 万级短流入口在 `cloud_chaos::ten_thousand_streams`（`#[ignore]`，默认 CI 不跑）。
 
 mod common;
 

@@ -72,6 +72,10 @@
 | `RUPI_S3_REGION` 或 `AWS_REGION` | 默认 `us-east-1` |
 | `RUPI_S3_ACCESS_KEY` 或 `AWS_ACCESS_KEY_ID` | 必填（用 `s3://` 时） |
 | `RUPI_S3_SECRET_KEY` 或 `AWS_SECRET_ACCESS_KEY` | 必填（用 `s3://` 时） |
+| `RUPI_EXEC_ALLOC_QUEUE_MS` | 池满时 execd `alloc` 最多排队多少毫秒，超时仍 `429`。默认 `0`（立刻拒绝） |
+| `RUPI_LOAD_SESSIONS` | 万级短流入口的会话数，默认 `256` |
+| `RUPI_LOAD_STREAMS` | 万级短流入口完成的 mock AG-UI 次数，默认 `10000` |
+| `RUPI_LOAD_CONC` | 万级短流同时在飞的流数，默认 `32`。不要在 GitHub Actions 里拉到一万 |
 
 ## 必须守住的默认值
 
@@ -164,6 +168,26 @@ export RUPI_S3_SECRET_KEY=...
 rupi-server --insecure-exec --executor-urls http://10.0.0.8:8090 ...
 # 且 execd 必须有非空 --token
 ```
+
+## 容量演练
+
+CI `cloud` job 跑缩小规模的池耗尽 / 杀副本（`crates/rupi-server/tests/cloud_chaos.rs`）：池满且有 run → `429`；放开后抢占闲置卷再入院；杀掉一个控制面副本后另一副本仍能读会话树和共享快照。**默认 CI 不跑万级，也不会打满一万条长 SSE。**
+
+本机万级入口是短 mock 流（做完就结束），不是一万条常驻连接：
+
+```bash
+# 需要本机 Postgres / Redis（与 cloud job 相同的 DATABASE_URL / REDIS_URL）
+cargo test -p rupi-server --test cloud_chaos ten_thousand_streams -- --ignored --nocapture
+```
+
+默认 256 会话、1 万次短流、并发 32。真要逼近一万并发，把 `RUPI_LOAD_SESSIONS` 和 `RUPI_LOAD_CONC` 都拉高（会打满本机 fd / 工作区，GitHub Actions 不要这么干）：
+
+```bash
+RUPI_LOAD_SESSIONS=1024 RUPI_LOAD_STREAMS=10000 RUPI_LOAD_CONC=128 \
+  cargo test -p rupi-server --test cloud_chaos ten_thousand_streams -- --ignored --nocapture
+```
+
+池满排队（可选）：`RUPI_EXEC_ALLOC_QUEUE_MS=200` 让 execd 在 `release` 到来前等一会儿，超时仍 `429`。
 
 ## 未在本机验证
 

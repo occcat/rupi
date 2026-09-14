@@ -85,6 +85,7 @@ pub fn router(cfg: SandboxdConfig) -> Router {
         max_workspaces: cfg.max_sandboxes,
         warm_pool: cfg.warm_pool,
         isolation: Isolation::Sandbox,
+        alloc_queue: crate::engine::alloc_queue_from_env(),
     });
     let state = Arc::new(Inner { cfg, engine });
     let warm_state = state.clone();
