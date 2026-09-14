@@ -9,7 +9,7 @@
 //! 它所要取消的 `bash` 后面。
 
 use rupi_agent::{AgentSession, MessageInbox, QueueMode, QueuedImage, QueuedMessage};
-use rupi_core::{AgentEvent, CancelFlag, Message, Role};
+use rupi_core::{agent_event_to_rpc_json, AgentEvent, CancelFlag, Message, Role};
 use rupi_llm::ThinkingLevel;
 use rupi_tools::ToolOutput;
 use serde::Deserialize;
@@ -61,6 +61,13 @@ pub struct RpcCommand {
     /// `abort_bash` 可点名取消的句柄（默认取消当前进行中的那一个）。
     #[serde(default)]
     pub handle: Option<String>,
+    /// Pi `extension_ui_response`。
+    #[serde(default)]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub confirmed: Option<bool>,
+    #[serde(default)]
+    pub cancelled: Option<bool>,
 }
 
 /// Pi RPC `images[]`：`{type, data, mimeType}`。
@@ -131,10 +138,35 @@ fn emit(value: &Value) {
 }
 
 fn emit_event(e: &AgentEvent) {
-    if let Ok(s) = serde_json::to_string(e) {
-        println!("{s}");
-        let _ = std::io::stdout().flush();
+    emit(&agent_event_to_rpc_json(e));
+}
+
+fn emit_pending_ui(session: &AgentSession) {
+    for e in session.poll_extension_ui() {
+        emit_event(&e);
     }
+}
+
+fn extension_ui_reply(cmd: &RpcCommand) -> Value {
+    let mut v = json!({});
+    if cmd.cancelled == Some(true) {
+        v["cancelled"] = json!(true);
+    }
+    if let Some(c) = cmd.confirmed {
+        v["confirmed"] = json!(c);
+    }
+    if let Some(val) = &cmd.value {
+        v["value"] = val.clone();
+    }
+    v
+}
+
+fn handle_extension_ui_response(session: &AgentSession, cmd: &RpcCommand) {
+    let id = cmd.id.as_deref();
+    if let Some(ui_id) = id.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = session.complete_extension_ui(ui_id, extension_ui_reply(cmd));
+    }
+    emit(&response_ok(id, "extension_ui_response", None));
 }
 
 /// 一次 RPC `bash` 的可取消句柄（本机进程组或远程 Executor 工具都认这面旗）。
@@ -252,10 +284,18 @@ fn abort_bash_job(job: &BashJob, cmd: &RpcCommand) {
 /// 驱动 RPC 循环直到 stdin EOF。诊断走 stderr。
 pub async fn serve(mut session: AgentSession) -> anyhow::Result<AgentSession> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let line = match lines.next_line().await? {
-            None => break,
-            Some(l) => l,
+        let line = tokio::select! {
+            _ = tick.tick() => {
+                emit_pending_ui(&session);
+                continue;
+            }
+            line = lines.next_line() => match line? {
+                None => break,
+                Some(l) => l,
+            },
         };
         let cmd = match parse_line(&line) {
             Ok(None) => continue,
@@ -269,14 +309,17 @@ pub async fn serve(mut session: AgentSession) -> anyhow::Result<AgentSession> {
             if let Some(message) = queued_from_cmd(&cmd) {
                 emit(&response_ok(cmd.id.as_deref(), &cmd.typ, None));
                 run_prompt(&mut session, message, &mut lines).await?;
+                emit_pending_ui(&session);
                 continue;
             }
         }
         if cmd.typ == "bash" {
             run_bash(&mut session, &cmd, &mut lines).await?;
+            emit_pending_ui(&session);
             continue;
         }
         dispatch(&mut session, &cmd).await?;
+        emit_pending_ui(&session);
     }
     Ok(session)
 }
@@ -401,6 +444,14 @@ async fn dispatch(session: &mut AgentSession, cmd: &RpcCommand) -> anyhow::Resul
             session.agent.compaction_enabled = cmd.enabled.unwrap_or(true);
             emit(&response_ok(id, "set_auto_compaction", None));
         }
+        "set_auto_retry" => {
+            session.set_auto_retry(cmd.enabled.unwrap_or(true));
+            emit(&response_ok(id, "set_auto_retry", None));
+        }
+        "abort_retry" => {
+            emit(&response_ok(id, "abort_retry", None));
+        }
+        "extension_ui_response" => handle_extension_ui_response(session, cmd),
         "set_model" => match model_spec(cmd) {
             Some(spec) => {
                 let data = apply_set_model(session, &spec).await;
@@ -554,6 +605,8 @@ async fn run_prompt<R: tokio::io::AsyncBufRead + Unpin>(
         session_id: session.session_id.clone(),
         session_name: session.session_name.clone(),
         thinking: session.agent.thinking,
+        auto_retry: session.auto_retry_enabled.clone(),
+        auto_compaction_enabled: session.agent.compaction_enabled,
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let on_event = move |e: AgentEvent| {
@@ -669,6 +722,9 @@ fn handle_during_bash(job: &BashJob, cmd: &RpcCommand) {
             job.cancel.cancel();
             emit(&response_ok(id, "abort", None));
         }
+        "set_auto_retry" | "abort_retry" | "extension_ui_response" => {
+            emit(&response_ok(id, cmd.typ.as_str(), None));
+        }
         "get_state" => {
             emit(&response_ok(
                 id,
@@ -692,6 +748,8 @@ struct StateSnap {
     session_id: String,
     session_name: Option<String>,
     thinking: Option<ThinkingLevel>,
+    auto_retry: Arc<std::sync::atomic::AtomicBool>,
+    auto_compaction_enabled: bool,
 }
 
 fn handle_during_prompt(
@@ -756,6 +814,10 @@ fn handle_during_prompt(
                     "steeringMode": inbox.steering_mode(),
                     "followUpMode": inbox.follow_up_mode(),
                     "pendingMessageCount": inbox.pending_count(),
+                    "autoCompactionEnabled": snap.auto_compaction_enabled,
+                    "autoRetryEnabled": snap
+                        .auto_retry
+                        .load(std::sync::atomic::Ordering::SeqCst),
                 })),
             ));
         }
@@ -774,6 +836,19 @@ fn handle_during_prompt(
             } else {
                 emit(&response_err(id, "set_follow_up_mode", "invalid mode"));
             }
+        }
+        "set_auto_retry" => {
+            snap.auto_retry.store(
+                cmd.enabled.unwrap_or(true),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            emit(&response_ok(id, "set_auto_retry", None));
+        }
+        "abort_retry" => {
+            emit(&response_ok(id, "abort_retry", None));
+        }
+        "extension_ui_response" => {
+            emit(&response_ok(id, "extension_ui_response", None));
         }
         other => emit(&response_err(
             id,
@@ -988,5 +1063,69 @@ mod tests {
             .unwrap();
         abort_bash_job(&job, &hit);
         assert!(job.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn set_auto_retry_and_extension_ui_fields() {
+        let c = parse_line(r#"{"id":"r1","type":"set_auto_retry","enabled":false}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.typ, "set_auto_retry");
+        assert_eq!(c.enabled, Some(false));
+
+        let u = parse_line(r#"{"type":"extension_ui_response","id":"uuid-1","value":"Allow"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.typ, "extension_ui_response");
+        assert_eq!(u.id.as_deref(), Some("uuid-1"));
+        assert_eq!(u.value.as_ref().and_then(|v| v.as_str()), Some("Allow"));
+
+        let n = parse_line(r#"{"type":"extension_ui_response","id":"uuid-2","cancelled":true}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n.cancelled, Some(true));
+        let reply = extension_ui_reply(&n);
+        assert_eq!(reply["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn set_auto_retry_updates_state_camel_case() {
+        let mut session =
+            rupi_agent::create_agent_session(Arc::new(rupi_llm::MockProvider::new(vec![])));
+        assert!(session.auto_retry());
+        let cmd = parse_line(r#"{"id":"1","type":"set_auto_retry","enabled":false}"#)
+            .unwrap()
+            .unwrap();
+        dispatch(&mut session, &cmd).await.unwrap();
+        assert!(!session.auto_retry());
+        let st = serde_json::to_value(session.state()).unwrap();
+        assert_eq!(st["autoRetryEnabled"], false);
+        assert_eq!(st["autoCompactionEnabled"], true);
+        assert!(st.get("sessionId").and_then(|v| v.as_str()).is_some());
+        assert!(st.get("session_id").is_none());
+
+        let abort = parse_line(r#"{"id":"2","type":"abort_retry"}"#)
+            .unwrap()
+            .unwrap();
+        dispatch(&mut session, &abort).await.unwrap();
+
+        let ui = parse_line(r#"{"id":"missing","type":"extension_ui_response","cancelled":true}"#)
+            .unwrap()
+            .unwrap();
+        dispatch(&mut session, &ui).await.unwrap();
+    }
+
+    #[test]
+    fn emit_event_uses_pi_tool_fields() {
+        let ev = AgentEvent::ToolStart {
+            tool_call_id: "c1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "a.rs"}),
+        };
+        let v = agent_event_to_rpc_json(&ev);
+        assert_eq!(v["type"], "tool_execution_start");
+        assert_eq!(v["toolCallId"], "c1");
+        assert_eq!(v["toolName"], "read");
+        assert_eq!(v["args"]["path"], "a.rs");
     }
 }

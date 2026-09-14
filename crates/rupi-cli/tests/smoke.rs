@@ -78,6 +78,58 @@ fn rpc_mode_prompt_and_state() {
 }
 
 #[test]
+fn rpc_set_auto_retry_and_state_fields() {
+    let home = fresh_home();
+    let mut child = rupi(&home, &["--mode", "rpc", "--no-approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sin = child.stdin.take().unwrap();
+        writeln!(sin, r#"{{"id":"r0","type":"get_state"}}"#).unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"r1","type":"set_auto_retry","enabled":false}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"r2","type":"get_state"}}"#).unwrap();
+        writeln!(sin, r#"{{"id":"r3","type":"abort_retry"}}"#).unwrap();
+        writeln!(
+            sin,
+            r#"{{"id":"uuid-1","type":"extension_ui_response","cancelled":true}}"#
+        )
+        .unwrap();
+        writeln!(sin, r#"{{"id":"p","type":"prompt","message":"hello"}}"#).unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = out_text(&o);
+    assert!(
+        o.status.success(),
+        "rpc retry/ui 非零退出:\nstdout={out}\nstderr={err}"
+    );
+    assert!(
+        !out.contains(r#"unknown command: set_auto_retry"#),
+        "set_auto_retry 仍落到 unknown:\n{out}"
+    );
+    assert!(out.contains(r#""command":"set_auto_retry""#), "{out}");
+    assert!(out.contains(r#""command":"abort_retry""#), "{out}");
+    assert!(
+        out.contains(r#""command":"extension_ui_response""#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#""autoRetryEnabled":false"#),
+        "get_state 应含 Pi camelCase autoRetryEnabled:\n{out}"
+    );
+    assert!(
+        out.contains("text_delta") || out.contains("hello") || out.contains("demo mode"),
+        "prompt 无事件:\n{out}"
+    );
+}
+
+#[test]
 fn rpc_set_model_session_fork_images_and_commands() {
     let home = fresh_home();
     std::fs::create_dir_all(home.join("prompts")).unwrap();
