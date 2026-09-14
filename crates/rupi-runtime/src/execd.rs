@@ -58,6 +58,12 @@ pub async fn spawn(
     tokio::task::JoinHandle<anyhow::Result<()>>,
 )> {
     validate_listen_token(&cfg.bind, &cfg.token, cfg.insecure).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::create_dir_all(&cfg.root).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create execd --root {}: {e} (loopback: use a writable path such as ./rupi-data/execd)",
+            cfg.root.display()
+        )
+    })?;
     let listener = TcpListener::bind(&cfg.bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!("rupi-execd listen {addr}");
@@ -586,6 +592,24 @@ mod tests {
         assert_eq!(st.used, 1);
         exec.destroy(&b).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unwritable_root_mentions_loopback_path() {
+        let path = std::env::temp_dir().join(format!("rupi-execd-notdir-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"not a dir").unwrap();
+        let err = spawn(ExecdConfig {
+            bind: "127.0.0.1:0".into(),
+            root: path.clone(),
+            token: "t".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        let s = err.to_string();
+        assert!(s.contains("./rupi-data/execd"), "{s}");
+        assert!(s.contains("cannot create execd --root"), "{s}");
     }
 
     #[tokio::test]

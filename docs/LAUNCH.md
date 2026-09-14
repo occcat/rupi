@@ -24,6 +24,7 @@
 | `--database-url` | `DATABASE_URL` | （必填） | Postgres |
 | `--database-read-url` | `DATABASE_READ_URL` | 无 | 只读副本；hydrate / 写仍走主库 |
 | `--redis-url` | `REDIS_URL` | `redis://127.0.0.1:6379` | 缓存 |
+| `--redis-cluster` | — | false | Cluster 客户端。也可用 `REDIS_CLUSTER=1`，或 URL `redis-cluster://` / 逗号多 seed |
 | `--executor-url` | `RUPI_EXECUTOR_URL` | 空 | 单个 execd |
 | `--executor-urls` | `RUPI_EXECUTOR_URLS` | 空 | 逗号分隔，可写 `region=url`；优先于单个 URL |
 | `--sandbox-urls` | `RUPI_SANDBOX_URLS` | 空 | sandboxd 节点，格式同上 |
@@ -51,12 +52,15 @@
 | `--warm-pool` | `RUPI_EXEC_WARM` | 2 |
 | `--insecure` | `RUPI_EXEC_INSECURE` | false |
 
+`--root` 必须可写。本机回环用 `./rupi-data/execd`。`/var/lib/...` 只有目录已存在且进程用户可写时才用，否则启动直接 `Permission denied`。
+
 ### `rupi-sandboxd`
 
-与 execd 相同的 `--listen` / `--root` / `--token` / `--warm-pool` / `--insecure`，另有：
+与 execd 相同的 `--listen` / `--root` / `--token` / `--insecure`。`--warm-pool` **不是** `RUPI_EXEC_WARM`：
 
 | flag | 环境变量 | 默认 |
 |---|---|---|
+| `--warm-pool` | `RUPI_SANDBOX_WARM` | 2 |
 | `--max-sandboxes` | `RUPI_SANDBOX_MAX` | 64 |
 | `--region` | `RUPI_REGION` | `local` |
 
@@ -64,10 +68,11 @@
 
 | 变量 | 作用 |
 |---|---|
+| `REDIS_CLUSTER=1` | 与 `--redis-cluster` 相同（clap 本身不读这个 env） |
 | `RUPI_DB_INSECURE=1` | 允许非回环明文 `DATABASE_URL`（跳过 rustls） |
 | `RUPI_GIT_ALLOW_ANON=1` | 允许无 token 的公开 https git clone（默认关） |
 | `RUPI_CLOUD_ALLOW_MOCK=1` | 租户 `PATCH /v1/settings` 可以写 `mock_script` |
-| `RUPI_CLOUD_MOCK` / `RUPI_MOCK_SCRIPT` | 控制面走 mock 剧本（本地/CI） |
+| `RUPI_CLOUD_MOCK` / `RUPI_MOCK_SCRIPT` | 控制面走 mock 剧本（本地/CI）。`=1` 时无剧本回 `hello from rupi-server (mock)` |
 | `RUPI_S3_ENDPOINT` 或 `AWS_ENDPOINT_URL` | S3 兼容 endpoint（默认 `https://s3.amazonaws.com`） |
 | `RUPI_S3_REGION` 或 `AWS_REGION` | 默认 `us-east-1` |
 | `RUPI_S3_ACCESS_KEY` 或 `AWS_ACCESS_KEY_ID` | 必填（用 `s3://` 时） |
@@ -82,16 +87,30 @@
 - 租户 BYOK 按 provider 读 `anthropic_api_key` / `gemini_api_key` / `openai_api_key`（或 `api_key`）。不会把 OpenAI key 塞给 Anthropic。
 - `git` bootstrap 只接受 `https://` 或 `git@host:path`（`file://` 一律拒）。host 默认白名单（github.com / gitlab.com / bitbucket.org / git.sr.ht / codeberg.org），可用 settings / 请求体 `git_hosts` 加。无 token 的 `git@` / https 默认拒；公开只读 https 需 `RUPI_GIT_ALLOW_ANON=1`。租户 token 只进这一次 clone。
 - 租户 `PATCH /v1/settings` 与管理面同一白名单；`***` 不覆盖密钥；`mock_script` 仅 `RUPI_CLOUD_ALLOW_MOCK=1` 或管理面。
+- **`/ready`**：Postgres 不通，或没有任何执行节点 `stats` 成功（`capacity > 0`），HTTP **503**，JSON `ok: false`。Redis 挂了仍 200（缓存可降级）。不配 `--executor-urls` / `--sandbox-urls` 时进程能起来，但 `/ready` 是 503。
 
 ## 本机先跑通（回环）
 
 回环也要带执行口令。空 token 起 execd 必须再加 `--insecure`，生产不要这么干。
 
+`--root` 写相对 cwd 的 `./rupi-data/...`（与默认 `--snapshot-dir` 同一棵树）。不要用 `/var/lib/rupi/...`，非 root 会在建目录时直接退出。
+
 ```bash
-# Postgres / Redis 自备
+# 本页后面用 target/release
+cargo build --release -p rupi-server
+
+# Postgres / Redis 自备。与 CI 同款镜像可以是：
+#   docker run -d --name rupi-pg -e POSTGRES_USER=rupi -e POSTGRES_PASSWORD=rupi \
+#     -e POSTGRES_DB=rupi -p 127.0.0.1:5432:5432 postgres:16
+#   docker run -d --name rupi-redis -p 127.0.0.1:6379:6379 redis:7
+# migrate 会 `CREATE EXTENSION IF NOT EXISTS pg_trgm`（需要 contrib）。
+# 扩展失败只让中文检索降级，不挡启动。
+
 export RUPI_ADMIN_TOKEN=...
 export RUPI_EXEC_TOKEN=...
 export DATABASE_URL=postgres://rupi:rupi@127.0.0.1:5432/rupi
+# 无 BYOK 时打 AG-UI 用 mock（写在正式 rupi-server 进程环境里）
+export RUPI_CLOUD_MOCK=1
 
 # 种 Key（打印后退出）
 ./target/release/rupi-server \
@@ -104,13 +123,13 @@ export DATABASE_URL=postgres://rupi:rupi@127.0.0.1:5432/rupi
 
 ./target/release/rupi-execd \
   --listen 127.0.0.1:8090 \
-  --root /var/lib/rupi/execd \
+  --root ./rupi-data/execd \
   --token "$RUPI_EXEC_TOKEN"
 
 # 可选第二种后端
 ./target/release/rupi-sandboxd \
   --listen 127.0.0.1:8190 \
-  --root /var/lib/rupi/sandboxd \
+  --root ./rupi-data/sandboxd \
   --token "$RUPI_EXEC_TOKEN"
 
 ./target/release/rupi-server \
@@ -126,12 +145,34 @@ export DATABASE_URL=postgres://rupi:rupi@127.0.0.1:5432/rupi
 验收：
 
 ```bash
+curl -sS -o /tmp/ready.json -w "%{http_code}\n" http://127.0.0.1:8080/ready
+# 健康必须是 200；JSON ok=true。Postgres / 执行面挂了是 503。
 curl -sS http://127.0.0.1:8080/health
-curl -sS http://127.0.0.1:8080/ready
 curl -sS http://127.0.0.1:8080/metrics
 curl -sS -H "Authorization: Bearer $RUPI_ADMIN_TOKEN" http://127.0.0.1:8080/admin/api/me
+
+# 管理面种 Key（也可用上面 bootstrap 打出来的 RUPI_CLOUD_KEY）
+CREATE=$(curl -sS -H "Authorization: Bearer $RUPI_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"demo-live"}' \
+  http://127.0.0.1:8080/admin/api/tenants)
+export RUPI_CLOUD_KEY=$(printf '%s' "$CREATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
+
 curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" http://127.0.0.1:8080/v1/me
-# POST /v1/agent 用租户 Key
+
+SESS=$(curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"thread-1"}' \
+  http://127.0.0.1:8080/v1/sessions)
+SID=$(printf '%s' "$SESS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# POST /v1/agent 用租户 Key；RUPI_CLOUD_MOCK=1 时助手文本含 hello from rupi-server (mock)
+curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" \
+  -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d "{\"threadId\":\"$SID\",\"runId\":\"run-1\",\"messages\":[{\"id\":\"m1\",\"role\":\"user\",\"content\":\"hello\"}]}" \
+  http://127.0.0.1:8080/v1/agent
+
 # 掐 SSE 后 AgentLoop 停、exec 停
 # 租户 A 的 bash 读不到租户 B 的卷
 ```
