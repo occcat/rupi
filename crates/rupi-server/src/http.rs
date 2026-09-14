@@ -311,6 +311,7 @@ async fn create_session(
         .ok_or_else(|| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
         })?;
+    cache_session_meta(&app, &row).await;
     Ok((StatusCode::CREATED, Json(session_json(&row, None))))
 }
 
@@ -331,6 +332,7 @@ async fn get_session(
 ) -> Result<Json<Value>, Response> {
     let t = tenant_of(&app, &headers).await?;
     let row = session_guard(&app, &t, &id).await?;
+    cache_session_meta(&app, &row).await;
     let tree = db::load_tree(&app.pool, &t.id, &id).await.ok();
     Ok(Json(session_json(
         &row,
@@ -478,6 +480,7 @@ async fn duplicate(
         .ok_or_else(|| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"session vanished"}))).into_response()
         })?;
+    cache_session_meta(app, &row).await;
     Ok(Json(session_json(&row, None)))
 }
 
@@ -605,6 +608,18 @@ async fn alloc_workspace(
         }
         Err(e) => Err(e),
     }
+}
+
+async fn cache_session_meta(app: &App, row: &db::SessionRow) {
+    let _ = app
+        .cache
+        .put_session_meta(
+            &row.tenant_id,
+            &row.id,
+            &session_json(row, None).to_string(),
+            crate::cache::SESS_META_TTL_SECS,
+        )
+        .await;
 }
 
 pub(crate) fn session_json(row: &db::SessionRow, extra: Option<Value>) -> Value {

@@ -3,6 +3,16 @@
 use clap::Parser;
 use rupi_server::{auth, db, CloudConfig};
 
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Parser)]
 #[command(name = "rupi-server", about = "Cloud control plane: AG-UI + REST, Postgres, external Executor")]
 struct Cli {
@@ -15,6 +25,10 @@ struct Cli {
     database_read_url: Option<String>,
     #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
+    /// 使用 Redis Cluster 客户端。也可用 `REDIS_CLUSTER=1`，或 URL
+    /// `redis-cluster://` / 逗号分隔多个 seed。
+    #[arg(long, default_value_t = false)]
+    redis_cluster: bool,
     #[arg(long, env = "RUPI_EXECUTOR_URL", default_value = "")]
     executor_url: String,
     /// 逗号分隔的多个 execd。可写 `region=url`。优先于单个 URL。
@@ -78,7 +92,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg = CloudConfig {
         database_url: cli.database_url,
         database_read_url: cli.database_read_url,
-        redis_url: cli.redis_url,
+        redis_url: if cli.redis_cluster || env_truthy("REDIS_CLUSTER") {
+            rupi_server::cache::prefer_cluster_url(&cli.redis_url)
+        } else {
+            cli.redis_url
+        },
         executor_url: cli.executor_url,
         executor_urls: urls,
         sandbox_urls,
