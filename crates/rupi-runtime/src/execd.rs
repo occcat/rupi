@@ -95,7 +95,7 @@ pub fn router(cfg: ExecdConfig) -> Router {
         .route("/v1/bootstrap", post(bootstrap))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/restore", post(restore))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(crate::access_trace_layer())
         .with_state(state)
 }
 

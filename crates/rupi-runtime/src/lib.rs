@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub mod access_log;
 pub mod engine;
 pub mod execd;
 pub mod git;
@@ -20,6 +21,7 @@ pub mod store;
 pub mod tar;
 pub mod token;
 
+pub use access_log::access_trace_layer;
 pub use jail::Isolation;
 pub use pool::{is_pool_exhausted, parse_endpoint_list, PoolExhausted, PoolNode, PoolScheduler};
 pub use s3::{MemoryObjectStore, S3Config, S3ObjectStore};
