@@ -52,6 +52,27 @@ impl Drop for Kids {
     }
 }
 
+fn collect_text_deltas(body: &str) -> String {
+    let mut text = String::new();
+    for line in body.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("TEXT_MESSAGE_CONTENT") | Some("TEXT_MESSAGE_DELTA") => {
+                if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
+                    text.push_str(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
 async fn wait_http(url: &str, want: u16) -> bool {
     let c = reqwest::Client::new();
     for _ in 0..50 {
@@ -212,7 +233,8 @@ async fn launch_md_binaries_admin_key_session_mock() {
         .unwrap();
     assert_eq!(agent.status(), 200, "{}", agent.status());
     let body = agent.text().await.unwrap();
-    assert!(body.contains("hello from rupi-server (mock)"), "{body}");
+    let text = collect_text_deltas(&body);
+    assert_eq!(text, "hello from rupi-server (mock)", "{body}");
     assert!(body.contains("RUN_FINISHED"), "{body}");
 
     let _ = std::fs::remove_dir_all(root);

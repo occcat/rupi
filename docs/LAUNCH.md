@@ -166,7 +166,8 @@ SESS=$(curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" \
   http://127.0.0.1:8080/v1/sessions)
 SID=$(printf '%s' "$SESS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
-# POST /v1/agent 用租户 Key；RUPI_CLOUD_MOCK=1 时助手文本含 hello from rupi-server (mock)
+# POST /v1/agent 用租户 Key。RUPI_CLOUD_MOCK=1 时 TEXT_MESSAGE_* delta 拼起来是
+# hello from rupi-server (mock)（原始 SSE 不会出现这一整句）。
 curl -sS -H "Authorization: Bearer $RUPI_CLOUD_KEY" \
   -H "Accept: text/event-stream" \
   -H "Content-Type: application/json" \

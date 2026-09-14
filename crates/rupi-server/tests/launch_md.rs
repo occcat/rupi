@@ -31,9 +31,15 @@ fn launch_md_lists_real_flags_and_loopback_paths() {
     assert!(src.contains("./rupi-data/sandboxd"), "{src}");
 
     let local = section(&src, "## 本机先跑通", "## 对外听");
+    let recipe_cmds: String = local
+        .split("```")
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, block)| block)
+        .collect();
     assert!(
-        !local.contains("/var/lib/rupi"),
-        "loopback recipe must not use /var/lib/rupi (not writable): {local}"
+        !recipe_cmds.contains("/var/lib/rupi"),
+        "loopback commands must not use /var/lib/rupi (not writable): {recipe_cmds}"
     );
     assert!(
         local.contains("cargo build --release"),
@@ -46,6 +52,10 @@ fn launch_md_lists_real_flags_and_loopback_paths() {
     assert!(local.contains("/v1/sessions"), "{local}");
     assert!(local.contains("/v1/agent"), "{local}");
     assert!(local.contains("RUPI_CLOUD_MOCK=1"), "{local}");
+    assert!(
+        local.contains("TEXT_MESSAGE"),
+        "mock smoke must say to join SSE deltas, not grep the raw body"
+    );
 }
 
 #[test]
