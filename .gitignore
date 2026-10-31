@@ -1,10 +1,45 @@
+# Rust build output
 /target/
-.rupi/sessions/
+**/*.rs.bk
+*.pdb
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+
+# rupi runtime state (never commit)
 *.db
 *.db-wal
 *.db-shm
+.rupi/sessions/
+# Project memory is per developer
+.rupi/MEMORY.md
+.rupi/USER.md
+.rupi/failures.md
+# /export and /share write into the current directory by default
+rupi-session-*.html
+rupi-session-*.jsonl
+# rupi-server default snapshot/executor roots (relative to cwd)
+rupi-data/
 
-# local
-.worktree/
+# Secrets and local environment
 .env
-/rupi-data/
+.env.*
+!.env.example
+
+# Worktrees for parallel branches
+.worktree/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/settings.local.json
+
+# Logs
+*.log
