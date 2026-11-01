@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
 use rupi_core::{CancelFlag, ToolDefinition};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -88,9 +88,12 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// 工具注册表。按名字有序存放：`names()` / `definitions()` 跨进程、跨热重载顺序恒定，
+/// 请求里的 tools 与系统提示 AvailableTools 前缀稳定，prompt cache 才能命中
+/// （云端每个 run 都新建注册表；HashMap 迭代序每个进程都不同）。
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -1600,6 +1603,29 @@ mod tests {
         assert!(!names.iter().any(|n| n == "find" || n == "ls"));
         let out = r.execute("nope", serde_json::json!({})).await.unwrap();
         assert!(out.is_error);
+    }
+
+    #[test]
+    fn definitions_order_is_stable_across_builds_and_reloads() {
+        // HashMap 迭代序每个实例都不同：同进程连建几个注册表就能得到不同顺序，
+        // 请求的 tools 前缀随之变化，prompt cache 失效。
+        let serialize = |r: &ToolRegistry| serde_json::to_string(&r.definitions()).unwrap();
+        let base = ToolRegistry::with_builtins();
+        let first = serialize(&base);
+        for _ in 0..8 {
+            assert_eq!(serialize(&ToolRegistry::with_builtins()), first);
+        }
+        let names = base.names();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        // 注册再注销一批工具（热重载）后回到同一序列。
+        let mut r = ToolRegistry::with_builtins();
+        r.register_optional(["find", "ls"]);
+        for n in ["find", "ls"] {
+            r.unregister(n);
+        }
+        assert_eq!(serialize(&r), first);
     }
 
     #[tokio::test]
