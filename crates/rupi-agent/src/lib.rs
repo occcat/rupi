@@ -233,8 +233,9 @@ pub struct AgentLoop {
     /// 云路径：Ask 时不阻塞 [`Approver`]，由回调决定是否挂起本轮。
     /// `None` 时保持本机审批语义（TUI/CLI/`--mode rpc` 不变）。
     pub on_ask: Option<Arc<dyn Fn(&str, &serde_json::Value, &str) -> AskAction + Send + Sync>>,
-    /// `on_ask` 返回 [`AskAction::Interrupt`] 时写入；宿主据此发 AG-UI interrupt。
-    pub pending_interrupt: Arc<std::sync::Mutex<Option<PendingInterrupt>>>,
+    /// `on_ask` 返回 [`AskAction::Interrupt`] 时写入（同批每个挂起调用一条，按调用原序）；
+    /// 宿主据此发 AG-UI interrupt。
+    pub pending_interrupts: Arc<std::sync::Mutex<Vec<PendingInterrupt>>>,
 }
 
 impl AgentLoop {
@@ -263,7 +264,7 @@ impl AgentLoop {
             discovered: Arc::new(std::sync::Mutex::new(HashSet::new())),
             inbox: None,
             on_ask: None,
-            pending_interrupt: Arc::new(std::sync::Mutex::new(None)),
+            pending_interrupts: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -276,8 +277,23 @@ impl AgentLoop {
         self
     }
 
+    /// 取走本轮全部挂起的调用（按调用原序）。
+    pub fn take_pending_interrupts(&self) -> Vec<PendingInterrupt> {
+        std::mem::take(
+            &mut *self
+                .pending_interrupts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// 兼容旧接口：按原序弹出一个挂起调用，重复调用可逐个取完。
     pub fn take_pending_interrupt(&self) -> Option<PendingInterrupt> {
-        self.pending_interrupt.lock().unwrap().take()
+        let mut g = self
+            .pending_interrupts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (!g.is_empty()).then(|| g.remove(0))
     }
 
     pub fn with_inbox(mut self, inbox: Arc<crate::MessageInbox>) -> Self {
@@ -524,10 +540,6 @@ impl AgentLoop {
         }
     }
 
-    fn is_mutating(tool: &str) -> bool {
-        matches!(tool, "write" | "edit" | "bash")
-    }
-
     /// 运行一轮用户请求直到 `done` / 无工具调用 / max_turns。每步推 `AgentEvent`。
     /// 协作取消（`cancel`，对标上游 effect-gate 取消源）：turn 边界、流式补全中、
     /// 串行工具间隙检查；中止发 `TurnEnd{Aborted}`（轮中）+ `RunEnd{Aborted}` 并回
@@ -700,7 +712,7 @@ impl AgentLoop {
                 system.push_str(&format!("\n<Recalled>\n{recalled}\n</Recalled>\n"));
             }
             if self.plan_mode {
-                system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools, then describe the plan. Do NOT call write/edit/bash.\n</PlanMode>\n");
+                system.push_str("\n<PlanMode>\nYou are in PLAN MODE: explore with read-only tools (read/glob/grep/memory_search), then describe the plan. Do NOT modify files, run commands, write memory or call external tools; such calls are refused.\n</PlanMode>\n");
             }
             let history: Vec<Message> =
                 session.prompt_history(self.compression_for(provider).keep_recent_tokens);
@@ -875,24 +887,53 @@ impl AgentLoop {
                     _ => None,
                 })
                 .collect();
+            // 输出被 max_tokens 截断时参数必然残缺（对标上游 agent-loop argumentsError）：
+            // 整批不执行、不送审批，各合成一条错误结果，调用与结果仍一一配对。
+            let truncated = matches!(
+                resp.stop_reason.as_str(),
+                "length" | "max_tokens" | "MAX_TOKENS"
+            );
             let mut results = vec![];
-            // 第一阶段（顺序）：before 钩子改写/拒绝 → ToolStart → 权限门/审批/计划模式。
-            // 问询类动作保持原序；真实执行留到第二阶段（串行或并发），事件与结果保原序。
+            // 第一阶段（顺序）：before 钩子改写/拒绝 → ToolStart → 可见性/计划模式/权限门/审批。
+            // 门按短路顺序判：前一道拒绝后不再问后面的（hook 拒绝的调用不该再弹审批）。
+            // 整批都判完才进入执行：同批的 Interrupt 全部收集，已放行的照常执行入树，
+            // 宿主据 `take_pending_interrupts` 一个调用挂一条，resume 时逐个回填。
             let mut pending: Vec<PendingCall> = vec![];
+            let mut interrupts: Vec<PendingInterrupt> = vec![];
             for (id, name, args) in calls {
                 tool_names.push(name.clone());
+                // 无参工具有的 provider 给 null，按空对象处理
+                let mut args = if args.is_null() {
+                    serde_json::json!({})
+                } else {
+                    args
+                };
+                let malformed = if truncated {
+                    Some(rupi_tools::ToolOutput::err(format!(
+                        "tool call {name} was cut off because the reply hit the output token limit; \
+                         its arguments are incomplete and it was not run. Retry in smaller steps, \
+                         for example write a large file in several parts."
+                    )))
+                } else if !args.is_object() {
+                    Some(rupi_tools::ToolOutput::err(format!(
+                        "invalid arguments for {name}: expected a JSON object; the call was not run"
+                    )))
+                } else {
+                    None
+                };
                 // before 钩子：可改写 args（后续钩子/策略门/执行看到新值）或提前拒绝
-                let mut args = args;
                 let mut hook_denied: Option<rupi_tools::ToolOutput> = None;
-                for h in &self.hooks {
-                    match h.before(&name, &args).await {
-                        HookDecision::Proceed { args: Some(a) } => args = a,
-                        HookDecision::Proceed { args: None } => {}
-                        HookDecision::Deny { reason } => {
-                            hook_denied = Some(rupi_tools::ToolOutput::err(format!(
-                                "denied by hook: {reason}"
-                            )));
-                            break;
+                if malformed.is_none() {
+                    for h in &self.hooks {
+                        match h.before(&name, &args).await {
+                            HookDecision::Proceed { args: Some(a) } => args = a,
+                            HookDecision::Proceed { args: None } => {}
+                            HookDecision::Deny { reason } => {
+                                hook_denied = Some(rupi_tools::ToolOutput::err(format!(
+                                    "denied by hook: {reason}"
+                                )));
+                                break;
+                            }
                         }
                     }
                 }
@@ -905,79 +946,83 @@ impl AgentLoop {
                 for e in extensions {
                     e.on_event(&start).await?;
                 }
-                // 权限门：拒绝 / 无审批的 Ask 一律转 tool error 回模型，主循环不中断
+                // 拒绝 / 无审批的 Ask 一律转 tool error 回模型，主循环不中断
                 let denied: Option<rupi_tools::ToolOutput> =
-                    hook_denied.or(match self.policy.decide(&name, &args) {
-                        Decision::Allow => None,
-                        Decision::Deny(reason) => Some(rupi_tools::ToolOutput::err(format!(
-                            "denied by policy: {reason}"
-                        ))),
-                        Decision::Ask(reason) => {
-                            if let Some(cb) = &self.on_ask {
-                                match cb(&name, &args, &reason) {
-                                    AskAction::Allow => None,
-                                    AskAction::Deny => Some(rupi_tools::ToolOutput::err(format!(
-                                        "denied (approval required): {reason}"
-                                    ))),
-                                    AskAction::Interrupt => {
-                                        *self.pending_interrupt.lock().unwrap() =
-                                            Some(PendingInterrupt {
-                                                tool_call_id: id.clone(),
-                                                name: name.clone(),
-                                                arguments: args.clone(),
-                                                reason,
-                                            });
-                                        // ToolStart 已发出；不执行、不发 ToolEnd、不发 RunEnd。
-                                        // 宿主（AG-UI）据此落盘 interrupt 并结束本轮 SSE。
-                                        return Ok(StopReason::Aborted);
-                                    }
-                                }
-                            } else {
-                                // 本机：审批问询前后广播 UiPrompt（对标上游 ui_prompt_start/end），
-                                // 无审批器则不问直接拒绝，此时不发事件（没有等待发生）。
-                                let ok = match &self.approver {
-                                    None => false,
-                                    Some(a) => {
-                                        let start = AgentEvent::UiPromptStart {
-                                            tool: name.clone(),
-                                            reason: reason.clone(),
-                                        };
-                                        on_event(start.clone());
-                                        for e in extensions {
-                                            e.on_event(&start).await?;
-                                        }
-                                        let ok = a.approve(&name, &args, &reason);
-                                        let end = AgentEvent::UiPromptEnd {
-                                            tool: name.clone(),
-                                            approved: ok,
-                                        };
-                                        on_event(end.clone());
-                                        for e in extensions {
-                                            e.on_event(&end).await?;
-                                        }
-                                        ok
-                                    }
-                                };
-                                if ok {
-                                    None
-                                } else {
-                                    Some(rupi_tools::ToolOutput::err(format!(
-                                        "denied (approval required): {reason}"
-                                    )))
-                                }
-                            }
-                        }
-                    });
-                // 计划模式兜底：即使策略放行，变更类工具也不执行
-                let denied = denied.or_else(|| {
-                    if self.plan_mode && Self::is_mutating(&name) {
+                    if let Some(out) = malformed.or(hook_denied) {
+                        Some(out)
+                    } else if !self.tool_visible(&name)
+                        && !(name == "search_tools" && self.discovery.is_some())
+                    {
+                        // `--tools` / `--exclude-tools` 不只隐藏 schema：模型照名字调也不执行
+                        Some(rupi_tools::ToolOutput::err(format!(
+                            "tool {name} is disabled"
+                        )))
+                    } else if self.plan_mode && !policy::plan_mode_allows(&name) {
+                        // 计划模式只放行只读工具；放在审批之前，免得先问用户再拒绝
                         Some(rupi_tools::ToolOutput::err(format!(
                             "plan mode: {name} is disabled; describe the plan instead"
                         )))
                     } else {
-                        None
-                    }
-                });
+                        match self.policy.decide(&name, &args) {
+                            Decision::Allow => None,
+                            Decision::Deny(reason) => Some(rupi_tools::ToolOutput::err(format!(
+                                "denied by policy: {reason}"
+                            ))),
+                            Decision::Ask(reason) => {
+                                if let Some(cb) = &self.on_ask {
+                                    match cb(&name, &args, &reason) {
+                                        AskAction::Allow => None,
+                                        AskAction::Deny => Some(rupi_tools::ToolOutput::err(
+                                            format!("denied (approval required): {reason}"),
+                                        )),
+                                        AskAction::Interrupt => {
+                                            // 不执行、不发 ToolEnd；结果由宿主 resume 时回填
+                                            interrupts.push(PendingInterrupt {
+                                                tool_call_id: id,
+                                                name,
+                                                arguments: args,
+                                                reason,
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    // 本机：审批问询前后广播 UiPrompt（对标上游 ui_prompt_start/end），
+                                    // 无审批器则不问直接拒绝，此时不发事件（没有等待发生）。
+                                    let ok = match &self.approver {
+                                        None => false,
+                                        Some(a) => {
+                                            let start = AgentEvent::UiPromptStart {
+                                                tool: name.clone(),
+                                                reason: reason.clone(),
+                                            };
+                                            on_event(start.clone());
+                                            for e in extensions {
+                                                e.on_event(&start).await?;
+                                            }
+                                            let ok = a.approve(&name, &args, &reason);
+                                            let end = AgentEvent::UiPromptEnd {
+                                                tool: name.clone(),
+                                                approved: ok,
+                                            };
+                                            on_event(end.clone());
+                                            for e in extensions {
+                                                e.on_event(&end).await?;
+                                            }
+                                            ok
+                                        }
+                                    };
+                                    if ok {
+                                        None
+                                    } else {
+                                        Some(rupi_tools::ToolOutput::err(format!(
+                                            "denied (approval required): {reason}"
+                                        )))
+                                    }
+                                }
+                            }
+                        }
+                    };
                 pending.push(PendingCall {
                     id,
                     name,
@@ -1085,13 +1130,23 @@ impl AgentLoop {
                     });
                 }
             }
-            session.push(Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: Role::Tool,
-                blocks: results,
-                provider: None,
-                created_at: chrono::Utc::now(),
-            });
+            if !results.is_empty() {
+                session.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: Role::Tool,
+                    blocks: results,
+                    provider: None,
+                    created_at: chrono::Utc::now(),
+                });
+            }
+            // 有挂起的审批：已放行的结果已入树，停在这里等宿主 resume（不发 RunEnd）。
+            if !interrupts.is_empty() {
+                *self
+                    .pending_interrupts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = interrupts;
+                return Ok(StopReason::Aborted);
+            }
             // 轮中取消（工具间隙置位）：结果已落盘保不变量，跳过压实（省一次模型调用），
             // 本轮记 Aborted 而非 Done。
             if cancel.is_cancelled() {
