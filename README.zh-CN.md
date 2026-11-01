@@ -328,6 +328,8 @@ rupi --api-key "$RUPI_CLOUD_KEY" cloud --url http://127.0.0.1:8080 prompt "hello
 |---|---|
 | [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | 逐子系统对照 Pi、有意偏离、未移植项 |
 | [`docs/LAUNCH.md`](docs/LAUNCH.md) | 云部署：全部真实 flag、安全默认值、回环与对外监听、容量演练 |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | 产品目标、现状、进行中的分支和下一步 |
+| [`docs/backlog/`](docs/backlog/README.md) | 全部已知问题（258 条审查发现）与 42 条按优先级排序的上游 Pi v1.4.0 借鉴条目 |
 | [`AGENTS.md`](AGENTS.md) | 面向贡献者和编码 agent 的项目原则与规范 |
 | [`BRANCH_COMPARISON.md`](BRANCH_COMPARISON.md) | 三个初始移植分支的历史评审（2026-09） |
 | [`crates/*/README.md`](crates/) | 各 crate 的职责与命令 |
