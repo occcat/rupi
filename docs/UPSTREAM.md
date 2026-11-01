@@ -114,3 +114,5 @@
 6. 借鉴：`[core]` 记忆分层、本文档。
 
 已知未做：子 agent 继承 policy/approver；悬空符号链接写入逃逸沙箱；扩展 WASM。`rupi login` 没有设备码流。
+
+上面这份清单只记录 0.85 移植时的状态。上游已到 v1.4.0（新增 `pi-durable`、`pi-env`、`pi-codemode`、`pi-mcp`）。全部已知问题与借鉴计划见 [`ROADMAP.md`](ROADMAP.md) 和 [`backlog/`](backlog/README.md)。

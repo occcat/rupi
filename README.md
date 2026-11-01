@@ -328,6 +328,8 @@ Conversations use AG-UI: `POST /v1/agent` with a `RunAgentInput` body returns an
 |---|---|
 | [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | Subsystem-by-subsystem mapping to Pi, deliberate differences, what is not ported |
 | [`docs/LAUNCH.md`](docs/LAUNCH.md) | Cloud deployment: every real flag, safe defaults, loopback and public setups, load drills |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Product goal, current state, branches in progress, and what to do next |
+| [`docs/backlog/`](docs/backlog/README.md) | Every known issue (258 review findings) and 42 ranked ideas borrowed from upstream Pi v1.4.0 |
 | [`AGENTS.md`](AGENTS.md) | Project principles and conventions for contributors and coding agents |
 | [`BRANCH_COMPARISON.md`](BRANCH_COMPARISON.md) | Historical review of the three original port branches (2026-09) |
 | [`crates/*/README.md`](crates/) | Per-crate responsibilities and commands |
