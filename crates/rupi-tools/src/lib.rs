@@ -903,6 +903,8 @@ impl Tool for BashTool {
     /// stdout/stderr 自 spawn 起由两个 reader task 并发排空（有界 50KB 尾部 ring），
     /// 避免子进程写满 ~64KB 管道缓冲后阻塞、`wait` 永远等不到（P0 死锁）。
     /// 超时/取消同样先保证排空在跑，再杀进程组，最后回收 reader。
+    /// stdin 接 `/dev/null`（对标 Pi `stdio: ["ignore", ...]`）：读 stdin 的命令立即见 EOF，
+    /// 不挂到超时，也不和 RPC/TUI 宿主抢输入。
     async fn execute_with_cancel(
         &self,
         arguments: serde_json::Value,
@@ -920,6 +922,7 @@ impl Tool for BashTool {
         crate::shell::configure_isolation(cmd.as_std_mut());
         let mut child = match cmd
             .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -927,9 +930,23 @@ impl Tool for BashTool {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::err(format!("spawn failed: {e}"))),
         };
+        // wait 之后 `child.id()` 为 None；进程组 id 即 shell pid，留着给后台进程收尾用。
+        let pid = child.id();
         // 先拿走管道再 wait：reader 与 wait/取消/超时并发，写满缓冲也不会堵死子进程。
-        let out_task = tokio::spawn(Self::read_pipe_tail(child.stdout.take(), DEFAULT_MAX_BYTES));
-        let err_task = tokio::spawn(Self::read_pipe_tail(child.stderr.take(), DEFAULT_MAX_BYTES));
+        // 尾部 ring 共享出来：reader 被放弃（孙进程占着写端）时已收内容照样可取。
+        let activity = Arc::new(tokio::sync::Notify::new());
+        let out_tail = Arc::new(Mutex::new(PipeTail::new(DEFAULT_MAX_BYTES)));
+        let err_tail = Arc::new(Mutex::new(PipeTail::new(DEFAULT_MAX_BYTES)));
+        let mut out_task = tokio::spawn(read_pipe_tail(
+            child.stdout.take(),
+            out_tail.clone(),
+            activity.clone(),
+        ));
+        let mut err_task = tokio::spawn(read_pipe_tail(
+            child.stderr.take(),
+            err_tail.clone(),
+            activity.clone(),
+        ));
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
         tokio::pin!(timeout);
         enum End {
@@ -938,7 +955,7 @@ impl Tool for BashTool {
             TimedOut,
             WaitFailed(String),
         }
-        let end = tokio::select! {
+        let mut end = tokio::select! {
             _ = cancel.cancelled() => End::Cancelled,
             _ = &mut timeout => End::TimedOut,
             res = child.wait() => match res {
@@ -946,59 +963,111 @@ impl Tool for BashTool {
                 Err(e) => End::WaitFailed(e.to_string()),
             },
         };
-        match end {
-            End::Done(status) => {
-                let (out_text, err_text) = Self::join_pipe_readers(out_task, err_task, None).await;
-                let mut s = out_text;
-                if !err_text.is_empty() {
-                    s.push_str(&format!("\n[stderr]\n{err_text}"));
-                }
-                s = bound_bash_output(&s);
-                if status.success() {
-                    Ok(ToolOutput::ok(s))
-                } else {
-                    Ok(ToolOutput::err(format!("exit {status}: {s}")))
+        if matches!(end, End::Done(_)) {
+            // shell 已退出，但后台孙进程（`sleep 9 &`、`npm run dev &`）可能继承了
+            // 管道写端，读到 EOF 要等它们退出。对标 Pi waitForChildProcess：等管道关闭，
+            // 或静默满 100ms（每来一段输出重新计时）即收尾，后台进程照旧运行；
+            // 这期间取消或超时则杀掉整组。
+            let mut readers = std::pin::pin!(async {
+                let _ = (&mut out_task).await;
+                let _ = (&mut err_task).await;
+            });
+            loop {
+                tokio::select! {
+                    _ = &mut readers => break,
+                    idle = tokio::time::timeout(EXIT_STDIO_GRACE, activity.notified()) => {
+                        if idle.is_err() {
+                            break;
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        end = End::Cancelled;
+                        break;
+                    }
+                    _ = &mut timeout => {
+                        end = End::TimedOut;
+                        break;
+                    }
                 }
             }
-            End::Cancelled => {
-                Self::kill_tree(&mut child).await;
-                // 残余输出只等 500ms：孙进程可能继承管道写端（如 sh -c fork 出子进程），
-                // 无限等会拖到命令自然结束，违背取消语义；超时则舍弃残余直接返回。
-                let (out_text, _) = Self::join_pipe_readers(
-                    out_task,
-                    err_task,
-                    Some(std::time::Duration::from_millis(500)),
-                )
-                .await;
-                let partial = truncate_middle(&out_text, MAX_TOOL_OUTPUT);
-                let mut msg = String::from("cancelled by user");
-                if !partial.is_empty() {
-                    msg.push_str(&format!("\n[partial output]\n{partial}"));
+            if !matches!(end, End::Done(_)) {
+                if let Some(pid) = pid {
+                    crate::shell::kill_pid_tree(pid);
                 }
-                Ok(ToolOutput::err(msg))
             }
-            End::TimedOut => {
-                Self::kill_tree(&mut child).await;
-                // 杀后再回收 reader：排空已入 ring 的尾部，避免管道/任务泄漏。
-                let _ = Self::join_pipe_readers(
-                    out_task,
-                    err_task,
-                    Some(std::time::Duration::from_millis(500)),
-                )
-                .await;
-                Ok(ToolOutput::err(format!(
-                    "command timed out after {timeout_secs}s"
-                )))
+        } else {
+            crate::shell::kill_tree(&mut child).await;
+            // 杀组后残余只再等 500ms 排空管道缓冲，不无限等。
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let _ = (&mut out_task).await;
+                let _ = (&mut err_task).await;
+            })
+            .await;
+        }
+        // 放弃仍阻塞在孙进程管道上的 reader（对标 Pi 收尾时 destroy 流）。
+        out_task.abort();
+        err_task.abort();
+        let mut s = out_tail.lock().unwrap().take_string();
+        let err_text = err_tail.lock().unwrap().take_string();
+        if !err_text.is_empty() {
+            s.push_str(&format!("\n[stderr]\n{err_text}"));
+        }
+        let s = bound_bash_output(&s);
+        let with_partial = |head: String| {
+            if s.is_empty() {
+                head
+            } else {
+                format!("{head}\n[partial output]\n{s}")
             }
-            End::WaitFailed(e) => {
-                Self::kill_tree(&mut child).await;
-                let _ = Self::join_pipe_readers(
-                    out_task,
-                    err_task,
-                    Some(std::time::Duration::from_millis(500)),
-                )
-                .await;
-                Ok(ToolOutput::err(format!("wait failed: {e}")))
+        };
+        Ok(match end {
+            End::Done(status) if status.success() => ToolOutput::ok(s),
+            End::Done(status) => ToolOutput::err(format!("{}: {s}", exit_status_text(status))),
+            End::Cancelled => ToolOutput::err(with_partial("cancelled by user".into())),
+            End::TimedOut => ToolOutput::err(with_partial(format!(
+                "command timed out after {timeout_secs}s"
+            ))),
+            End::WaitFailed(e) => ToolOutput::err(with_partial(format!("wait failed: {e}"))),
+        })
+    }
+}
+
+/// shell 退出后等后台孙进程释放管道的静默宽限（对标 Pi `EXIT_STDIO_GRACE_MS`）。
+const EXIT_STDIO_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 非零退出的前缀：`exit code N`；Unix 被信号杀死时 `killed by signal N`。
+/// `ExitStatus` 的 Display 自带 `exit status:`，直接拼会变成 `exit exit status: 3`。
+fn exit_status_text(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(sig) = status.signal() {
+            return format!("killed by signal {sig}");
+        }
+    }
+    format!("exit {status}")
+}
+
+/// 并发排空一条管道进共享尾部 ring（对标 bash 50KB 尾部），每段输出唤醒一次 `activity`。
+async fn read_pipe_tail<R: tokio::io::AsyncRead + Unpin + Send>(
+    reader: Option<R>,
+    tail: Arc<Mutex<PipeTail>>,
+    activity: Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let Some(mut r) = reader else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.lock().unwrap().push(&chunk[..n]);
+                activity.notify_one();
             }
         }
     }
@@ -1016,51 +1085,6 @@ impl BashTool {
             .unwrap_or(30)
             .clamp(1, 300);
         (command, timeout_secs)
-    }
-
-    /// 杀整组进程树。Unix：killpg + 定向 kill；Windows：taskkill /F /T。
-    /// 失败一律忽略（组已空/进程已死），wait 保证无僵尸。
-    async fn kill_tree(child: &mut tokio::process::Child) {
-        crate::shell::kill_tree(child).await;
-    }
-
-    /// 并发排空一条管道，只保留最后 `max_bytes`（对标 bash 50KB 尾部）。
-    async fn read_pipe_tail<R: tokio::io::AsyncRead + Unpin + Send>(
-        reader: Option<R>,
-        max_bytes: usize,
-    ) -> PipeTail {
-        use tokio::io::AsyncReadExt as _;
-        let mut tail = PipeTail::new(max_bytes);
-        let Some(mut r) = reader else {
-            return tail;
-        };
-        let mut chunk = [0u8; 8192];
-        loop {
-            match r.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => tail.push(&chunk[..n]),
-            }
-        }
-        tail
-    }
-
-    /// 回收两个 reader。`limit` 用于取消/超时：孙进程占着写端时不能无限等。
-    async fn join_pipe_readers(
-        out_task: tokio::task::JoinHandle<PipeTail>,
-        err_task: tokio::task::JoinHandle<PipeTail>,
-        limit: Option<std::time::Duration>,
-    ) -> (String, String) {
-        let join = async {
-            let (o, e) = tokio::join!(out_task, err_task);
-            (
-                o.unwrap_or_else(|_| PipeTail::new(0)).into_string(),
-                e.unwrap_or_else(|_| PipeTail::new(0)).into_string(),
-            )
-        };
-        match limit {
-            None => join.await,
-            Some(d) => tokio::time::timeout(d, join).await.unwrap_or_default(),
-        }
     }
 }
 
@@ -1098,8 +1122,8 @@ impl PipeTail {
         self.buf.extend(chunk.iter().copied());
     }
 
-    fn into_string(self) -> String {
-        let v: Vec<u8> = self.buf.into_iter().collect();
+    fn take_string(&mut self) -> String {
+        let v: Vec<u8> = self.buf.drain(..).collect();
         decode_utf8(&v)
     }
 }
@@ -2073,11 +2097,111 @@ mod tests {
     fn pipe_tail_keeps_only_last_bytes() {
         let mut t = PipeTail::new(8);
         t.push(b"abcdefghij");
-        assert_eq!(t.into_string(), "cdefghij");
+        assert_eq!(t.take_string(), "cdefghij");
         let mut t = PipeTail::new(8);
         t.push(b"abcd");
         t.push(b"efghij");
-        assert_eq!(t.into_string(), "cdefghij");
+        assert_eq!(t.take_string(), "cdefghij");
+    }
+
+    #[tokio::test]
+    async fn bash_background_child_does_not_hold_the_call() {
+        // shell 退出后孙进程仍持有管道写端：旧实现无限等 EOF，6s 才返回、超时与取消都失效。
+        let tool = BashTool;
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({"command": "sleep 5 & echo hi", "timeout_secs": 30}))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content.trim(), "hi");
+        // 后台进程持续输出时继续收（宽限按静默计时），停下后收尾。
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({
+                "command": "(for i in 1 2 3; do echo tick$i; sleep 0.05; done; sleep 5) & echo go",
+                "timeout_secs": 30
+            }))
+            .await
+            .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(out.content.contains("tick3"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn bash_stdin_is_null_so_readers_see_eof() {
+        // 旧实现继承宿主 stdin：`cat` / `read` 挂到超时，RPC 下还和 JSONL 通道抢输入。
+        // 测试进程自身 stdin 可能已是 /dev/null，所以重启本测试二进制、喂一根不关闭的
+        // 管道当 stdin，在子进程里跑探针（复现 `rupi --mode rpc` 的宿主环境）。
+        if std::env::var_os("RUPI_BASH_STDIN_PROBE").is_some() {
+            let start = std::time::Instant::now();
+            let out = BashTool
+                .execute(serde_json::json!({
+                    "command": "cat; read x; echo got:$x",
+                    "timeout_secs": 5
+                }))
+                .await
+                .unwrap();
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(out.content.trim(), "got:");
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::bash_stdin_is_null_so_readers_see_eof",
+                "--test-threads=1",
+            ])
+            .env("RUPI_BASH_STDIN_PROBE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _held_open = child.stdin.take();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_keeps_partial_output_and_exit_text_is_clean() {
+        let out = BashTool
+            .execute(serde_json::json!({
+                "command": "echo partial; echo warn >&2; sleep 5",
+                "timeout_secs": 1
+            }))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.starts_with("command timed out after 1s"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[partial output]\npartial"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("[stderr]\nwarn"), "{}", out.content);
+        let fail = BashTool
+            .execute(serde_json::json!({"command": "echo boom; exit 3"}))
+            .await
+            .unwrap();
+        assert!(fail.is_error);
+        assert_eq!(fail.content, "exit code 3: boom");
     }
 
     #[tokio::test]

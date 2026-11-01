@@ -198,15 +198,14 @@ fn record_bash_context(session: &mut AgentSession, command: &str, output: &str) 
 }
 
 fn split_exit_tool_output(content: &str) -> (Option<i32>, &str) {
-    // BashTool 失败：`exit {ExitStatus}: {output}`，Unix 上 Display 为
-    // `exit status: N` 或 `signal: N`。
-    if let Some(rest) = content.strip_prefix("exit exit status: ") {
+    // BashTool 失败：`exit code N: {output}`；Unix 被信号杀死为 `killed by signal N: {output}`。
+    if let Some(rest) = content.strip_prefix("exit code ") {
         if let Some((code, out)) = rest.split_once(": ") {
             return (code.parse().ok(), out);
         }
         return (rest.parse().ok(), "");
     }
-    if let Some(rest) = content.strip_prefix("exit signal: ") {
+    if let Some(rest) = content.strip_prefix("killed by signal ") {
         if let Some((_, out)) = rest.split_once(": ") {
             return (None, out);
         }
@@ -223,7 +222,7 @@ fn bash_output_text(content: &str) -> String {
             .unwrap_or(rest)
             .to_string();
     }
-    if content.starts_with("exit ") {
+    if content.starts_with("exit code ") || content.starts_with("killed by signal ") {
         return split_exit_tool_output(content).1.to_string();
     }
     content.to_string()
@@ -967,7 +966,7 @@ mod tests {
         assert_eq!(cancel["exitCode"], Value::Null);
         assert_eq!(cancel["output"], "partial");
 
-        let fail = bash_result_from_tool(&ToolOutput::err("exit exit status: 7: boom"), "h1");
+        let fail = bash_result_from_tool(&ToolOutput::err("exit code 7: boom"), "h1");
         assert_eq!(fail["exitCode"], 7);
         assert_eq!(fail["cancelled"], false);
         assert_eq!(fail["output"], "boom");
