@@ -6,6 +6,17 @@
 - 目标架构：[`upstream-pi/architecture.md`](upstream-pi/architecture.md)
 - 借鉴条目详情：[`upstream-pi/ranked.md`](upstream-pi/ranked.md)；领域研究：`upstream-pi/study-*.md`
 
+上游引用的写法（`upstream-pi/` 和 B 条目里都用这套简写），对应 [earendil-works/pi](https://github.com/earendil-works/pi) 仓库里的路径：
+
+| 简写 | 实际路径 |
+|---|---|
+| `pkg/<包>/…` | `packages/<包>/…` |
+| `<包>.README.md`、`<包>.CHANGELOG.md` | `packages/<包>/README.md`、`packages/<包>/CHANGELOG.md` |
+| `docs/<名>.md`（除 rupi 自己的 `docs/LAUNCH.md` 等） | `packages/coding-agent/docs/<名>.md` |
+| `packages/…` | 原样 |
+
+上游文件抓取于 2026-11-01，来自 `main` 分支，包含 v1.4.0（tag 提交 `4a080252f06c`）之后 Unreleased 的内容。上游行号和 CHANGELOG 行号以这份快照为准，与 v1.4.0 tag 可能有出入，按章节标题或 issue 编号查找更可靠。
+
 ## 发现（258 条）
 
 | F | 级别 | 类型 | 来源审查 | 标题 | track |
