@@ -18,7 +18,7 @@
 不在本 track：rupi-server/src/tools.rs 与 rupi-runtime 归 executor-output-bounds；AgentLoop 其余部分归 agent-loop-integrity；rupi-llm 归 llm-wire-compat。
 
 ## 特别说明
-- 所有修复都要有回归测试；能用本地 Postgres 跑的集成测试一定要跑（见环境说明）。
+- 所有修复都要有回归测试；能用本地 Postgres 跑的集成测试一定要跑（步骤见 [`ROADMAP.md`](../../ROADMAP.md)「本机验证环境」）。
 - 优先级：凭证泄露、租约泄漏、tool_call 配对、跨会话记忆泄露、计费 > 其余。
 
 ## 借鉴上游 Pi 的条目（来自对标 Pi v1.4.0 的分析，按 SaaS 价值排序）
