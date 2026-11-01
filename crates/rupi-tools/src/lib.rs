@@ -421,7 +421,7 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".into(),
-            description: "Read a file from disk (paged; large files are truncated)".into(),
+            description: "Read a file from disk. Text pages stop at 2000 lines or 50KB (whichever comes first) on a whole line; continue with offset. Images are attached.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -455,8 +455,39 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// 超过此大小不再为了 “of N lines” 扫完全文，只报字节数。
 const READ_COUNT_REMAINING_MAX: u64 = 2 * 1024 * 1024;
 
+/// 读一行（含换行符）：最多把 `cap` 字节放进 `buf`，其余部分只消费不保存，
+/// 返回整行字节数（0 = EOF）。跳过 offset、数剩余行时 `cap=0`，单行巨型文件也不占内存。
+async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    let mut total = 0usize;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(total);
+        }
+        let (n, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        let room = cap.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..n.min(room)]);
+        reader.consume(n);
+        total += n;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// 文本分页（对标 Pi read：2000 行 / 50KB 先到先停，只在整行处停）。页内不再做中间截断，
+/// 按 `pass offset=` 提示翻页逐页拼接即原文（CRLF 归一为 LF）。非 UTF-8 字节按 U+FFFD
+/// 有损解码（Pi `toString("utf-8")` 同语义），不整文件报错。
 async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    use tokio::io::AsyncReadExt;
     if path.is_empty() {
         return ToolOutput::err("read requires path");
     }
@@ -489,10 +520,10 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
         Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
     };
     let mut reader = tokio::io::BufReader::new(file);
+    let mut buf = Vec::new();
     let mut skipped = 0usize;
     while skipped < offset {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
+        match read_line_capped(&mut reader, 0, &mut buf).await {
             Ok(0) => {
                 return ToolOutput::ok(format!(
                     "[read {path}: offset {offset} past end ({skipped} lines)]"
@@ -505,28 +536,44 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
     let mut page: Vec<String> = Vec::new();
     let mut page_bytes = 0usize;
     let mut hit_eof = false;
-    for _ in 0..limit {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
+    // 已读出但放不进本页的那一行：算作剩余行，下一页从它开始。
+    let mut overflow = false;
+    while page.len() < limit {
+        buf.clear();
+        // 留出 `\r\n` 两字节：内容恰为 50KB 的行也能完整放进 buf。
+        let total = match read_line_capped(&mut reader, DEFAULT_MAX_BYTES + 2, &mut buf).await {
             Ok(0) => {
                 hit_eof = true;
                 break;
             }
-            Ok(_) => {
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                page_bytes += line.len();
-                page.push(line);
-                if page_bytes >= MAX_TOOL_OUTPUT {
-                    break;
-                }
-            }
+            Ok(n) => n,
             Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
+        };
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
         }
+        // 按解码后的长度计：非法字节变 U+FFFD（3 字节），页大小仍守 50KB。
+        // 被 cap 截断的超长行解码后必然超过上限，走下面的超限分支。
+        let line = decode_utf8(&buf);
+        let sep = usize::from(!page.is_empty());
+        if page_bytes + sep + line.len() > DEFAULT_MAX_BYTES {
+            if page.is_empty() {
+                // 首行本身超限（对标 Pi firstLineExceedsLimit）：给 bash 读法，并允许跳过这一行。
+                let line_no = offset + 1;
+                return ToolOutput::ok(format!(
+                    "[line {line_no} is {}, exceeds the {} read limit. Use bash: sed -n '{line_no}p' {path} | head -c {DEFAULT_MAX_BYTES} — or pass offset={line_no} to skip it]",
+                    format_size(total),
+                    format_size(DEFAULT_MAX_BYTES)
+                ));
+            }
+            overflow = true;
+            break;
+        }
+        page_bytes += sep + line.len();
+        page.push(line);
     }
     if page.is_empty() && hit_eof {
         return ToolOutput::ok(format!(
@@ -535,14 +582,13 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
     }
     let start = offset + 1;
     let end = offset + page.len();
-    let mut more = false;
+    let mut more = overflow;
     let mut total: Option<usize> = None;
     if !hit_eof {
         if file_len <= READ_COUNT_REMAINING_MAX {
-            let mut rem = 0usize;
+            let mut rem = usize::from(overflow);
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
+                match read_line_capped(&mut reader, 0, &mut buf).await {
                     Ok(0) => break,
                     Ok(_) => rem += 1,
                     Err(e) => return ToolOutput::err(format!("read {path} failed: {e}")),
@@ -550,28 +596,30 @@ async fn read_path_paged(path: &str, offset: usize, limit: usize) -> ToolOutput 
             }
             more = rem > 0;
             total = Some(end + rem);
-        } else {
+        } else if !overflow {
             let mut peek = [0u8; 1];
-            match reader.read(&mut peek).await {
-                Ok(n) if n > 0 => more = true,
-                _ => more = false,
-            }
+            more = matches!(reader.read(&mut peek).await, Ok(n) if n > 0);
         }
     }
     let mut s = page.join("\n");
     if more {
+        let cap = if overflow {
+            format!(" ({} limit)", format_size(DEFAULT_MAX_BYTES))
+        } else {
+            String::new()
+        };
         match total {
             Some(n) => s.push_str(&format!(
-                "\n…[truncated: lines {start}-{end} of {n} — pass offset={end} for more]"
+                "\n…[truncated: lines {start}-{end} of {n}{cap} — pass offset={end} for more]"
             )),
             None => s.push_str(&format!(
-                "\n…[truncated: lines {start}-{end} · {file_len} bytes — pass offset={end} for more]"
+                "\n…[truncated: lines {start}-{end} · {file_len} bytes{cap} — pass offset={end} for more]"
             )),
         }
     } else if offset > 0 {
         s.push_str(&format!("\n[end of file: {} lines]", total.unwrap_or(end)));
     }
-    ToolOutput::ok(truncate_middle(&s, MAX_TOOL_OUTPUT))
+    ToolOutput::ok(s)
 }
 
 pub struct WriteTool;
@@ -1475,23 +1523,27 @@ pub fn current_session_env() -> Vec<(String, String)> {
     ]
 }
 
+/// 超过 `limit` 字节时保留首尾各约 `limit/2` 字节（向内对齐到字符边界），中部折叠并标注
+/// 截掉的字节数。判断与截取统一按字节：此前按字节判断、按字符截取，多字节文本
+/// 头尾两段会重叠，内容重复且比原文更长。
 pub fn truncate_middle(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
     }
     let keep = limit / 2;
-    let head: String = s.chars().take(keep).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    let mut head_end = keep;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - keep;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
     format!(
-        "{head}\n…[truncated {} chars]…\n{tail}",
-        s.len().saturating_sub(limit)
+        "{}\n…[truncated {} bytes]…\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
     )
 }
 
@@ -1700,6 +1752,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 按 `pass offset=N` 提示一直翻页，把各页正文拼回原文。
+    async fn read_all_pages(r: &ToolRegistry, path: &str) -> (String, usize) {
+        let mut offset = 0usize;
+        let mut pages = Vec::new();
+        loop {
+            let out = r
+                .execute("read", serde_json::json!({"path": path, "offset": offset}))
+                .await
+                .unwrap();
+            assert!(!out.is_error, "{}", out.content);
+            assert!(out.content.len() <= DEFAULT_MAX_BYTES + 200, "page too big");
+            assert!(
+                !out.content.contains("…[truncated "),
+                "page cut in the middle"
+            );
+            if let Some((body, marker)) = out.content.rsplit_once("\n…[truncated: lines ") {
+                let next = marker
+                    .split("pass offset=")
+                    .nth(1)
+                    .and_then(|s| s.split(' ').next())
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                assert!(next > offset, "offset must advance");
+                pages.push(body.to_string());
+                offset = next;
+            } else {
+                let body = out
+                    .content
+                    .rsplit_once("\n[end of file: ")
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or(out.content);
+                pages.push(body);
+                return (pages.join("\n"), pages.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pages_concatenate_to_original_without_dropped_lines() {
+        // 旧实现在 12KB 停页后又整体中间截断：L0060/L0061 这类页中行被静默剪掉，翻页也看不到。
+        let dir = unique_tmp("rupi-read-pages");
+        let r = ToolRegistry::with_builtins();
+        let ascii: String = (0..3000)
+            .map(|i| format!("L{i:04} {}", "x".repeat(94)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cjk: String = (0..3000)
+            .map(|i| format!("第{i:04}行 中文内容与表情😀"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, body) in [("ascii.txt", &ascii), ("cjk.txt", &cjk)] {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("{body}\n")).unwrap();
+            let (joined, n) = read_all_pages(&r, &p.to_string_lossy()).await;
+            assert!(n > 1, "{name}: should take several pages");
+            assert_eq!(&joined, body, "{name}: pages must rebuild the file");
+        }
+        let first = r
+            .execute(
+                "read",
+                serde_json::json!({"path": dir.join("ascii.txt").to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(first.content.contains("L0060") && first.content.contains("L0061"));
+        assert!(
+            first.content.contains("of 3000 (50.0KB limit)"),
+            "{}",
+            first.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_huge_single_line_points_to_bash_and_lossy_decodes_latin1() {
+        let dir = unique_tmp("rupi-read-edge");
+        let r = ToolRegistry::with_builtins();
+        let wide = dir.join("wide.txt");
+        std::fs::write(&wide, format!("{}\nnext\n", "y".repeat(80_000))).unwrap();
+        let out = r
+            .execute("read", serde_json::json!({"path": wide.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("line 1 is"), "{}", out.content);
+        assert!(out.content.contains("sed -n '1p'"), "{}", out.content);
+        assert!(out.content.len() < 1000);
+        let skip = r
+            .execute(
+                "read",
+                serde_json::json!({"path": wide.to_string_lossy(), "offset": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(skip.content.starts_with("next"), "{}", skip.content);
+        // latin1：旧实现 read_line 遇非法 UTF-8 整文件报错，Pi 是有损解码。
+        let latin = dir.join("latin1.txt");
+        std::fs::write(&latin, b"caf\xe9\nok\n").unwrap();
+        let out = r
+            .execute("read", serde_json::json!({"path": latin.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "caf\u{FFFD}\nok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn read_does_not_slurp_huge_file_and_attaches_images() {
         let dir = std::env::temp_dir().join(format!("rupi-huge-{}", std::process::id()));
@@ -1885,6 +2045,28 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[test]
+    fn truncate_middle_counts_bytes_and_never_duplicates_multibyte_text() {
+        // 中文 3 字节/字、emoji 4 字节：旧实现按字节判断、按字符截取，头尾重叠后比原文还长。
+        let line = |i: usize| format!("第{i:04}行：中文内容😀\n");
+        let s: String = (0..600).map(line).collect();
+        assert!(s.len() > 12_000 && s.chars().count() < 12_000);
+        let out = truncate_middle(&s, 12_000);
+        assert!(out.len() < 12_000 + 64, "len {}", out.len());
+        for i in 0..600 {
+            assert!(out.matches(&line(i)).count() <= 1, "line {i} duplicated");
+        }
+        assert!(out.starts_with(&line(0)) && out.ends_with(&line(599)));
+        let (head, rest) = out.split_once("\n…[truncated ").unwrap();
+        let (count, tail) = rest.split_once(" bytes]…\n").unwrap();
+        assert!(s.starts_with(head) && s.ends_with(tail));
+        assert_eq!(
+            head.len() + count.parse::<usize>().unwrap() + tail.len(),
+            s.len()
+        );
+        assert_eq!(truncate_middle("短文本", 100), "短文本");
     }
 
     #[test]
