@@ -1,4 +1,4 @@
-name: CI (MacBook M1)
+name: CI (Linux + M1 macOS)
 
 on:
   push:
@@ -26,119 +26,224 @@ env:
 jobs:
   ci:
     name: ${{ matrix.os }} / ${{ matrix.toolchain }}
-    if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os:
-          - macos-latest
+        - ubuntu-latest
+        # Assessment cited 1.85 (edition2024 floor). Current Cargo.lock needs
+        # 1.88 (darling / encoding_rs / icu_* / ignore / globset).
+        toolchain: [stable, "1.88"]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        components: rustfmt, clippy
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install OpenSSL headers (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+    - name: rustfmt
+      run: cargo fmt --all -- --check
+
+    - name: clippy
+      run: cargo clippy --workspace --all-targets --locked --exclude rupi-benches
+
+    - name: build
+      run: cargo build --workspace --all-targets --locked --exclude rupi-benches
+
+    - name: test
+      run: cargo test --workspace --locked --exclude rupi-benches
+
+  cloud:
+    name: cloud control plane
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rupi
+          POSTGRES_PASSWORD: rupi
+          POSTGRES_DB: rupi
+        ports:
+        - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rupi -d rupi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+        - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://rupi:rupi@127.0.0.1:5432/rupi
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: MinIO (S3 compatible, optional)
+      continue-on-error: true
+      run: |
+        # 社区版不再保证预编译二进制；失败则跳过，s3_compat 进程内服务仍跑。
+        url="https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z"
+        if ! curl -fL --retry 2 -o /tmp/minio "$url"; then
+          echo "minio binary unavailable; S3 tests use in-process compat server"
+          exit 0
+        fi
+        chmod +x /tmp/minio
+        mkdir -p /tmp/minio-data
+        MINIO_ROOT_USER=rupi MINIO_ROOT_PASSWORD=rupisecret1 \
+          /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 &
+        for i in $(seq 1 40); do
+          if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+            echo "RUPI_S3_ENDPOINT=http://127.0.0.1:9000" >> "$GITHUB_ENV"
+            echo "RUPI_S3_ACCESS_KEY=rupi" >> "$GITHUB_ENV"
+            echo "RUPI_S3_SECRET_KEY=rupisecret1" >> "$GITHUB_ENV"
+            echo "RUPI_S3_REGION=us-east-1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          sleep 0.25
+        done
+        echo "minio did not become healthy; continuing without it"
+
+      # cloud_chaos 的 ten_thousand_streams 是 #[ignore]：这里只跑缩小规模的
+      # 池耗尽 / 杀副本 / short_stream_load_regression，不会打满一万长连接。
+    - name: cloud crates
+      run: cargo test --locked -p rupi-runtime -p rupi-server -p rupi-agent -- --nocapture
+
+    - name: ten thousand streams (manual)
+      if: ${{ github.event_name == 'workflow_dispatch' && inputs.ten_thousand_streams }}
+      run: cargo test --locked -p rupi-server --test cloud_chaos ten_thousand_streams -- --ignored --exact --nocapture
+
+    - name: local rpc regression
+      run: cargo test --locked -p rupi-cli --test smoke rpc_mode_prompt_and_state -- --exact
+
+    - name: thin cloud client
+      run: cargo test --locked -p rupi-cli --test cloud_thin -- --nocapture
+
+  bench:
+    name: benches (build)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build criterion benches
+      run: cargo bench --workspace --no-run --locked
+
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo-deny and cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny,cargo-audit
+
+      # Advisories 走 cargo-audit：部分 rustsec 条目已用 CVSS 4.0，
+      # 旧 cargo-deny 解析 advisory-db 会直接失败。
+    - name: cargo deny check
+      run: cargo deny check licenses bans sources
+
+    - name: cargo audit
+      run: cargo audit
+  ci-macos:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    runs-on:
+    - self-hosted
+    - macOS
+    - ARM64
+    - occcat-m1
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - macos-latest
         # Assessment cited 1.85 (edition2024 floor). Current Cargo.lock needs
         # 1.88 (darling / encoding_rs / icu_* / ignore / globset).
         toolchain: [stable, "1.88"]
       max-parallel: 1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Create isolated Python environment
-        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
+      with:
+        persist-credentials: false
+    - name: Install Python 3.12 with Homebrew
+      run: |
+        brew install python@3.12
+        echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+    - name: Create isolated Python environment
+      run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
 
-      - name: Install native test dependencies
-        run: |
-          brew install openssl@3 gnu-tar
-          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
+    - name: Install native test dependencies
+      run: |
+        brew install openssl@3 gnu-tar
+        echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+        echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
-      - name: rustfmt
-        run: cargo fmt --all -- --check
+    - name: rustfmt
+      run: cargo fmt --all -- --check
 
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked --exclude rupi-benches
+    - name: clippy
+      run: cargo clippy --workspace --all-targets --locked --exclude rupi-benches
 
-      - name: build
-        run: cargo build --workspace --all-targets --locked --exclude rupi-benches
+    - name: build
+      run: cargo build --workspace --all-targets --locked --exclude rupi-benches
 
-      - name: test
-        run: cargo test --workspace --locked --exclude rupi-benches
+    - name: test
+      run: cargo test --workspace --locked --exclude rupi-benches
 
-    timeout-minutes: 60
-  bench:
-    name: benches (build)
     if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Create isolated Python environment
-        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build criterion benches
-        run: cargo bench --workspace --no-run --locked
-
-    timeout-minutes: 60
-  supply-chain:
-    name: cargo-deny + cargo-audit
-    if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Create isolated Python environment
-        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-deny and cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny,cargo-audit
-
-      # Advisories 走 cargo-audit：部分 rustsec 条目已用 CVSS 4.0，
-      # 旧 cargo-deny 解析 advisory-db 会直接失败。
-      - name: cargo deny check
-        run: cargo deny check licenses bans sources
-
-      - name: cargo audit
-        run: cargo audit
-    timeout-minutes: 60
+    timeout-minutes: 120
