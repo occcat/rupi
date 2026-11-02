@@ -1,0 +1,144 @@
+name: CI (MacBook M1)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ten_thousand_streams:
+        description: Run ignored 10k-entry short streams (never on pull_request)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  ci:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+        # Assessment cited 1.85 (edition2024 floor). Current Cargo.lock needs
+        # 1.88 (darling / encoding_rs / icu_* / ignore / globset).
+        toolchain: [stable, "1.88"]
+      max-parallel: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create isolated Python environment
+        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install native test dependencies
+        run: |
+          brew install openssl@3 gnu-tar
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked --exclude rupi-benches
+
+      - name: build
+        run: cargo build --workspace --all-targets --locked --exclude rupi-benches
+
+      - name: test
+        run: cargo test --workspace --locked --exclude rupi-benches
+
+    timeout-minutes: 60
+  bench:
+    name: benches (build)
+    if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create isolated Python environment
+        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build criterion benches
+        run: cargo bench --workspace --no-run --locked
+
+    timeout-minutes: 60
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    if: github.actor == 'occcat' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, occcat-m1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create isolated Python environment
+        run: "python -m venv \"$RUNNER_TEMP/python-env\"\necho \"$RUNNER_TEMP/python-env/bin\" >> \"$GITHUB_PATH\"\n"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      # Advisories 走 cargo-audit：部分 rustsec 条目已用 CVSS 4.0，
+      # 旧 cargo-deny 解析 advisory-db 会直接失败。
+      - name: cargo deny check
+        run: cargo deny check licenses bans sources
+
+      - name: cargo audit
+        run: cargo audit
+    timeout-minutes: 60
